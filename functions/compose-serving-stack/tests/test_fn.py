@@ -723,6 +723,16 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         )
 
         want = fnv1.RunFunctionResponse(
+            # The collector step requires every MetricMapping cluster-wide once the
+            # ProviderConfigs are observed, so it is part of the response here.
+            requirements=fnv1.Requirements(
+                resources={
+                    "metric-mappings": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="MetricMapping",
+                    ),
+                },
+            ),
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=fnv1.Resource(
@@ -955,6 +965,103 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
             "gateway-proxy must be ready once provider-kubernetes observes it Ready",
         )
 
+    async def test_collector_requested_then_composed(self) -> None:
+        """The collector goes through the whole function, not just its builders.
+
+        Two asserts, because the earlier version of this code passed every
+        builder test while composing no collector at all: the function has to
+        ask for the MetricMappings, and once they resolve it has to put a
+        Release in the desired resources.
+        """
+        req = _base_request()
+        for pc, api in (
+            ("provider-config-helm", "helm.m.crossplane.io/v1beta1"),
+            ("provider-config-kubernetes", "kubernetes.m.crossplane.io/v1alpha1"),
+        ):
+            req.observed.resources[pc].CopyFrom(
+                fnv1.Resource(resource=resource.dict_to_struct({"apiVersion": api, "kind": "ProviderConfig"})),
+            )
+
+        # Before the requirement resolves: asked for, nothing composed. Composing
+        # here would install a collector with no renames and churn it later.
+        got = await self.runner.RunFunction(req, None)
+        self.assertIn("metric-mappings", got.requirements.resources)
+        self.assertNotIn("otel-collector", got.desired.resources)
+
+        # Resolved: the mapping's rename reaches the rendered config, gated on
+        # the engine the mapping selects.
+        req.required_resources["metric-mappings"].items.append(
+            fnv1.Resource(
+                resource=resource.dict_to_struct(
+                    {
+                        "apiVersion": "modelplane.ai/v1alpha1",
+                        "kind": "MetricMapping",
+                        "metadata": {"name": "vllm", "namespace": "ml-team"},
+                        "spec": {
+                            "selector": {"matchLabels": {"modelplane.ai/engine": "vllm"}},
+                            "rename": {"vllm:num_requests_waiting": "modelplane_requests_waiting"},
+                        },
+                    }
+                ),
+            ),
+        )
+        got = await self.runner.RunFunction(req, None)
+        self.assertIn("otel-collector", got.desired.resources)
+        rendered = str(
+            json_format.MessageToDict(got).get("desired", {}).get("resources", {}).get("otel-collector", {}),
+        )
+        self.assertIn("modelplane_requests_waiting", rendered)
+        self.assertIn(fn._OTEL_ENGINE_ATTR, rendered)
+
+    async def test_collector_marked_ready_when_release_ready(self) -> None:
+        """An observed-Ready collector Release marks the composed resource ready.
+
+        Without this the collector is composed but never marked ready, so the
+        ServingStack reports it as an unready resource forever, BackendReady
+        never goes true, and the InferenceCluster never becomes Ready. The
+        collector working is not enough -- it has to be *reported* as working.
+        """
+        req = _base_request()
+        for pc, api in (
+            ("provider-config-helm", "helm.m.crossplane.io/v1beta1"),
+            ("provider-config-kubernetes", "kubernetes.m.crossplane.io/v1alpha1"),
+        ):
+            req.observed.resources[pc].CopyFrom(
+                fnv1.Resource(resource=resource.dict_to_struct({"apiVersion": api, "kind": "ProviderConfig"})),
+            )
+        req.required_resources["metric-mappings"].items.append(
+            fnv1.Resource(
+                resource=resource.dict_to_struct(
+                    {
+                        "apiVersion": "modelplane.ai/v1alpha1",
+                        "kind": "MetricMapping",
+                        "metadata": {"name": "vllm", "namespace": "ml-team"},
+                        "spec": {"rename": {"vllm:num_requests_waiting": "modelplane_requests_waiting"}},
+                    }
+                ),
+            ),
+        )
+
+        # Not yet observed: composed, and not claimed ready.
+        got = await self.runner.RunFunction(req, None)
+        self.assertIn("otel-collector", got.desired.resources)
+        self.assertNotEqual(got.desired.resources["otel-collector"].ready, fnv1.READY_TRUE)
+
+        # Observed Ready: the composed resource is marked ready too.
+        req.observed.resources["otel-collector"].CopyFrom(
+            fnv1.Resource(
+                resource=resource.dict_to_struct(
+                    {
+                        "apiVersion": "helm.m.crossplane.io/v1beta1",
+                        "kind": "Release",
+                        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                    }
+                ),
+            ),
+        )
+        got = await self.runner.RunFunction(req, None)
+        self.assertEqual(got.desired.resources["otel-collector"].ready, fnv1.READY_TRUE)
+
     async def test_third_pass(self) -> None:
         """Steady state: composed releases report Ready, and the gateway address is
         surfaced from the observed Object's manifest. The observed gateway Object
@@ -1005,6 +1112,16 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
             req.observed.resources[key].CopyFrom(observed)
 
         want = fnv1.RunFunctionResponse(
+            # The collector step requires every MetricMapping cluster-wide once the
+            # ProviderConfigs are observed, so it is part of the response here.
+            requirements=fnv1.Requirements(
+                resources={
+                    "metric-mappings": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="MetricMapping",
+                    ),
+                },
+            ),
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=fnv1.Resource(

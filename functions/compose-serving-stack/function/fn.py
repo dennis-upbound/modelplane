@@ -31,7 +31,7 @@ import pathlib
 
 import grpc
 import yaml
-from crossplane.function import logging, resource, response
+from crossplane.function import logging, request, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from crossplane.function.proto.v1 import run_function_pb2_grpc as grpcv1
 from models.ai.modelplane.infrastructure.servingstack import v1alpha1
@@ -464,6 +464,7 @@ class Composer:
         self.compose_ai_gateway()
         self.compose_gaie_crds()
         self.compose_prometheus()
+        self.compose_otel_collector()
         self.compose_leader_worker_set()
         self.compose_node_feature_discovery()
         self.compose_dra_driver()
@@ -757,6 +758,43 @@ class Composer:
         resource.update(
             self.rsp.desired.resources["prometheus"],
             _prometheus_release(v.prometheus, _pc_name(self.xr)),  # ty: ignore[invalid-argument-type]  # XRD defaults this version and forbids null
+        )
+
+    def compose_otel_collector(self) -> None:
+        """Compose the metrics collector. Gated on ProviderConfigs being observed,
+        like every other release here.
+
+        MetricMappings are required cluster-wide rather than selected. A mapping
+        names the engines it applies to by label, so which mappings exist is a
+        cluster-level fact rather than something a ServingStack spec repeats.
+
+        The collector is composed whether or not any mapping exists: collection
+        is always on, and a mapping only changes what a series is named.
+        """
+        pc_observed = self.provider_configs_observed()
+        if not (pc_observed or "otel-collector" in self.req.observed.resources):
+            return
+
+        response.require_resources(
+            self.rsp,
+            name="metric-mappings",
+            api_version="modelplane.ai/v1alpha1",
+            kind="MetricMapping",
+        )
+        # Crossplane re-calls once the requirement resolves. Composing before it
+        # does would install a collector with no renames, then rewrite its values
+        # when the mappings arrive and churn the release.
+        if "metric-mappings" not in self.req.required_resources:
+            return
+
+        mappings = [
+            mmv1alpha1.MetricMapping.model_validate(m)
+            for m in request.get_required_resources(self.req, "metric-mappings")
+        ]
+        v = self.xr.spec.versions or v1alpha1.Versions()
+        resource.update(
+            self.rsp.desired.resources["otel-collector"],
+            _otel_release(v.otelCollector, _pc_name(self.xr), mappings),  # ty: ignore[invalid-argument-type]  # XRD defaults this version and forbids null
         )
 
     def compose_leader_worker_set(self) -> None:
@@ -1054,6 +1092,7 @@ class Composer:
             "ai-gateway-crds",
             "ai-gateway",
             "prometheus",
+            "otel-collector",
             "leader-worker-set",
             "node-feature-discovery",
             "dra-driver",
