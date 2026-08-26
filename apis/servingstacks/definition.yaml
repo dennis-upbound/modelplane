@@ -137,6 +137,15 @@ spec:
                     description: kube-prometheus-stack chart version.
                     minLength: 1
                     maxLength: 32
+                  otelCollector:
+                    type: string
+                    default: "0.116.0"
+                    description: >-
+                      OpenTelemetry Collector chart version. The collector
+                      scrapes each engine's metrics and renames them onto the
+                      modelplane_* surface from the cluster's MetricMappings.
+                    minLength: 1
+                    maxLength: 32
                   leaderWorkerSet:
                     type: string
                     default: "v0.8.0"

@@ -35,6 +35,7 @@ from crossplane.function import logging, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from crossplane.function.proto.v1 import run_function_pb2_grpc as grpcv1
 from models.ai.modelplane.infrastructure.servingstack import v1alpha1
+from models.ai.modelplane.metricmapping import v1alpha1 as mmv1alpha1
 from models.io.crossplane.m.helm.providerconfig import v1beta1 as helmpcv1beta1
 from models.io.crossplane.m.helm.release import v1beta1 as helmv1beta1
 from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
@@ -80,6 +81,31 @@ _PROMETHEUS_FULLNAME_OVERRIDE = "prometheus"
 _PROMETHEUS_URL = f"http://{_PROMETHEUS_FULLNAME_OVERRIDE}-prometheus.{_PROMETHEUS_NAMESPACE}.svc.cluster.local:9090"
 _PROMETHEUS_CHART = "kube-prometheus-stack"
 _PROMETHEUS_REPO = "https://prometheus-community.github.io/helm-charts"
+
+# OpenTelemetry collector. It lands in the Prometheus namespace so the existing
+# Prometheus discovers it with no extra wiring: the collector scrapes each engine
+# under its native names, renames them onto modelplane_*, and re-exposes the
+# result on _OTEL_EXPORT_PORT for Prometheus to scrape. Sitting alongside rather
+# than replacing kube-prometheus-stack keeps this additive - the native series
+# stay reachable, so a mapping that is wrong or missing costs nothing.
+_OTEL_CHART = "opentelemetry-collector"
+_OTEL_REPO = "https://open-telemetry.github.io/opentelemetry-helm-charts"
+_OTEL_EXPORT_PORT = 8889
+
+# The pod label a MetricMapping selects an engine by, surfaced to OTTL as a
+# resource attribute under this name. Extracted explicitly rather than relying on
+# the k8sattributes default naming, which has changed across collector releases.
+_OTEL_ENGINE_ATTR = "modelplane.engine"
+
+# Pod labels this function has to know by value, because a composition function
+# cannot import another's package. compose-model-replica owns both - base.py's
+# LABEL_ENGINE and LABEL_SERVING, and the engine port's name - so these three are
+# a cross-function contract and have to change together. The serving one is
+# spelled the way Prometheus service discovery exposes it, with dots and slashes
+# collapsed to underscores.
+_LABEL_ENGINE = "modelplane.ai/engine"
+_LABEL_SERVING_SD = "modelplane_ai_serving"
+_ENGINE_PORT_NAME = "http"
 
 _DRA_DRIVER_NAMESPACE = "dra-driver-nvidia-gpu"
 # Upstream default for the DRA driver's NVIDIA_DRIVER_ROOT. A ServingStack whose
@@ -219,6 +245,111 @@ def _k8s_object(
             celQuery=cel_query,
         )
     return obj
+
+
+def _otel_statements(mappings: list[mmv1alpha1.MetricMapping]) -> list[str]:
+    """Render every MetricMapping into OTTL statements for the transform processor.
+
+    One statement per rename and per added label, each gated on the engine the
+    mapping selects. The gate is what makes this label-driven rather than
+    name-driven: two mappings can rename the same source name (a fork of an
+    engine emits its upstream names), and a series from an engine with no mapping
+    has to come through untouched rather than be renamed by someone else's rule.
+
+    Sorted so the rendered config is stable: an unordered dict would reshuffle
+    the statements between reconciles and churn the Helm release for no reason.
+    """
+    out: list[str] = []
+    for mapping in sorted(mappings, key=lambda m: _name(m.metadata)):
+        spec = mapping.spec
+        if spec is None:
+            continue
+        labels = (spec.selector.matchLabels if spec.selector else None) or {}
+        engine = labels.get(_LABEL_ENGINE)
+        # A mapping that selects nothing we can key on would apply everywhere.
+        # Skip it rather than let it rewrite another engine's series.
+        if not engine:
+            continue
+        gate = f'resource.attributes["{_OTEL_ENGINE_ATTR}"] == "{engine}"'
+        for source, target in sorted((spec.rename or {}).items()):
+            out.append(f'set(metric.name, "{target}") where metric.name == "{source}" and {gate}')
+        add = (spec.labels.add if spec.labels else None) or {}
+        for key, value in sorted(add.items()):
+            out.append(f'set(datapoint.attributes["{key}"], "{value}") where {gate}')
+    return out
+
+
+def _otel_values(mappings: list[mmv1alpha1.MetricMapping]) -> dict:
+    """Helm values for the collector: scrape engines, rename, re-expose.
+
+    The scrape keeps only pods carrying the serving label and only their port
+    named `http`, which is the engine's. Matching the port by name rather than
+    number is what makes this correct under prefill/decode, where the pd-sidecar
+    holds 8000 and the engine has moved to its own port.
+    """
+    return {
+        "mode": "deployment",
+        "replicaCount": 1,
+        "image": {"repository": "otel/opentelemetry-collector-contrib"},
+        "ports": {"prom-export": {"enabled": True, "containerPort": _OTEL_EXPORT_PORT, "protocol": "TCP"}},
+        "presets": {"kubernetesAttributes": {"enabled": True}},
+        "config": {
+            "receivers": {
+                "prometheus": {
+                    "config": {
+                        "scrape_configs": [
+                            {
+                                "job_name": "modelplane-engines",
+                                "kubernetes_sd_configs": [{"role": "pod"}],
+                                "relabel_configs": [
+                                    {
+                                        "source_labels": [f"__meta_kubernetes_pod_label_{_LABEL_SERVING_SD}"],
+                                        "action": "keep",
+                                        "regex": ".+",
+                                    },
+                                    {
+                                        "source_labels": ["__meta_kubernetes_pod_container_port_name"],
+                                        "action": "keep",
+                                        "regex": _ENGINE_PORT_NAME,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            },
+            "processors": {
+                "k8sattributes": {
+                    "extract": {
+                        "labels": [{"tag_name": _OTEL_ENGINE_ATTR, "key": _LABEL_ENGINE, "from": "pod"}],
+                    },
+                },
+                "transform": {"metric_statements": [{"statements": _otel_statements(mappings)}]},
+            },
+            "exporters": {"prometheus": {"endpoint": f"0.0.0.0:{_OTEL_EXPORT_PORT}"}},
+            "service": {
+                "pipelines": {
+                    "metrics": {
+                        "receivers": ["prometheus"],
+                        "processors": ["k8sattributes", "transform"],
+                        "exporters": ["prometheus"],
+                    },
+                },
+            },
+        },
+    }
+
+
+def _otel_release(version: str, provider_config: str, mappings: list[mmv1alpha1.MetricMapping]) -> helmv1beta1.Release:
+    """Build the OpenTelemetry collector release for a workload cluster."""
+    return _helm_release(
+        chart=_OTEL_CHART,
+        repo=_OTEL_REPO,
+        version=version,
+        namespace=_PROMETHEUS_NAMESPACE,
+        provider_config=provider_config,
+        values=_otel_values(mappings),
+    )
 
 
 def _prometheus_release(version: str, provider_config: str) -> helmv1beta1.Release:
