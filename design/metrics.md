@@ -1,6 +1,6 @@
 # Metrics collection
 
-**Status:** Draft
+**Status:** Draft, with the MetricMapping kind landed
 **Date:** August 2026
 **Author:** Dennis Ramdass
 
@@ -141,6 +141,13 @@ spec:
 the collector's config, the ConfigMap the OTel collector loads on each cluster. The
 `rename` map becomes transform-processor rules, applied to metrics from the pods the
 `selector` matches. A new engine is a new `MetricMapping`, not a package change.
+
+The kind itself is implemented, in its own XRD and `compose-metric-mapping` function.
+Two things about that are worth knowing before reading the rest as built. Nothing consumes
+a `MetricMapping` yet: the collector this section hands them to does not exist, so applying
+one reports Ready and changes no behaviour. And the reading side sits in a function of
+its own rather than in `compose-serving-stack` as written above, which is harmless while
+there is no collector to feed but is a difference to close, not to keep.
 
 As engines emit the OpenTelemetry conventions directly (vLLM already emits OTLP traces,
 and native OTLP metrics are in progress), each mapping shrinks toward identity and the
