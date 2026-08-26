@@ -151,6 +151,19 @@ LABEL_SERVING = "modelplane.ai/serving"
 # Deployment selectors fighting over each other's pods.
 LABEL_WORKLOAD = "modelplane.ai/workload"
 
+# Pod label naming which engine a serving pod runs, from engines[].type. A
+# MetricMapping selects on it to normalize that engine's metrics, so the label is
+# what makes normalization label-driven rather than a guess from the image. Only
+# set when the user declared a type: an engine with none is still scraped, under
+# its native metric names.
+LABEL_ENGINE = "modelplane.ai/engine"
+
+
+def engine_labels(engine: v1alpha1.Engine) -> dict[str, str]:
+    """The engine-type label for a serving pod, or {} when none was declared."""
+    return {LABEL_ENGINE: engine.type} if engine.type else {}
+
+
 # Backend-neutral env var carrying the gang leader's address, injected into
 # every engine container of a multi-node engine's gang. A member's command finds its
 # peers through this without hard-coding the underlying orchestrator's variable.

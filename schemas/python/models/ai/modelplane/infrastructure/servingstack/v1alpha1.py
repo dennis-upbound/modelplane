@@ -116,6 +116,10 @@ class Versions(BaseModel):
     """
     NVIDIA DRA driver chart version. Publishes GPUs as DRA ResourceSlices and the gpu.nvidia.com DeviceClass that ModelReplica ResourceClaims bind through.
     """
+    otelCollector: constr(min_length=1, max_length=32) | None = '0.116.0'
+    """
+    OpenTelemetry Collector chart version. The collector scrapes each engine's metrics and renames them onto the modelplane_* surface from the cluster's MetricMappings.
+    """
     prometheus: constr(min_length=1, max_length=32) | None = '72.6.2'
     """
     kube-prometheus-stack chart version.

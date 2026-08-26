@@ -55,6 +55,7 @@ def _gpu_request(count: int) -> v1alpha1.DeviceRequest:
 def _standalone_engine(
     name: str = "main",
     *,
+    engine_type: str | None = None,
     copies: int = 1,
     args: list[str] | None = None,
     command: list[str] | None = None,
@@ -69,6 +70,7 @@ def _standalone_engine(
     if command is not None:
         container.command = command
     return v1alpha1.Engine(
+        **({"type": engine_type} if engine_type else {}),
         name=name,
         copies=copies,
         members=[
@@ -968,3 +970,37 @@ class TestKvBlockSize(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEngineLabel(unittest.TestCase):
+    """engines[].type reaches the serving pods as modelplane.ai/engine.
+
+    It is what makes normalization label-driven: a MetricMapping selects on this
+    label, so a pod without it is scraped under the engine's native metric names
+    instead of being renamed by a guess.
+    """
+
+    def test_standalone_pod_carries_the_engine_label(self) -> None:
+        engine = _standalone_engine(engine_type="vllm")
+        replica = _replica(engines=[engine])
+        out = native.NativeBackend().build(replica, engine, _PC, base.serving_label(replica))
+        labels = out["model-serving-main"].spec.forProvider.manifest["spec"]["template"]["metadata"]["labels"]
+        self.assertEqual(labels[base.LABEL_ENGINE], "vllm")
+
+    def test_no_type_means_no_engine_label(self) -> None:
+        engine = _standalone_engine()
+        replica = _replica(engines=[engine])
+        out = native.NativeBackend().build(replica, engine, _PC, base.serving_label(replica))
+        labels = out["model-serving-main"].spec.forProvider.manifest["spec"]["template"]["metadata"]["labels"]
+        self.assertNotIn(base.LABEL_ENGINE, labels)
+
+    def test_gang_labels_the_leader_and_not_the_workers(self) -> None:
+        # The workers serve nothing, so they carry no serving label and no engine
+        # label either - there are no metrics on them to attribute.
+        engine = _gang_engine()
+        engine.type = "sglang"
+        replica = _replica(engines=[engine])
+        out = llmd.LLMDBackend().build(replica, engine, _PC, base.serving_label(replica))
+        tmpl = out["model-serving-main"].spec.forProvider.manifest["spec"]["leaderWorkerTemplate"]
+        self.assertEqual(tmpl["leaderTemplate"]["metadata"]["labels"][base.LABEL_ENGINE], "sglang")
+        self.assertNotIn(base.LABEL_ENGINE, tmpl["workerTemplate"].get("metadata", {}).get("labels", {}))

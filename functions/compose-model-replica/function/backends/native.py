@@ -48,7 +48,11 @@ class NativeBackend:
         # per-workload label this Deployment selects on. The latter must be
         # engine-unique so two Standalone engines of one replica don't share a
         # selector and fight over each other's pods.
-        pod_labels = {base.LABEL_SERVING: serving_label, base.LABEL_WORKLOAD: name}
+        pod_labels = {
+            base.LABEL_SERVING: serving_label,
+            base.LABEL_WORKLOAD: name,
+            **base.engine_labels(engine),
+        }
         selector = {base.LABEL_WORKLOAD: name}
 
         cache_volumes, cache_volume_mounts = base.cache_mounts(replica)

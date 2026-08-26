@@ -406,7 +406,8 @@ class Composer:
     def _replica_engine(self, engine: v1alpha1.Engine, placement: scheduling.EnginePlacement) -> mrv1alpha1.Engine:
         """Build a ModelReplica engine from a deployment engine + placement.
 
-        The engine keeps its name, copies, phase, and member templates verbatim;
+        The engine keeps its name, copies, phase, type, and member templates
+        verbatim;
         the scheduler supplies each member's pool (nodePoolName) and resolved
         claim: DRA device requests. A member that claims nothing - no
         nodeSelector, or only synthetic devices matched - carries only its pool
@@ -448,6 +449,11 @@ class Composer:
         # doesn't serialize a null into the composed ModelReplica.
         if engine.phase is not None:
             replica_engine.phase = engine.phase
+        # type reaches the replica backend, which stamps it as the engine label a
+        # MetricMapping selects on. Optional, and omitted when unset for the same
+        # reason as phase.
+        if engine.type is not None:
+            replica_engine.type = engine.type
         return replica_engine
 
     def compose_endpoints(self, matched: list[scheduling.Candidate]) -> None:

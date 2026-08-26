@@ -135,7 +135,13 @@ class LLMDBackend:
         # the replica's shared Service selects on, plus the role label, the
         # serving port, and the readiness probe.
         leader_pod = {
-            "metadata": {"labels": {base.LABEL_SERVING: serving_label, _LABEL_ROLE: "leader"}},
+            "metadata": {
+                "labels": {
+                    base.LABEL_SERVING: serving_label,
+                    _LABEL_ROLE: "leader",
+                    **base.engine_labels(engine),
+                },
+            },
             "spec": pod_spec(leader, container(leader, serving=True)),
         }
         # The worker followers don't serve the OpenAI API, so they carry no

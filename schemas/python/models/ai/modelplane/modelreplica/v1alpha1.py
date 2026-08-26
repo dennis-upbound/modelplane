@@ -148,6 +148,10 @@ class Engine(BaseModel):
     members: list[Member] = Field(..., max_length=2, min_length=1)
     name: constr(min_length=1, max_length=63)
     phase: Literal['Prefill', 'Decode'] | None = None
+    type: constr(min_length=1, max_length=63) | None = None
+    """
+    Which engine this runs, e.g. vllm or sglang. Stamped onto the serving pods as modelplane.ai/engine, where a MetricMapping selects on it to normalize that engine's metrics onto the modelplane_* surface. Free-form rather than an enum: a platform team adds a MetricMapping for a forked or new engine without a Modelplane release, and an engine with no mapping is still scraped under its native names. Omit it and the engine's metrics are collected unnormalized.
+    """
 
 
 class ModelCacheRef(BaseModel):

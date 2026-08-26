@@ -210,6 +210,10 @@ class Engine(BaseModel):
     """
     The engine's phase in a PrefillDecode deployment, Prefill or Decode. Set only when serving.mode is PrefillDecode, where exactly one engine takes each phase.
     """
+    type: constr(min_length=1, max_length=63) | None = None
+    """
+    Which engine this runs, e.g. vllm or sglang. Stamped onto the serving pods as modelplane.ai/engine, where a MetricMapping selects on it to normalize that engine's metrics onto the modelplane_* surface. Free-form rather than an enum: a platform team adds a MetricMapping for a forked or new engine without a Modelplane release, and an engine with no mapping is still scraped under its native names. Omit it and the engine's metrics are collected unnormalized.
+    """
 
 
 class ModelCacheRef(BaseModel):

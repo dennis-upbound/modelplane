@@ -242,6 +242,22 @@ spec:
                               default: 1
                               minimum: 1
                               maximum: 64
+                            type:
+                              type: string
+                              description: >-
+                                Which engine this runs, e.g. vllm or sglang.
+                                Stamped onto the serving pods as
+                                modelplane.ai/engine, where a MetricMapping
+                                selects on it to normalize that engine's metrics
+                                onto the modelplane_* surface. Free-form rather
+                                than an enum: a platform team adds a
+                                MetricMapping for a forked or new engine without
+                                a Modelplane release, and an engine with no
+                                mapping is still scraped under its native names.
+                                Omit it and the engine's metrics are collected
+                                unnormalized.
+                              minLength: 1
+                              maxLength: 63
                             phase:
                               type: string
                               enum: [Prefill, Decode]
