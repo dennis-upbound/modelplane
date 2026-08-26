@@ -116,6 +116,23 @@ informed.
   aggregated under its native names. The rename is skipped and Modelplane surfaces it
   ("no mapping for `X`") rather than guessing a mapping and reporting the wrong thing.
 
+Selecting by label rather than by metric name looks redundant at first, because engine
+metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
+rename them unambiguously with no selector at all. It is not redundant, for four reasons
+worth writing down so the field is not optimized away later. Degradation above is
+label-based by construction: reporting "no mapping for `X`" means reading a pod's claimed
+engine and finding no mapping for it. Name matching cannot tell that apart from a
+successful rename of nothing. The consistent label set is per pod, not per series, so name matching
+cannot attach `engine` and `cluster` to the series a mapping does not rename. A forked
+engine emits the upstream names while needing its own mapping, and two mappings matching
+one name cannot be told apart without the pod. And not every name is namespaced:
+kube-scheduler's are plain `scheduler_*`, so the scheduler section needs the selector
+most of all.
+
+In collector terms that makes the rename an OTTL transform gated on a resource attribute,
+rather than the simpler metrics-transform processor, which matches on metric name only. The pod label reaches OTTL as a resource attribute through the k8sattributes
+processor.
+
 A `MetricMapping` is small: a selector for the pods it applies to, the source names, the
 `modelplane_*` name each becomes, and the labels to keep or add. The vLLM one:
 
