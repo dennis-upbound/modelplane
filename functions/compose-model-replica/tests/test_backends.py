@@ -208,7 +208,7 @@ _NATIVE_WANT = {
                             "name": "engine",
                             "image": "vllm/vllm-openai:latest",
                             "args": ["--model=Qwen/Qwen3-0.6B"],
-                            "ports": [{"containerPort": 8000}],
+                            "ports": [{"name": "http", "containerPort": 8000}],
                             "resources": {"claims": [{"name": "devices"}]},
                             "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
                             "readinessProbe": {
@@ -297,7 +297,7 @@ def _engine(
         c["args"] = args
     c["env"] = env if env is not None else [_LEADER_ENV]
     if serving:
-        c["ports"] = [{"containerPort": 8000}]
+        c["ports"] = [{"name": "http", "containerPort": 8000}]
         c["readinessProbe"] = {
             "httpGet": {"path": "/health", "port": 8000},
             "initialDelaySeconds": 30,
@@ -800,6 +800,9 @@ class TestDisaggregated(unittest.TestCase):
         self.assertEqual(engine["ports"][0]["containerPort"], 9000)
         self.assertIn("--vllm-port=9000", sidecar["args"])
         self.assertEqual(sidecar["ports"][0]["containerPort"], 8000)
+        # Left unnamed: a pod's named ports must be unique, and the engine is the
+        # one worth following.
+        self.assertNotIn("name", sidecar["ports"][0])
 
     def test_engines_role_labeled(self) -> None:
         out = self._apply()
@@ -815,9 +818,15 @@ class TestDisaggregated(unittest.TestCase):
         self.assertEqual(names, ["engine", "pd-sidecar"])
         engine = next(c for c in containers if c["name"] == "engine")
         self.assertEqual(engine["ports"][0]["containerPort"], 8001)
+        # Named, so a scrape targeting "http" follows the engine to 8001 rather
+        # than matching 8000 by number and hitting the sidecar.
+        self.assertEqual(engine["ports"][0]["name"], "http")
         self.assertEqual(engine["readinessProbe"]["timeoutSeconds"], 5)
         sidecar = next(c for c in containers if c["name"] == "pd-sidecar")
         self.assertEqual(sidecar["ports"][0]["containerPort"], 8000)
+        # Left unnamed: a pod's named ports must be unique, and the engine is the
+        # one worth following.
+        self.assertNotIn("name", sidecar["ports"][0])
         self.assertEqual(sidecar["readinessProbe"]["timeoutSeconds"], 5)
         self.assertIn("--secure-proxy=false", sidecar["args"])
 

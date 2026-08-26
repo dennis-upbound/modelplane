@@ -375,7 +375,7 @@ def _add_sidecar_to_decode(obj: k8sobjv1alpha1.Object) -> None:
         containers = tmpl["spec"]["containers"]
         engine = next(c for c in containers if c["name"] == "engine")
         port = _decode_port(engine)
-        engine["ports"] = [{"containerPort": port}]
+        engine["ports"] = [{"name": base.ENGINE_PORT_NAME, "containerPort": port}]
         engine["readinessProbe"] = {
             "httpGet": {"path": "/health", "port": port},
             "initialDelaySeconds": 30,

@@ -131,6 +131,14 @@ REMOTE_NAMESPACE = "default"
 # the ModelEndpoint URLs, so it must not diverge between backends.
 ENGINE_PORT = 8000
 
+# Name for the engine's serving port. Named so a scrape can follow the engine by
+# name rather than by number, which matters under prefill/decode: there the
+# pd-sidecar takes ENGINE_PORT and the engine moves to its own --port, so a
+# target matching 8000 by number hits the sidecar. The sidecar's port is left
+# unnamed - a pod's named ports must be unique, and the engine is the one worth
+# following.
+ENGINE_PORT_NAME = "http"
+
 # Pod label carrying the serving identity (the replica name). The replica's one
 # shared Service selects on it, so every engine's serving pods - a Standalone pod
 # or an LWS gang leader - carry it. A multi-node gang's worker followers do NOT

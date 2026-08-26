@@ -103,7 +103,7 @@ class LLMDBackend:
                 env.extend(e.model_dump(exclude_none=True) for e in engine_container.env)
             c["env"] = env
             if serving:
-                c["ports"] = [{"containerPort": base.ENGINE_PORT}]
+                c["ports"] = [{"name": base.ENGINE_PORT_NAME, "containerPort": base.ENGINE_PORT}]
                 c["readinessProbe"] = {
                     "httpGet": {"path": "/health", "port": base.ENGINE_PORT},
                     "initialDelaySeconds": 30,

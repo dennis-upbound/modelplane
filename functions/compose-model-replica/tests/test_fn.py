@@ -186,7 +186,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                                                                 "name": "engine",
                                                                 "image": "vllm/vllm-openai:latest",
                                                                 "args": ["--model=Qwen/Qwen3-0.6B"],
-                                                                "ports": [{"containerPort": 8000}],
+                                                                "ports": [{"name": "http", "containerPort": 8000}],
                                                                 "resources": {"claims": [{"name": "devices"}]},
                                                                 "volumeMounts": [
                                                                     {"name": "dshm", "mountPath": "/dev/shm"},
