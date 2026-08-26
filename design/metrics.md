@@ -113,8 +113,11 @@ informed.
   engine. Being typed, it validates on apply and appears under `kubectl get metricmappings`,
   and adding one is no fork and no Modelplane release.
 - **Graceful degradation.** An unlabelled or unmapped engine still gets scraped and
-  aggregated under its native names. The rename is skipped and Modelplane surfaces it
+  aggregated under its own names. The rename is skipped and Modelplane surfaces it
   ("no mapping for `X`") rather than guessing a mapping and reporting the wrong thing.
+  One caveat, measured rather than assumed: the collector's Prometheus exporter
+  sanitizes `:` to `_`, so an unmapped `vllm:gpu_cache_usage_perc` is published as
+  `vllm_gpu_cache_usage_perc`. Passthrough keeps the name and not the punctuation.
 
 Selecting by label rather than by metric name looks redundant at first, because engine
 metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
@@ -159,12 +162,16 @@ the collector's config, the ConfigMap the OTel collector loads on each cluster. 
 `rename` map becomes transform-processor rules, applied to metrics from the pods the
 `selector` matches. A new engine is a new `MetricMapping`, not a package change.
 
-The kind itself is implemented, in its own XRD and `compose-metric-mapping` function.
-Two things about that are worth knowing before reading the rest as built. Nothing consumes
-a `MetricMapping` yet: the collector this section hands them to does not exist, so applying
-one reports Ready and changes no behaviour. And the reading side sits in a function of
-its own rather than in `compose-serving-stack` as written above, which is harmless while
-there is no collector to feed but is a difference to close, not to keep.
+The kind and the collector that consumes it are implemented in #412, and this section
+describes what that PR does: `compose-serving-stack` reads every `MetricMapping` and
+renders it into the collector's transform rules, each gated on the engine the mapping
+selects.
+
+That was validated on a real GKE cluster with vLLM 0.23.0, which publishes 359 metric
+lines. The mapped ones came back renamed and labelled with their engine, the rename
+happening in place rather than alongside the originals, and the remaining 308 passed
+through. The EPP half of this document is still unimplemented: the endpoint picker
+exposes no metrics port today.
 
 As engines emit the OpenTelemetry conventions directly (vLLM already emits OTLP traces,
 and native OTLP metrics are in progress), each mapping shrinks toward identity and the
@@ -245,8 +252,8 @@ cluster's capacity is shared fairly across teams.
   `volcano_pod_preemption_victims`.
 
 A scheduler's mapping is a `MetricMapping` like an engine's, and the degradation rule
-carries over. An unmapped scheduler still gets scraped under its native names, and
-Modelplane surfaces that rather than guessing.
+carries over, punctuation caveat included. An unmapped scheduler still gets scraped
+under its own names, and Modelplane surfaces that rather than guessing.
 
 ## Aggregate to one view
 
