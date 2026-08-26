@@ -10,7 +10,7 @@
 #   --served-model-name     the id clients pass as "model" in OpenAI requests.
 #
 # vLLM exposes Prometheus metrics at /metrics on its serving port (:8000) with no
-# extra flag, which is what the example's PodMonitor scrapes.
+# extra flag, which is what Modelplane's collector scrapes.
 #
 # No --port or --host: Modelplane's routing expects the engine on its default
 # :8000 with a /health probe, and passes args through verbatim.
@@ -26,6 +26,10 @@ spec:
     spec:
       engines:
       - name: qwen2-5-0-5b
+        # Names the engine so its serving pods carry modelplane.ai/engine, which
+        # is how the vLLM MetricMapping selects them. Without it the engine is
+        # still collected from, under vLLM's own metric names.
+        type: vllm
         members:
     # A single self-contained vLLM pod. The container named "engine" is the
     # inference server; its image and args pass through verbatim.
