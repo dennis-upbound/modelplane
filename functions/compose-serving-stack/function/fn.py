@@ -91,6 +91,10 @@ _PROMETHEUS_REPO = "https://prometheus-community.github.io/helm-charts"
 _OTEL_CHART = "opentelemetry-collector"
 _OTEL_REPO = "https://open-telemetry.github.io/opentelemetry-helm-charts"
 _OTEL_EXPORT_PORT = 8889
+# Pin the chart's resource names the way the Prometheus release does, so the
+# collector's Service has a name a scrape config (and a test) can rely on rather
+# than one derived from the release name.
+_OTEL_FULLNAME_OVERRIDE = "otel-collector"
 
 # The pod label a MetricMapping selects an engine by, surfaced to OTTL as a
 # resource attribute under this name. Extracted explicitly rather than relying on
@@ -288,10 +292,21 @@ def _otel_values(mappings: list[mmv1alpha1.MetricMapping]) -> dict:
     holds 8000 and the engine has moved to its own port.
     """
     return {
+        "fullnameOverride": _OTEL_FULLNAME_OVERRIDE,
         "mode": "deployment",
         "replicaCount": 1,
         "image": {"repository": "otel/opentelemetry-collector-contrib"},
-        "ports": {"prom-export": {"enabled": True, "containerPort": _OTEL_EXPORT_PORT, "protocol": "TCP"}},
+        # servicePort as well as containerPort: the chart builds the Service from
+        # servicePort, so a port declared only on the container is exposed on the
+        # pod and unreachable through the Service.
+        "ports": {
+            "prom-export": {
+                "enabled": True,
+                "containerPort": _OTEL_EXPORT_PORT,
+                "servicePort": _OTEL_EXPORT_PORT,
+                "protocol": "TCP",
+            }
+        },
         "presets": {"kubernetesAttributes": {"enabled": True}},
         "config": {
             "receivers": {

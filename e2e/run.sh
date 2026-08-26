@@ -248,3 +248,39 @@ kubectl --context "$cpctx" -n "$ns" delete pod -l app.kubernetes.io/name=e2e-ver
 	exit 1
 }
 log "End to end OK: $addr serves OpenAI (/v1/chat/completions) and Anthropic (/v1/messages)"
+
+# Metrics normalization. The requests above gave the engine something to count,
+# so its /metrics now has non-zero vLLM series. Assert the collector on the
+# workload cluster re-exposes them under modelplane_* names: that is the whole
+# MetricMapping path -- engine label stamped, port scraped by name, rename
+# applied, gated on the engine attribute. Grepping the collector's exporter
+# directly keeps this a test of normalization and not of Prometheus.
+log "Verifying metrics normalization"
+mns=monitoring
+mpod=e2e-verify-metrics
+otel="http://otel-collector.$mns.svc:8889/metrics"
+
+# The collector has to start, discover the engine pod and complete one scrape
+# interval, so this polls rather than asserting on the first try.
+found=""
+for attempt in $(seq 1 20); do
+	kubectl --context "$WLCTX" -n "$mns" delete pod "$mpod" --now >/dev/null 2>&1 || true
+	kubectl --context "$WLCTX" -n "$mns" run "$mpod" --restart=Never --image="$CURL_IMAGE" \
+		--command -- curl -sS --max-time 15 "$otel" >/dev/null 2>&1 || true
+	body=""
+	for _ in $(seq 1 15); do
+		body="$(kubectl --context "$WLCTX" -n "$mns" logs "$mpod" 2>/dev/null || true)"
+		[ -n "$body" ] && break
+		sleep 2
+	done
+	found="$(printf '%s' "$body" | grep -c '^modelplane_' || true)"
+	log "metrics attempt $attempt: ${found:-0} modelplane_* series"
+	[ "${found:-0}" -gt 0 ] && { printf '%s' "$body" | grep '^modelplane_' | head -5 | sed 's/^/    /'; break; }
+	sleep 15
+done
+kubectl --context "$WLCTX" -n "$mns" delete pod "$mpod" --now >/dev/null 2>&1 || true
+[ "${found:-0}" -gt 0 ] || {
+	echo "verify: the collector at $otel exposed no modelplane_* series; the MetricMapping rename did not apply" >&2
+	exit 1
+}
+log "Metrics OK: the collector re-exposes the engine's vLLM series as modelplane_*"

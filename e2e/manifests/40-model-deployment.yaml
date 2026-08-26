@@ -15,6 +15,9 @@ spec:
     spec:
       engines:
       - name: mock
+        # Names the engine so its serving pods carry modelplane.ai/engine, which
+        # is what the vllm MetricMapping selects on.
+        type: vllm
         members:
         - role: Standalone
           nodeSelector:
@@ -44,9 +47,29 @@ spec:
                           self.send_header("content-length", str(len(b)))
                           self.end_headers()
                           self.wfile.write(b)
+                      def _text(self, body, c=200):
+                          b = body.encode()
+                          self.send_response(c)
+                          self.send_header("content-type", "text/plain; version=0.0.4")
+                          self.send_header("content-length", str(len(b)))
+                          self.end_headers()
+                          self.wfile.write(b)
                       def do_GET(self):
                           if self.path == "/health":
                               self._s({"status": "ok"})
+                          elif self.path == "/metrics":
+                              # Prometheus exposition under vLLM's own names, so the
+                              # MetricMapping has something real to rename. A real
+                              # engine publishes these on the serving port too.
+                              self._text(
+                                  "# TYPE vllm:num_requests_waiting gauge\n"
+                                  "vllm:num_requests_waiting 3\n"
+                                  "# TYPE vllm:time_to_first_token_seconds histogram\n"
+                                  'vllm:time_to_first_token_seconds_bucket{le="0.1"} 1\n'
+                                  'vllm:time_to_first_token_seconds_bucket{le="+Inf"} 2\n'
+                                  "vllm:time_to_first_token_seconds_sum 0.25\n"
+                                  "vllm:time_to_first_token_seconds_count 2\n"
+                              )
                           elif self.path.startswith("/v1/models"):
                               self._s({"object": "list", "data": [{"id": "mock", "object": "model"}]})
                           else:

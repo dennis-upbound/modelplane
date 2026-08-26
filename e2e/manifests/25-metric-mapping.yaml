@@ -1,0 +1,20 @@
+---
+# The vLLM mapping. The mock engine publishes vLLM's own metric names on
+# /metrics, and the ModelDeployment declares `type: vllm`, so this selects that
+# engine's pods by label and the collector renames only their series. An engine
+# with no matching mapping keeps its native names.
+apiVersion: modelplane.ai/v1alpha1
+kind: MetricMapping
+metadata:
+  name: vllm
+  namespace: ml-team
+spec:
+  selector:
+    matchLabels:
+      modelplane.ai/engine: vllm
+  rename:
+    vllm:num_requests_waiting: modelplane_requests_waiting
+    vllm:time_to_first_token_seconds: modelplane_time_to_first_token
+  labels:
+    add:
+      engine: vllm
