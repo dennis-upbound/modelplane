@@ -1,6 +1,6 @@
 # Metrics collection
 
-**Status:** Draft, with the MetricMapping kind landed
+**Status:** Draft, with the MetricMapping kind proven and unmerged
 **Date:** August 2026
 **Author:** Dennis Ramdass
 
@@ -40,9 +40,11 @@ request and error rates per model. It answers "is my model serving well, and is 
 saturated?"
 
 **Substrate health.** The stack Modelplane installs on each workload cluster. Is the
-gateway up, are cert-manager, the LeaderWorkerSet controller, the NVIDIA DRA driver, and
-the pod scheduler healthy, are GPUs allocatable and gangs forming. "Is the machinery on
-this cluster working?"
+gateway up, are cert-manager, the NVIDIA DRA driver, and the multi-node controller
+healthy, are GPUs allocatable and gangs forming. "Is the machinery on this cluster
+working?" Which components those are now depends on `InferenceCluster.spec.stack`: a
+`Standard` cluster runs the LeaderWorkerSet controller, a `Dynamo` one runs Grove, the KAI
+Scheduler, and a ModelExpress server.
 
 **Control-plane health.** Modelplane itself. Crossplane reconcile rates and errors,
 function latency and panics, the fleet scheduler placing replicas, and XR `Ready`/`Synced`.
@@ -61,9 +63,11 @@ On each cluster Modelplane collects from every source it owns, with no opt-in or
 Three existing pieces make it cheap.
 
 - **The serving label spans every shape.** `modelplane.ai/serving` is on standalone pods,
-  LeaderWorkerSet leaders, and both prefill and decode engines, since it's the label the
-  InferencePool selects on. One selector on it follows the shape, so leader/worker and
-  prefill/decode need no special casing.
+  LeaderWorkerSet leaders, Grove leader cliques, and both prefill and decode engines,
+  since it's the label the InferencePool selects on. One selector on it follows the shape,
+  so leader/worker, prefill/decode, and a Dynamo cluster's PodCliqueSets need no special
+  casing. The Dynamo work added a fourth workload kind without touching this, which is the
+  test this approach had to pass.
 - **The stack already scrapes.** `compose-serving-stack` runs a metrics stack on every
   workload cluster and already scrapes the gateway's Envoy proxies, so adding a target is
   composition, not new infrastructure.
@@ -73,14 +77,22 @@ Three existing pieces make it cheap.
 A cluster-wide selector on `modelplane.ai/serving` covers every engine of every
 deployment, so collection is a cluster property rather than something composed per
 replica. A second selector covers the endpoint pickers, and a third the substrate
-`compose-serving-stack` installs.
+`compose-serving-stack` installs, which is now stack-dependent: the LeaderWorkerSet
+controller on a `Standard` cluster, or Grove, the KAI Scheduler and the ModelExpress
+server on a `Dynamo` one. The substrate selector has to follow the stack, and the
+ModelExpress server is a Modelplane-owned component we have not yet checked for a metrics
+endpoint.
 
-Scrape the engine port by name, not by number. The engine serves `/metrics` on its
-serving port, which the backends name `http` in `native.py`, `llmd.py`, and `routing.py`.
-It is `http` and not `metrics` because it is the one serving port, not a dedicated metrics
-one. Under prefill/decode the decode engine serves on 8001 because the pd-sidecar takes
-8000, so matching 8000 by number would scrape the sidecar. By name, the scrape follows the
-engine on every pod.
+Scrape the engine port by name, not by number, which needs a change first: no backend
+names it today. `native.py`, `llmd.py`, and `grove.py` all compose
+`{"containerPort": 8000}` with no `name`, so a `PodMonitor` matching `port: http` matches
+nothing. Naming it is a prerequisite of this design rather than something it can assume.
+
+Name it `http` and not `metrics`, because it is the one serving port rather than a
+dedicated metrics one. The reason to go by name at all is prefill/decode: the decode
+engine serves on `_DECODE_ENGINE_PORT` (8001) because the pd-sidecar takes 8000, so
+matching 8000 by number scrapes the sidecar. By name, the scrape follows the engine on
+every pod, on every backend.
 
 ## Capture from an opaque engine
 
@@ -162,10 +174,11 @@ the collector's config, the ConfigMap the OTel collector loads on each cluster. 
 `rename` map becomes transform-processor rules, applied to metrics from the pods the
 `selector` matches. A new engine is a new `MetricMapping`, not a package change.
 
-The kind and the collector that consumes it are implemented in #412, and this section
-describes what that PR does: `compose-serving-stack` reads every `MetricMapping` and
-renders it into the collector's transform rules, each gated on the engine the mapping
-selects.
+The kind and the collector that consumes it were built in
+[#412](https://github.com/modelplaneai/modelplane/pull/412): `compose-serving-stack` reads
+every `MetricMapping` and renders it into the collector's transform rules, each gated on
+the engine the mapping selects. That PR is closed unmerged, waiting on this design, and
+the branch `dennis/metrics-poc` stays.
 
 That was validated on a real GKE cluster with vLLM 0.23.0, which publishes 359 metric
 lines. The mapped ones came back renamed and labelled with their engine, the rename
@@ -226,14 +239,20 @@ interval is a knob rather than a fixed value.
 ## Cluster scheduler metrics
 
 The engine is not the only pluggable component on a workload cluster. The pod scheduler
-that places the engine pods is one too. By default it is kube-scheduler. On a managed
-cluster that scheduler sits in the provider's control plane and is often not scrapable. A
-fleet running multi-node gangs or GPU fairness installs a gang scheduler instead, NVIDIA
-KAI or Volcano. Those run as in-cluster pods the collector reaches. Modelplane treats such
-a scheduler like an engine. A per-scheduler mapping, keyed by the one installed, normalizes
-to a `modelplane_cluster_scheduler_*` surface. The name says cluster because a
-future Modelplane fleet scheduler, placing replicas across clusters rather than pods across
-nodes, would get its own `modelplane_fleet_scheduler_*` surface.
+that places the engine pods is one too. By default it is kube-scheduler, which on a managed
+cluster sits in the provider's control plane and is often not scrapable.
+
+A gang scheduler runs as in-cluster pods the collector reaches, and on a `Dynamo` cluster
+Modelplane now installs one itself. `compose-serving-stack` composes the KAI Scheduler and
+the queues its pods schedule against, so KAI's series are first-party rather than something
+a platform team might have brought: the queue is `modelplane` under an unbounded
+`modelplane-root`, and every Grove pod carries `kai.scheduler/queue: modelplane`. A fleet
+that brought Volcano itself is the same problem one mapping further out.
+
+Modelplane treats a scheduler like an engine. A per-scheduler mapping, keyed by the one
+installed, normalizes to a `modelplane_cluster_scheduler_*` surface. The name says cluster
+because a future Modelplane fleet scheduler, placing replicas across clusters rather than
+pods across nodes, would get its own `modelplane_fleet_scheduler_*` surface.
 
 Five signals matter, and they answer whether a replica's pods reach GPUs and whether the
 cluster's capacity is shared fairly across teams.
@@ -244,7 +263,10 @@ cluster's capacity is shared fairly across teams.
   `volcano_e2e_job_scheduling_latency_milliseconds`.
 - **Gang readiness.** Whether a podgroup's pods can all start at once,
   `volcano_queue_pod_group_pending_count` against `_running_count`. A gang that never forms
-  is a stuck multi-node deployment.
+  is a stuck multi-node deployment. On a Dynamo cluster this has to come from KAI, not from
+  Grove: `PodCliqueSet.status.podGangStatuses` exists on the type and nothing writes it, so
+  `availableReplicas` is the only signal Grove publishes, and it can't distinguish a gang
+  that never formed from one still forming.
 - **Per-queue GPU allocation against quota.** `kai_queue_allocated_gpus`, Volcano's
   `volcano_queue_allocated_scalar_resources` against `_deserved_` and `_capacity_`, with
   `volcano_queue_overused` for fairness.
