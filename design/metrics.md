@@ -18,13 +18,18 @@ the engines, the endpoint pickers, and the substrate, with no per-deployment tog
 
 **Normalize to `modelplane_*`.** Each engine names its metrics its own way (`vllm:*`,
 `sglang:*`). The collector renames them to one Modelplane vocabulary, picked by an
-engine-type label, so a dashboard reads Modelplane's names and not each engine's.
+engine-type label, so a dashboard reads Modelplane's names and not each engine's. That
+label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeployment`.
 
 **Aggregate to one view.** Every cluster's series roll up to one view at the control
 plane, so one query covers the whole deployment instead of a per-cluster island.
 
-**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, not a
-per-cluster Prometheus. The section below gives the reasons.
+**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, added beside
+the per-cluster Prometheus rather than replacing it. The section below gives the reasons.
+
+Two API additions carry it: a `MetricMapping` kind holding one engine's renames, and
+`engines[].type` on a `ModelDeployment`. Naming the engine port is a third change, to
+`compose-model-replica` rather than to an API.
 
 Approving this means agreeing that normalization and aggregation are Modelplane's job
 rather than the platform team's, that collection is always on, and that the collector is
@@ -103,11 +108,20 @@ args, and serving stays opaque to the engine inside. Normalization is the opposi
 enough engine identity to pick a mapping, and no more.
 
 The pattern is the one the [GAIE model-server-protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/003-model-server-protocol/README.md)
-already uses, and that Modelplane's routing depends on: read a label, don't detect the
-engine. The GAIE endpoint picker carries metric mappings for vLLM and SGLang and selects
-one from an engine-type label on the pod. If Modelplane runs that picker for
-KV-cache-aware routing, the engine-type label already exists, and normalization reuses it.
-The label serves two consumers, the picker for routing and the collector for normalization.
+uses: read a label, don't detect the engine. The GAIE endpoint picker carries metric
+mappings for vLLM and SGLang and selects one from an engine-type label on the pod.
+
+No such label exists in Modelplane today, and an ML team can't add one. The
+`ModelDeployment` XRD rejects any label key under the reserved `modelplane.ai/` prefix, on
+both the deployment and the member pod template, so `modelplane.ai/engine: vllm` fails to
+apply. That prefix is Modelplane's to stamp, which is how `modelplane.ai/serving`,
+`modelplane.ai/workload` and `modelplane.ai/pool` already reach pods.
+
+So the engine type is a field, and the label is derived from it. An optional `type` on the
+engine, an enum of the kinds Modelplane ships a mapping for, which
+`compose-model-replica` stamps onto the pod as `modelplane.ai/engine` alongside the labels
+it already applies. One field feeds two consumers, the picker for routing and the collector
+for normalization, and the reserved prefix keeps meaning what it means.
 The picker routes any engine. Its KV- and queue-aware scoring reads the engine's standard
 metrics through the same mapping, so an engine without them still routes, only less
 informed.
@@ -116,9 +130,11 @@ informed.
   follows the GAIE protocol and the OpenTelemetry GenAI conventions: TTFT, time per output
   token, queue depth, KV-cache occupancy. It's the metrics analogue of the OpenAI API
   contract Modelplane already assumes for serving.
-- **Selection by label.** An engine-type label (`modelplane.ai/engine: vllm`) picks the
-  `MetricMapping`. The ML team already chose the engine in the image. Naming its kind for
-  metrics is one token and touches nothing about serving.
+- **Selection by a stamped label.** `ModelDeployment` gains `engines[].type`, and
+  Modelplane stamps `modelplane.ai/engine` from it. That label picks the `MetricMapping`.
+  The ML team already chose the engine in the image, so naming its kind is one enum value
+  and touches nothing about serving. Typed rather than free-form, it validates on apply
+  and a mapping can't be selected by a value nothing produces.
 - **A registry of first-class resources.** Each mapping is a `MetricMapping`, a Modelplane
   kind, not a ConfigMap or an EnvironmentConfig. Modelplane installs the built-in ones
   (vLLM, SGLang, Triton/TensorRT-LLM). A platform team applies one more for a new or forked
@@ -159,11 +175,12 @@ metadata:
 spec:
   selector:
     matchLabels:
-      modelplane.ai/engine: vllm
+      modelplane.ai/engine: vllm      # stamped by Modelplane from engines[].type
   rename:
     vllm:time_to_first_token_seconds: modelplane_time_to_first_token
-    vllm:inter_token_latency_seconds: modelplane_inter_token_latency
+    vllm:inter_token_latency_seconds: modelplane_time_per_output_token
     vllm:num_requests_waiting: modelplane_requests_waiting
+    vllm:gpu_cache_usage_perc: modelplane_kv_cache_utilization
   labels:
     add: { engine: vllm }
 ```
@@ -318,6 +335,21 @@ Prometheus.
 - **One pipeline carries three signals.** Metrics, the #77 traces, and logs travel
   together, where a Prometheus stack is metrics only.
 
+The kube-prometheus-stack `compose-serving-stack` installs stays. It is unconditional
+today, on both stacks, and two things here depend on it: it already scrapes the substrate
+and the gateway's Envoy proxies, and its operator is what defines the `PodMonitor` CRD this
+design composes against. So the collector is added beside it rather than in place of it,
+and what the collector removes is per-cluster recording rules and a second Prometheus at
+the center, not the one already on each cluster.
+
+That leaves one thing to settle: a plain OTel collector doesn't read `PodMonitor`s. Either
+it runs under the OpenTelemetry Operator, whose target allocator consumes `PodMonitor` and
+`ServiceMonitor` directly and keeps the cluster-wide-selector shape below, or it carries
+its own Kubernetes service-discovery scrape config and `PodMonitor` is the wrong word
+throughout this document. The target allocator is the smaller change and preserves the
+#264 upgrade path, but nobody has run it here, so it is a decision this design records
+rather than one it has tested.
+
 ## Architecture
 
 ```mermaid
@@ -349,10 +381,12 @@ flowchart LR
 
 Each cluster runs the kube-prometheus-stack `compose-serving-stack` already installs, with
 composed `PodMonitor`s, and remote-writes to a central Prometheus-compatible store. It's
-the incumbent and PromQL is standard. The collector wins for the reasons
-above: it renames in the pipeline instead of through per-cluster recording rules, carries
-traces and logs on the same path, and runs no full Prometheus per cluster or at the center.
-If an operator does want a store, it can still be Prometheus-compatible.
+the incumbent and PromQL is standard. The collector wins for the reasons above: it renames
+in the pipeline instead of through per-cluster recording rules, and carries traces and logs
+on the same path. It does not remove the per-cluster Prometheus, which stays for the
+substrate and for its `PodMonitor` CRD; what it avoids is recording rules on every cluster
+and a second Prometheus at the center. If an operator does want a store, it can still be
+Prometheus-compatible.
 
 ### Stop at per-cluster collection
 
