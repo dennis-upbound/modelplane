@@ -39,8 +39,6 @@ today.
 
 ## What to monitor
 
-Four things are worth watching in a Modelplane deployment.
-
 **Inference signal (data plane).** The engine's `/metrics`, the EPP's `llm_d_epp_*`, and
 Envoy. TTFT, inter-token latency, tokens per second, queue depth, KV-cache occupancy, and
 request and error rates per model. It answers "is my model serving well, and is it
@@ -60,7 +58,7 @@ function latency and panics, the fleet scheduler placing replicas, and XR `Ready
 **Fleet roll-up.** Across every cluster and deployment: total capacity, GPU usage,
 degraded deployments, and cost.
 
-All four are in the central view. The data plane and substrate are collected on each
+Every one of these is in the central view. The data plane and substrate are collected on each
 cluster and aggregated up, the control plane is scraped at the center, and the fleet
 roll-up is the collector's aggregation over the collected series.
 
@@ -72,7 +70,7 @@ configured composes no collector, because a collector with nowhere to send is co
 a reader. Once a destination exists, collection is on for everything Modelplane owns, and a
 `ModelDeployment` author doesn't get a toggle over telemetry the platform team consumes.
 
-Two existing pieces make it cheap.
+The pieces are already there.
 
 - **The serving label spans every shape.** `modelplane.ai/serving` is on standalone pods,
   LeaderWorkerSet leaders, Grove leader cliques, and both prefill and decode engines,
@@ -250,8 +248,8 @@ exporters:
 ```
 
 An unmapped engine matches the scrape config and no `transform` block, so it arrives under
-its own names. That is the degradation above, and it falls out of the structure rather than
-needing a rule.
+its own names. That is the degradation above, and the structure gives it rather than a
+rule having to.
 
 The kind and the collector that consumes it were built in
 [#412](https://github.com/modelplaneai/modelplane/pull/412): `compose-serving-stack` reads
@@ -333,8 +331,8 @@ installed, normalizes to a `modelplane_cluster_scheduler_*` surface. The name sa
 because a future Modelplane fleet scheduler, placing replicas across clusters rather than
 pods across nodes, would get its own `modelplane_fleet_scheduler_*` surface.
 
-Five signals matter, and they answer whether a replica's pods reach GPUs and whether the
-cluster's capacity is shared fairly across teams.
+These signals answer whether a replica's pods reach GPUs, and whether a cluster's capacity
+is shared fairly across teams.
 
 - **Pending or unschedulable work.** kube-scheduler's `scheduler_pending_pods{queue}`,
   Volcano's `volcano_unschedule_job_counts`, a KAI queue's waiting podgroups.
@@ -371,18 +369,18 @@ kubeconfig `provider-kubernetes` holds. Nothing guarantees a path back, least of
 an on-premise or neocloud GPU cluster behind a firewall. So transport is a real question
 rather than a detail of the exporter.
 
-**Push, agent to gateway. The default.** Each cluster's collector OTLP-exports to a gateway
+**Push to a gateway collector.** The default. Each cluster's collector OTLP-exports to one
 collector at the control plane, which is OpenTelemetry's own multi-cluster pattern. The
 cluster needs egress and nothing inbound, and nothing on it is exposed. The control plane
-exposes one OTLP endpoint, which is a Gateway API listener with TLS, the same surface the
-inference gateway already is.
+exposes one OTLP endpoint, a Gateway API listener with TLS, the same kind of surface the
+inference gateway already serves.
 
 Credentials are already solved. `ModelCache` propagates an `authSecret` from the control
 plane to every matched cluster so hydration can read a HuggingFace token. A bearer token or
 client certificate for the OTLP endpoint travels the same way, through the same mechanism,
 so this adds a Secret to propagate rather than a way to propagate Secrets.
 
-**Pull through the API server proxy. The fallback.** Where a cluster has no egress, the
+**Pull through the API server proxy.** The fallback, for a cluster with no egress. The
 center scrapes it over the connection it already has. The Kubernetes API server proxies to
 in-cluster Services, so the collector is reachable at
 `/api/v1/namespaces/<ns>/services/<collector>:<port>/proxy/metrics` with the credential
@@ -394,11 +392,11 @@ That makes this a fallback for a cluster that cannot push rather than a default,
 a ceiling on how much a cluster in that mode can send.
 
 **Pull direct.** A LoadBalancer or Ingress per cluster for the center to scrape. It needs
-inbound exposure on every GPU cluster, which is the thing the other two avoid. Recorded to
-be dismissed.
+inbound exposure on every GPU cluster, which the other two avoid. Named here only to rule
+it out.
 
-Which mode a cluster uses is per cluster, and reported on the `InferenceCluster` status so
-an operator can see it without inferring it from a config.
+The mode is per cluster, and reported on the `InferenceCluster` status, so an operator can
+read it rather than infer it from a config.
 
 The roll-up is a set of `modelplane_*` series over the aggregate: capacity, GPU usage,
 cost, degraded deployments, and SLO attainment such as the fraction of requests under a
@@ -406,15 +404,15 @@ TTFT target. The control-plane collector produces them in memory, because each i
 aggregation it already does. It sums gauges and counters across clusters and merges
 per-cluster histograms into a fleet histogram. SLO attainment is a ratio of buckets in
 that merged histogram when a boundary sits at the target, which is ours to set. So Modelplane
-runs no store and the control plane stays stateless, which is what lets it run in a Space.
+runs no store and the control plane stays stateless, as running in a Space requires.
 
 Computing a percentile value or answering an ad-hoc query is read-time work for whatever
 consumes the export, a dashboard or an operator's own Prometheus-compatible backend.
 
 ### Exporters and destination
 
-The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, which is what the gateway
-collector and any OpenTelemetry-compatible backend take. `prometheusremotewrite` covers an
+The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, taken by the gateway
+collector and by any OpenTelemetry-compatible backend. `prometheusremotewrite` covers an
 operator who wants the series in a Prometheus-compatible store instead. Vendor-specific
 exporters are out of scope: an operator who wants one puts it behind the gateway, where one
 configuration serves the fleet rather than one per cluster.
@@ -440,20 +438,20 @@ a rolling update into a fresh set of series that never gets written to again. Ke
 `engine`, `cluster`, `model`, `deployment`, and `namespace`, which are the dimensions the
 roll-up and every dashboard query group by.
 
-One trap worth naming, because the obvious processor is the wrong one. The `attributes`
-processor's `delete_key` removes a label but leaves the series that collided on it as
-separate, undefined points rather than merging them. Merging within a dropped dimension is
-`metricstransform` with an aggregation action, which sums the colliding series into one.
+The obvious processor is the wrong one. The `attributes` processor's `delete_key` removes a
+label but leaves the series that collided on it as separate, undefined points rather than
+merging them. Merging within a dropped dimension is `metricstransform` with an aggregation
+action, which sums the colliding series into one.
 Getting this wrong looks like it worked and reports nonsense.
 
 Histogram buckets are the other cardinality cost, and not one to trim. `le` is what makes
-the fleet histogram and the SLO ratio above possible, so the buckets are the GenAI
-conventions' and stay.
+the fleet histogram and the SLO ratio above possible, so the buckets stay as the GenAI
+conventions define them.
 
 ## Collector: OpenTelemetry
 
 The collector is an OpenTelemetry collector, and it replaces the kube-prometheus-stack
-`compose-serving-stack` installs. Three reasons settle that over keeping Prometheus.
+`compose-serving-stack` installs. The reasons, over keeping Prometheus:
 
 - **The normalization target is a standard.** The OpenTelemetry GenAI conventions already
   define `time_to_first_token` and `time_per_output_token` as histograms with LLM-shaped
@@ -494,8 +492,6 @@ EPP and `k8s_cluster` answer the inference and substrate questions above. Node C
 and disk answer a question a platform team may already have another agent for.
 
 ### What we give up
-
-Two things, both worth stating rather than discovering.
 
 Ad-hoc PromQL against a local store. Today an operator can port-forward a cluster's
 Prometheus and query it. After this there is no per-cluster store, so ad-hoc querying moves
@@ -589,7 +585,7 @@ workflow go: the hand-written `PodMonitor`, because discovery moves into the col
 scrape config, and the port-forward to the in-cluster Prometheus, because there is no
 longer one. Rewriting the guide against the composed collector is part of this work.
 
-Two upgrade notes come with it. A hand-written `PodMonitor` left in place is inert once the
+A hand-written `PodMonitor` left in place is inert once the
 Prometheus Operator is gone, so it stops working rather than double-scraping, which is
 quieter and worse; it should be called out. And an operator relying on that Prometheus for
 anything of their own loses it, so the release note has to say the store is going and where
