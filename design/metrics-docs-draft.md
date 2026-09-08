@@ -112,9 +112,9 @@ so one query spans the fleet:
 | Metric | Means |
 |---|---|
 | `modelplane_time_to_first_token` | Latency to the first token, as a histogram |
-| `modelplane_time_per_output_token` | Inter-token latency, as a histogram |
+| `modelplane_inter_token_latency` | The gap between output tokens, as a histogram |
 | `modelplane_requests_waiting` | Queue depth per engine |
-| `modelplane_kv_cache_utilization` | KV-cache occupancy per engine |
+| `modelplane_kv_cache_usage` | KV-cache occupancy per engine |
 
 Pod-scoped labels are dropped before export: a rolling update would otherwise
 leave a dead series behind for every pod it replaced.
