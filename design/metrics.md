@@ -65,9 +65,12 @@ roll-up is the collector's aggregation over the collected series.
 ## Collect on every cluster
 
 On each cluster Modelplane collects from every source it owns, with no per-deployment
-opt-in or opt-out. The switch is one level up: a cluster with no export destination
-configured composes no collector, because a collector with nowhere to send is cost without
-a reader. Once a destination exists, collection is on for everything Modelplane owns, and a
+opt-in or opt-out. The switch is one level up, and at the fleet: with no destination
+configured anywhere, no cluster composes a collector, because a collector nothing reads is
+cost with no reader. The gate is the fleet destination and not a per-cluster exporter,
+since a cluster the center pulls from has no exporter of its own and still delivers.
+
+Once a destination exists, collection is on for everything Modelplane owns, and a
 `ModelDeployment` author doesn't get a toggle over telemetry the platform team consumes.
 
 The pieces are already there.
@@ -140,9 +143,11 @@ informed.
   contract Modelplane already assumes for serving.
 - **Selection by a stamped label.** `ModelDeployment` gains `engines[].type`, and
   Modelplane stamps `modelplane.ai/engine` from it. That label picks the `MetricMapping`.
-  The ML team already chose the engine in the image, so naming its kind is one enum value
-  and touches nothing about serving. Typed rather than free-form, it validates on apply
-  and a mapping can't be selected by a value nothing produces.
+  The ML team already chose the engine in the image, so naming its kind touches nothing
+  about serving. It is a free-form string validated as a label value, not an enum: the
+  registry below is open to a mapping for a forked or unreleased engine, and an enum would
+  close the selector against the values that mapping needs to match. A value with no
+  mapping degrades to passthrough, which is the behaviour below rather than an error.
 - **A registry of first-class resources.** Each mapping is a `MetricMapping`, a Modelplane
   kind, not a ConfigMap or an EnvironmentConfig. Modelplane installs the built-in ones
   (vLLM, SGLang, Triton/TensorRT-LLM). A platform team applies one more for a new or forked
@@ -387,6 +392,11 @@ in-cluster Services, so the collector is reachable at
 Modelplane already holds. No inbound exposure, no firewall change, no second credential;
 the only addition is a `ClusterRole` granting `services/proxy`.
 
+This changes the collector's exporter and not only its transport. A cluster the center
+pulls from exposes a scrape endpoint for the center to read, where a pushing cluster
+OTLP-exports and exposes nothing. The center is what turns the result back into one stream,
+so the destination and everything downstream of it are the same either way.
+
 The cost is that every series crosses the API server, which is not built to carry them.
 That makes this a fallback for a cluster that cannot push rather than a default, and it puts
 a ceiling on how much a cluster in that mode can send.
@@ -497,6 +507,13 @@ Ad-hoc PromQL against a local store. Today an operator can port-forward a cluste
 Prometheus and query it. After this there is no per-cluster store, so ad-hoc querying moves
 to whatever consumes the export. That is the same trade the roll-up section already makes
 for the center, applied to each cluster.
+
+Which inverts what a fresh install gives you, and the inversion is worth stating rather
+than discovering. Today Modelplane installs a working per-cluster store with no
+aggregation. After this it aggregates across the fleet and stores nothing, so an install
+with no destination configured collects nothing at all. That is the right trade for a fleet
+and the wrong one for a first afternoon with Modelplane, which argues for the getting
+started path shipping a destination rather than leaving the field empty.
 
 The [#264](https://github.com/modelplaneai/modelplane/issues/264) guide. Its whole workflow
 is a hand-written `PodMonitor` plus a port-forward to the in-cluster Prometheus, and both
