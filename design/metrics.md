@@ -24,16 +24,18 @@ label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeploym
 **Aggregate to one view.** Every cluster's series roll up to one view at the control
 plane, so one query covers the whole deployment instead of a per-cluster island.
 
-**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, added beside
-the per-cluster Prometheus rather than replacing it. The section below gives the reasons.
+**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, and it
+replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
+below gives the reasons and what covers each thing that stack did.
 
 Two API additions carry it: a `MetricMapping` kind holding one engine's renames, and
 `engines[].type` on a `ModelDeployment`. Naming the engine port is a third change, to
 `compose-model-replica` rather than to an API.
 
 Approving this means agreeing that normalization and aggregation are Modelplane's job
-rather than the platform team's, that collection is always on, and that the collector is
-OpenTelemetry.
+rather than the platform team's, that collection is on for every source once a destination
+exists, and that the collector is OpenTelemetry in place of the Prometheus stack we install
+today.
 
 ## What to monitor
 
@@ -64,8 +66,13 @@ roll-up is the collector's aggregation over the collected series.
 
 ## Collect on every cluster
 
-On each cluster Modelplane collects from every source it owns, with no opt-in or opt-out.
-Three existing pieces make it cheap.
+On each cluster Modelplane collects from every source it owns, with no per-deployment
+opt-in or opt-out. The switch is one level up: a cluster with no export destination
+configured composes no collector, because a collector with nowhere to send is cost without
+a reader. Once a destination exists, collection is on for everything Modelplane owns, and a
+`ModelDeployment` author doesn't get a toggle over telemetry the platform team consumes.
+
+Two existing pieces make it cheap.
 
 - **The serving label spans every shape.** `modelplane.ai/serving` is on standalone pods,
   LeaderWorkerSet leaders, Grove leader cliques, and both prefill and decode engines,
@@ -73,11 +80,13 @@ Three existing pieces make it cheap.
   so leader/worker, prefill/decode, and a Dynamo cluster's PodCliqueSets need no special
   casing. The Dynamo work added a fourth workload kind without touching this, which is the
   test this approach had to pass.
-- **The stack already scrapes.** `compose-serving-stack` runs a metrics stack on every
-  workload cluster and already scrapes the gateway's Envoy proxies, so adding a target is
-  composition, not new infrastructure.
 - **Modelplane owns the picker.** The EPP is Modelplane's own Deployment, so its metrics
   port and flags are ours to set.
+
+The scrape config carries over as it stands. `compose-serving-stack` scrapes the gateway's
+Envoy proxies today through the Prometheus chart's `additionalScrapeConfigs`, which is a
+`kubernetes_sd_configs` block. That is the same format the collector's `prometheus`
+receiver takes, so the Envoy target moves across verbatim rather than being rewritten.
 
 A cluster-wide selector on `modelplane.ai/serving` covers every engine of every
 deployment, so collection is a cluster property rather than something composed per
@@ -90,8 +99,9 @@ endpoint.
 
 Scrape the engine port by name, not by number, which needs a change first: no backend
 names it today. `native.py`, `llmd.py`, and `grove.py` all compose
-`{"containerPort": 8000}` with no `name`, so a `PodMonitor` matching `port: http` matches
-nothing. Naming it is a prerequisite of this design rather than something it can assume.
+`{"containerPort": 8000}` with no `name`, so the `__meta_kubernetes_pod_container_port_name`
+relabel the scrape config below keeps on has nothing to match. Naming it is a prerequisite
+of this design rather than something it can assume.
 
 Name it `http` and not `metrics`, because it is the one serving port rather than a
 dedicated metrics one. The reason to go by name at all is prefill/decode: the decode
@@ -190,6 +200,58 @@ spec:
 the collector's config, the ConfigMap the OTel collector loads on each cluster. The
 `rename` map becomes transform-processor rules, applied to metrics from the pods the
 `selector` matches. A new engine is a new `MetricMapping`, not a package change.
+
+What that renders, with the vLLM mapping above as the only one installed:
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+      - job_name: modelplane-engines
+        kubernetes_sd_configs: [{ role: pod }]
+        relabel_configs:
+        # every engine of every deployment, whatever its workload kind
+        - source_labels: [__meta_kubernetes_pod_label_modelplane_ai_serving]
+          action: keep
+          regex: .+
+        # the engine's own port, not a sidecar's
+        - source_labels: [__meta_kubernetes_pod_container_port_name]
+          action: keep
+          regex: http
+
+processors:
+  # lifts the stamped engine label onto the series as a resource attribute
+  k8sattributes:
+    extract:
+      labels:
+      - { tag_name: engine, key: modelplane.ai/engine, from: pod }
+
+  # one block per MetricMapping, gated on the engine it selects
+  transform/vllm:
+    metric_statements:
+    - context: metric
+      conditions:
+      - resource.attributes["engine"] == "vllm"
+      statements:
+      - set(name, "modelplane_time_to_first_token")
+          where name == "vllm:time_to_first_token_seconds"
+      - set(name, "modelplane_time_per_output_token")
+          where name == "vllm:inter_token_latency_seconds"
+      - set(name, "modelplane_requests_waiting")
+          where name == "vllm:num_requests_waiting"
+      - set(name, "modelplane_kv_cache_utilization")
+          where name == "vllm:gpu_cache_usage_perc"
+
+exporters:
+  otlp:
+    endpoint: ${MODELPLANE_OTLP_ENDPOINT}
+    auth: { authenticator: bearertokenauth }
+```
+
+An unmapped engine matches the scrape config and no `transform` block, so it arrives under
+its own names. That is the degradation above, and it falls out of the structure rather than
+needing a rule.
 
 The kind and the collector that consumes it were built in
 [#412](https://github.com/modelplaneai/modelplane/pull/412): `compose-serving-stack` reads
@@ -301,12 +363,42 @@ control plane, which also collects the control plane's own metrics (Crossplane, 
 functions, the fleet scheduler). One query then covers the whole deployment rather than a
 per-cluster island an operator stitches together by hand.
 
-The cluster sends by pushing outbound. Each collector remote-writes or OTLP-exports to a
-control-plane endpoint, so the workload cluster needs only egress, which is what makes it
-work across regions and through firewalls. Nothing inbound to the cluster is required, and
-nothing is exposed outside it. The center can pull instead where it already reaches the
-cluster, publishing the cluster's endpoint on the `InferenceCluster` status, but push is the
-default for the regional and firewalled case.
+### Getting the series across
+
+Modelplane has exactly one connection to a workload cluster it can count on, and it runs
+the wrong way for this. The control plane reaches the cluster's API server with the
+kubeconfig `provider-kubernetes` holds. Nothing guarantees a path back, least of all from
+an on-premise or neocloud GPU cluster behind a firewall. So transport is a real question
+rather than a detail of the exporter.
+
+**Push, agent to gateway. The default.** Each cluster's collector OTLP-exports to a gateway
+collector at the control plane, which is OpenTelemetry's own multi-cluster pattern. The
+cluster needs egress and nothing inbound, and nothing on it is exposed. The control plane
+exposes one OTLP endpoint, which is a Gateway API listener with TLS, the same surface the
+inference gateway already is.
+
+Credentials are already solved. `ModelCache` propagates an `authSecret` from the control
+plane to every matched cluster so hydration can read a HuggingFace token. A bearer token or
+client certificate for the OTLP endpoint travels the same way, through the same mechanism,
+so this adds a Secret to propagate rather than a way to propagate Secrets.
+
+**Pull through the API server proxy. The fallback.** Where a cluster has no egress, the
+center scrapes it over the connection it already has. The Kubernetes API server proxies to
+in-cluster Services, so the collector is reachable at
+`/api/v1/namespaces/<ns>/services/<collector>:<port>/proxy/metrics` with the credential
+Modelplane already holds. No inbound exposure, no firewall change, no second credential;
+the only addition is a `ClusterRole` granting `services/proxy`.
+
+The cost is that every series crosses the API server, which is not built to carry them.
+That makes this a fallback for a cluster that cannot push rather than a default, and it puts
+a ceiling on how much a cluster in that mode can send.
+
+**Pull direct.** A LoadBalancer or Ingress per cluster for the center to scrape. It needs
+inbound exposure on every GPU cluster, which is the thing the other two avoid. Recorded to
+be dismissed.
+
+Which mode a cluster uses is per cluster, and reported on the `InferenceCluster` status so
+an operator can see it without inferring it from a config.
 
 The roll-up is a set of `modelplane_*` series over the aggregate: capacity, GPU usage,
 cost, degraded deployments, and SLO attainment such as the fraction of requests under a
@@ -319,36 +411,101 @@ runs no store and the control plane stays stateless, which is what lets it run i
 Computing a percentile value or answering an ad-hoc query is read-time work for whatever
 consumes the export, a dashboard or an operator's own Prometheus-compatible backend.
 
+### Exporters and destination
+
+The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, which is what the gateway
+collector and any OpenTelemetry-compatible backend take. `prometheusremotewrite` covers an
+operator who wants the series in a Prometheus-compatible store instead. Vendor-specific
+exporters are out of scope: an operator who wants one puts it behind the gateway, where one
+configuration serves the fleet rather than one per cluster.
+
+A Modelplane user does not write collector YAML. The destination is fleet-level
+configuration, one endpoint to match one view, propagated to each cluster's `ServingStack`
+and rendered into the collector's config there. Its credential is a Secret reference
+resolved per cluster, as above.
+
+Where that configuration lives is open. A field on a fleet-level resource and a kind of its
+own both work, and the choice is the same one `MetricMapping` faced: a typed kind validates
+on apply and lists under `kubectl get`, at the cost of another kind. Worth settling before
+implementation rather than in it.
+
+### Cardinality
+
+Every label multiplies series, and an inference fleet has labels that churn. Dropping them
+in the collector before export is cheaper than paying for them downstream and then
+aggregating them away.
+
+Dropped: `pod`, `pod_uid`, and `container_id`. Each is new on every restart, so each turns
+a rolling update into a fresh set of series that never gets written to again. Kept:
+`engine`, `cluster`, `model`, `deployment`, and `namespace`, which are the dimensions the
+roll-up and every dashboard query group by.
+
+One trap worth naming, because the obvious processor is the wrong one. The `attributes`
+processor's `delete_key` removes a label but leaves the series that collided on it as
+separate, undefined points rather than merging them. Merging within a dropped dimension is
+`metricstransform` with an aggregation action, which sums the colliding series into one.
+Getting this wrong looks like it worked and reports nonsense.
+
+Histogram buckets are the other cardinality cost, and not one to trim. `le` is what makes
+the fleet histogram and the SLO ratio above possible, so the buckets are the GenAI
+conventions' and stay.
+
 ## Collector: OpenTelemetry
 
-The collector is an OpenTelemetry collector. Three reasons settle it over a per-cluster
-Prometheus.
+The collector is an OpenTelemetry collector, and it replaces the kube-prometheus-stack
+`compose-serving-stack` installs. Three reasons settle that over keeping Prometheus.
 
 - **The normalization target is a standard.** The OpenTelemetry GenAI conventions already
   define `time_to_first_token` and `time_per_output_token` as histograms with LLM-shaped
   buckets. `modelplane_*` adopts those names rather than inventing them.
 - **The rename happens in the pipeline.** The collector scrapes each engine's `/metrics`
-  with the Prometheus receiver. The transform processor renames the series to
-  `modelplane_*`, keyed by the engine label, before forwarding up. A Prometheus stack
+  with the Prometheus receiver and renames the series before forwarding. A Prometheus stack
   pushes that rename into recording rules on every cluster and still needs its own
   federation.
 - **One pipeline carries three signals.** Metrics, the #77 traces, and logs travel
   together, where a Prometheus stack is metrics only.
 
-The kube-prometheus-stack `compose-serving-stack` installs stays. It is unconditional
-today, on both stacks, and two things here depend on it: it already scrapes the substrate
-and the gateway's Envoy proxies, and its operator is what defines the `PodMonitor` CRD this
-design composes against. So the collector is added beside it rather than in place of it,
-and what the collector removes is per-cluster recording rules and a second Prometheus at
-the center, not the one already on each cluster.
+An earlier draft argued Prometheus had to stay because its operator defines the
+`PodMonitor` CRD this design composes against. That has the dependency backwards.
+`PodMonitor` is a consequence of having chosen Prometheus, not a requirement of collection.
+The collector's `prometheus` receiver does Kubernetes service discovery itself, so
+discovery is a scrape config in the collector's own ConfigMap and no CRD is involved.
 
-That leaves one thing to settle: a plain OTel collector doesn't read `PodMonitor`s. Either
-it runs under the OpenTelemetry Operator, whose target allocator consumes `PodMonitor` and
-`ServiceMonitor` directly and keeps the cluster-wide-selector shape below, or it carries
-its own Kubernetes service-discovery scrape config and `PodMonitor` is the wrong word
-throughout this document. The target allocator is the smaller change and preserves the
-#264 upgrade path, but nobody has run it here, so it is a decision this design records
-rather than one it has tested.
+### What replaces the stack
+
+Each thing kube-prometheus-stack does today has a receiver that does it.
+
+| Today | Replacement |
+|---|---|
+| `PodMonitor` discovery | `prometheus` receiver with `kubernetes_sd_configs` |
+| The Envoy scrape config | the same block, moved into that receiver |
+| kube-state-metrics | `k8s_cluster` receiver |
+| cAdvisor and kubelet | `kubeletstats` receiver |
+| node-exporter | `hostmetrics` receiver |
+
+That splits the collector in two, which the current design doesn't describe. Node-scoped
+receivers (`kubeletstats`, `hostmetrics`, and the `filelog` receiver when logs follow) need
+a collector on every node, so they run as a DaemonSet. Cluster-scoped ones (`k8s_cluster`,
+and the engine and EPP scrapes) run as one Deployment. The engine scrape could run in
+either; putting it in the Deployment keeps one scrape config rather than N node-local ones.
+
+Whether the DaemonSet tier is in the first cut is worth deciding separately. Engines, the
+EPP and `k8s_cluster` answer the inference and substrate questions above. Node CPU, memory
+and disk answer a question a platform team may already have another agent for.
+
+### What we give up
+
+Two things, both worth stating rather than discovering.
+
+Ad-hoc PromQL against a local store. Today an operator can port-forward a cluster's
+Prometheus and query it. After this there is no per-cluster store, so ad-hoc querying moves
+to whatever consumes the export. That is the same trade the roll-up section already makes
+for the center, applied to each cluster.
+
+The [#264](https://github.com/modelplaneai/modelplane/issues/264) guide. Its whole workflow
+is a hand-written `PodMonitor` plus a port-forward to the in-cluster Prometheus, and both
+halves go. Rewriting it against the composed collector is part of this work, not a
+follow-up.
 
 ## Architecture
 
@@ -367,8 +524,8 @@ flowchart LR
     end
     OP["operator\ndashboards + alerting"]
     SA --> CA
-    CA -->|push| CENT
-    CB -->|push| CENT
+    CA -->|"push (OTLP)"| CENT
+    CENT -->|"pull via API proxy<br/>(no egress)"| CB
     XP -->|scraped by| CENT
     CENT --> OP
     classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
@@ -379,14 +536,14 @@ flowchart LR
 
 ### A Prometheus stack
 
-Each cluster runs the kube-prometheus-stack `compose-serving-stack` already installs, with
+Each cluster keeps the kube-prometheus-stack `compose-serving-stack` installs today, with
 composed `PodMonitor`s, and remote-writes to a central Prometheus-compatible store. It's
-the incumbent and PromQL is standard. The collector wins for the reasons above: it renames
-in the pipeline instead of through per-cluster recording rules, and carries traces and logs
-on the same path. It does not remove the per-cluster Prometheus, which stays for the
-substrate and for its `PodMonitor` CRD; what it avoids is recording rules on every cluster
-and a second Prometheus at the center. If an operator does want a store, it can still be
-Prometheus-compatible.
+the incumbent, PromQL is standard, and it keeps the local store an operator can query. The
+collector wins for the reasons above: the rename happens in the pipeline rather than in
+recording rules on every cluster, and metrics, traces and logs travel one path. It also
+runs no Prometheus per cluster, where this shape runs one everywhere and needs its own
+federation on top. If an operator wants a store the export still reaches a
+Prometheus-compatible one, at the center, once.
 
 ### Stop at per-cluster collection
 
@@ -406,9 +563,9 @@ whole deployment.
 ### A PodMonitor per replica
 
 `compose-model-replica` could compose a `PodMonitor` per replica, so collection comes and
-goes with the deployment. With no opt-out and a cluster-wide collector, that per-deployment
-lifecycle buys nothing over one cluster-wide selector, and it composes N monitors where one
-does the same job.
+goes with the deployment. It buys nothing over one cluster-wide scrape config, and composes
+N objects where one does the same job. It also assumes the CRD, which goes with the
+Prometheus stack.
 
 ### A per-deployment opt-out field
 
@@ -427,9 +584,13 @@ the endpoint carries non-sensitive routing stats reachable only in-cluster,
 ## Interaction with #264
 
 The [#264](https://github.com/modelplaneai/modelplane/issues/264) example documents the
-manual path: a hand-written `PodMonitor` plus the operator wiring to consume it. Once
-collection is composed and aggregated, that example drops the hand-written
-`podmonitor.yaml`.
+manual path, and it is the published `collecting-engine-metrics` guide. Both halves of that
+workflow go: the hand-written `PodMonitor`, because discovery moves into the collector's
+scrape config, and the port-forward to the in-cluster Prometheus, because there is no
+longer one. Rewriting the guide against the composed collector is part of this work.
 
-On upgrade, an existing hand-written `PodMonitor` has to be deleted, or it double-scrapes
-the same pods alongside the composed one. This warrants a release note.
+Two upgrade notes come with it. A hand-written `PodMonitor` left in place is inert once the
+Prometheus Operator is gone, so it stops working rather than double-scraping, which is
+quieter and worse; it should be called out. And an operator relying on that Prometheus for
+anything of their own loses it, so the release note has to say the store is going and where
+the series go instead.
