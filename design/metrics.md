@@ -1,6 +1,6 @@
 # Metrics collection
 
-**Status:** Draft, with the MetricMapping kind proven and unmerged
+**Status:** Draft. The MetricMapping kind is proven and unmerged; the rest is unbuilt
 **Date:** August 2026
 **Author:** Dennis Ramdass
 
@@ -11,25 +11,28 @@ plane. It builds on [design.md](./design.md) and addresses
 
 ## Summary
 
-I propose four things.
-
-**Collect on every cluster, always on.** Modelplane collects from every source it owns,
-the engines, the endpoint pickers, and the substrate, with no per-deployment toggle.
+**Collect on every cluster.** Modelplane collects from every source it owns, the engines,
+the endpoint pickers, and the substrate, with no per-deployment toggle. A fleet with no
+destination configured collects nothing, since a collector nothing reads is cost with no
+reader.
 
 **Normalize to `modelplane_*`.** Each engine names its metrics its own way (`vllm:*`,
 `sglang:*`). The collector renames them to one Modelplane vocabulary, picked by an
 engine-type label, so a dashboard reads Modelplane's names and not each engine's. That
 label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeployment`.
 
-**Aggregate to one view.** Every cluster's series roll up to one view at the control
-plane, so one query covers the whole deployment instead of a per-cluster island.
+**Aggregate to one view.** Every cluster's series roll up at the control plane and leave
+as one stream, so what consumes them answers across the fleet rather than per cluster.
+Modelplane runs no store, so the view is whatever that destination is.
 
 **Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, and it
 replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
 below gives the reasons and what covers each thing that stack did.
 
-Two API additions carry it: a `MetricMapping` kind holding one engine's renames, and
-`engines[].type` on a `ModelDeployment`. Naming the engine port is a third change, to
+Four API changes carry it. Two are settled: a `MetricMapping` kind holding one engine's
+renames, and `engines[].type` on a `ModelDeployment`. Two need deciding before this is
+built: where a fleet's metrics destination lives, and the field that says whether a cluster
+pushes or is pulled from. Naming the engine port is a fifth change, to
 `compose-model-replica` rather than to an API.
 
 Approving this means agreeing that normalization and aggregation are Modelplane's job
@@ -58,8 +61,8 @@ function latency and panics, the fleet scheduler placing replicas, and XR `Ready
 **Fleet roll-up.** Across every cluster and deployment: total capacity, GPU usage,
 degraded deployments, and cost.
 
-Every one of these is in the central view. The data plane and substrate are collected on each
-cluster and aggregated up, the control plane is scraped at the center, and the fleet
+Every one of these is in the central view. The data plane and substrate are collected on
+each cluster and aggregated up, the control plane is scraped at the center, and the fleet
 roll-up is the collector's aggregation over the collected series.
 
 ## Collect on every cluster
@@ -129,10 +132,11 @@ apply. That prefix is Modelplane's to stamp, which is how `modelplane.ai/serving
 `modelplane.ai/workload` and `modelplane.ai/pool` already reach pods.
 
 So the engine type is a field, and the label is derived from it. An optional `type` on the
-engine, an enum of the kinds Modelplane ships a mapping for, which
-`compose-model-replica` stamps onto the pod as `modelplane.ai/engine` alongside the labels
-it already applies. One field feeds two consumers, the picker for routing and the collector
-for normalization, and the reserved prefix keeps meaning what it means.
+engine, naming the engine's kind, which `compose-model-replica` stamps onto the pod as
+`modelplane.ai/engine` alongside the labels it already applies. One field feeds two
+consumers, the picker for routing and the collector for normalization, and the reserved
+prefix keeps meaning what it means.
+
 The picker routes any engine. Its KV- and queue-aware scoring reads the engine's standard
 metrics through the same mapping, so an engine without them still routes, only less
 informed.
@@ -162,20 +166,20 @@ informed.
 
 Selecting by label rather than by metric name looks redundant at first, because engine
 metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
-rename them unambiguously with no selector at all. It is not redundant, for four reasons
-worth writing down so the field is not optimized away later. Degradation above is
-label-based by construction: reporting "no mapping for `X`" means reading a pod's claimed
-engine and finding no mapping for it. Name matching cannot tell that apart from a
-successful rename of nothing. The consistent label set is per pod, not per series, so name matching
-cannot attach `engine` and `cluster` to the series a mapping does not rename. A forked
+rename them unambiguously with no selector at all. It is not, and the reasons are worth
+writing down so the field is not optimized away later. Degradation above is label-based by
+construction: reporting "no mapping for `X`" means reading a pod's claimed engine and
+finding no mapping for it. Name matching cannot tell that apart from a successful rename of
+nothing. The consistent label set is per pod, not per series, so name matching cannot
+attach `engine` and `cluster` to the series a mapping does not rename. A forked
 engine emits the upstream names while needing its own mapping, and two mappings matching
 one name cannot be told apart without the pod. And not every name is namespaced:
 kube-scheduler's are plain `scheduler_*`, so the scheduler section needs the selector
 most of all.
 
 In collector terms that makes the rename an OTTL transform gated on a resource attribute,
-rather than the simpler metrics-transform processor, which matches on metric name only. The pod label reaches OTTL as a resource attribute through the k8sattributes
-processor.
+rather than the simpler metrics-transform processor, which matches on metric name only.
+The pod label reaches OTTL as a resource attribute through the k8sattributes processor.
 
 A `MetricMapping` is small: a selector for the pods it applies to, the source names, the
 `modelplane_*` name each becomes, and the labels to keep or add. The vLLM one:
@@ -191,9 +195,9 @@ spec:
       modelplane.ai/engine: vllm      # stamped by Modelplane from engines[].type
   rename:
     vllm:time_to_first_token_seconds: modelplane_time_to_first_token
-    vllm:inter_token_latency_seconds: modelplane_time_per_output_token
+    vllm:inter_token_latency_seconds: modelplane_inter_token_latency
     vllm:num_requests_waiting: modelplane_requests_waiting
-    vllm:gpu_cache_usage_perc: modelplane_kv_cache_utilization
+    vllm:gpu_cache_usage_perc: modelplane_kv_cache_usage
   labels:
     add: { engine: vllm }
 ```
@@ -239,11 +243,11 @@ processors:
       statements:
       - set(name, "modelplane_time_to_first_token")
           where name == "vllm:time_to_first_token_seconds"
-      - set(name, "modelplane_time_per_output_token")
+      - set(name, "modelplane_inter_token_latency")
           where name == "vllm:inter_token_latency_seconds"
       - set(name, "modelplane_requests_waiting")
           where name == "vllm:num_requests_waiting"
-      - set(name, "modelplane_kv_cache_utilization")
+      - set(name, "modelplane_kv_cache_usage")
           where name == "vllm:gpu_cache_usage_perc"
 
 exporters:
@@ -289,7 +293,7 @@ from end-to-end.
 | `request_decode_time` | `vllm:request_decode_time_seconds` | per-stage | `nv_trt_llm_*` |
 | `e2e_request_latency` | `vllm:e2e_request_latency_seconds` | `sglang:e2e_request_latency_seconds` | `nv_inference_request_duration_us` |
 | `requests_waiting` | `vllm:num_requests_waiting` | scheduler waiting | `nv_trt_llm_request_metrics` |
-| `kv_cache_usage` | `vllm:kv_cache_usage_perc` | token usage | TRT-LLM KV metrics |
+| `kv_cache_usage` | `vllm:gpu_cache_usage_perc` | token usage | TRT-LLM KV metrics |
 | `prefix_cache_hits` | `vllm:prefix_cache_hits` | cache hit | n/a |
 | `input_sequence_tokens` | `vllm:request_prompt_tokens` | prompt tokens | `nv_trt_llm_*` |
 | `output_sequence_tokens` | `vllm:request_generation_tokens` | generation tokens | `nv_trt_llm_*` |
@@ -421,8 +425,9 @@ cost, degraded deployments, and SLO attainment such as the fraction of requests 
 TTFT target. The control-plane collector produces them in memory, because each is a spatial
 aggregation it already does. It sums gauges and counters across clusters and merges
 per-cluster histograms into a fleet histogram. SLO attainment is a ratio of buckets in
-that merged histogram when a boundary sits at the target, which is ours to set. So Modelplane
-runs no store and the control plane stays stateless, as running in a Space requires.
+that merged histogram when a boundary sits at the target, which is ours to set. So
+Modelplane runs no store and the control plane stays stateless, as running in a Space
+requires.
 
 Computing a percentile value or answering an ad-hoc query is read-time work for whatever
 consumes the export, a dashboard or an operator's own Prometheus-compatible backend.
