@@ -405,8 +405,16 @@ a ceiling on how much a cluster in that mode can send.
 inbound exposure on every GPU cluster, which the other two avoid. Named here only to rule
 it out.
 
-The mode is per cluster, and reported on the `InferenceCluster` status, so an operator can
-read it rather than infer it from a config.
+The mode is per cluster, and the platform team declares it. Modelplane can't detect it: a
+composition function does no network probing, so nothing at compose time knows whether a
+cluster can reach the destination. That makes it a field on the `InferenceCluster`
+alongside the rest of what a platform team says about a cluster, defaulting to push, with
+the resolved mode on status and as a printer column so an operator reads it rather than
+inferring it.
+
+Writing the user-facing page for this is what surfaced it. The draft said "Modelplane
+notices it can't reach out", which is the behaviour a reader would want and not one anything
+here can implement.
 
 The roll-up is a set of `modelplane_*` series over the aggregate: capacity, GPU usage,
 cost, degraded deployments, and SLO attainment such as the fraction of requests under a
@@ -432,10 +440,16 @@ configuration, one endpoint to match one view, propagated to each cluster's `Ser
 and rendered into the collector's config there. Its credential is a Secret reference
 resolved per cluster, as above.
 
-Where that configuration lives is open. A field on a fleet-level resource and a kind of its
-own both work, and the choice is the same one `MetricMapping` faced: a typed kind validates
-on apply and lists under `kubectl get`, at the cost of another kind. Worth settling before
-implementation rather than in it.
+Where that configuration lives needs deciding before this is built, not during. A field on
+a fleet-level resource and a kind of its own both work, and the choice is the same one
+`MetricMapping` faced: a typed kind validates on apply and lists under `kubectl get`, at
+the cost of another kind.
+
+It blocks more than the implementation. Configuring a destination is the first thing a user
+does, since nothing is collected until one exists, so it is the first thing the docs
+describe, and a draft of that page had to invent a `MetricsDestination` kind to say
+anything at all. Its scope and owner go with the decision: the platform team owns it and
+one destination serves the fleet, which points cluster-scoped rather than namespaced.
 
 ### Cardinality
 
