@@ -21,19 +21,20 @@ reader.
 engine-type label, so a dashboard reads Modelplane's names and not each engine's. That
 label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeployment`.
 
-**Aggregate to one view.** Every cluster's series roll up at the control plane and leave
-as one stream, so what consumes them answers across the fleet rather than per cluster.
-Modelplane runs no store, so the view is whatever that destination is.
+**Aggregate to one view.** Every cluster's collector pushes to the control plane, where
+the series roll up and leave as one stream, so what consumes them answers across the fleet
+rather than per cluster. Modelplane runs no store, so the view is whatever that destination
+is.
 
 **Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, and it
 replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
 below gives the reasons and what covers each thing that stack did.
 
-Four API changes carry it. Two are settled: a `MetricMapping` kind holding one engine's
-renames, and `engines[].type` on a `ModelDeployment`. Two need deciding before this is
-built: where a fleet's metrics destination lives, and the field that says whether a cluster
-pushes or is pulled from. Naming the engine port is a fifth change, to
-`compose-model-replica` rather than to an API.
+Three API changes carry it. Two are settled: a `MetricMapping` kind holding one engine's
+renames, and `engines[].type` on a `ModelDeployment`. The third needs deciding before this
+is built: where a fleet's telemetry destination lives, though what to call it is settled
+below. Naming the engine port is a fourth change, to `compose-model-replica` rather than to
+an API.
 
 Approving this means agreeing that normalization and aggregation are Modelplane's job
 rather than the platform team's, that collection is on for every source once a destination
@@ -70,8 +71,8 @@ roll-up is the collector's aggregation over the collected series.
 On each cluster Modelplane collects from every source it owns, with no per-deployment
 opt-in or opt-out. The switch is one level up, and at the fleet: with no destination
 configured anywhere, no cluster composes a collector, because a collector nothing reads is
-cost with no reader. The gate is the fleet destination and not a per-cluster exporter,
-since a cluster the center pulls from has no exporter of its own and still delivers.
+cost with no reader. The gate is the fleet destination rather than anything per cluster,
+since one destination is what makes the fleet's series one view.
 
 Once a destination exists, collection is on for everything Modelplane owns, and a
 `ModelDeployment` author doesn't get a toggle over telemetry the platform team consumes.
@@ -378,47 +379,40 @@ kubeconfig `provider-kubernetes` holds. Nothing guarantees a path back, least of
 an on-premise or neocloud GPU cluster behind a firewall. So transport is a real question
 rather than a detail of the exporter.
 
-**Push to a gateway collector.** The default. Each cluster's collector OTLP-exports to one
-collector at the control plane, which is OpenTelemetry's own multi-cluster pattern. The
-cluster needs egress and nothing inbound, and nothing on it is exposed. The control plane
-exposes one OTLP endpoint, a Gateway API listener with TLS, the same kind of surface the
-inference gateway already serves.
+**Every cluster pushes.** Each cluster's collector OTLP-exports to one collector at the
+control plane, which is OpenTelemetry's own multi-cluster pattern. The cluster needs egress
+and nothing inbound, and nothing on it is exposed. The control plane exposes one OTLP
+endpoint, a Gateway API listener with TLS, the same kind of surface the inference gateway
+already serves.
 
 Credentials are already solved. `ModelCache` propagates an `authSecret` from the control
 plane to every matched cluster so hydration can read a HuggingFace token. A bearer token or
 client certificate for the OTLP endpoint travels the same way, through the same mechanism,
 so this adds a Secret to propagate rather than a way to propagate Secrets.
 
-**Pull through the API server proxy.** The fallback, for a cluster with no egress. The
-center scrapes it over the connection it already has. The Kubernetes API server proxies to
-in-cluster Services, so the collector is reachable at
+One transport, and no field selecting it. An earlier draft offered a second mode for a
+cluster with no egress, pulling through the API server proxy at
 `/api/v1/namespaces/<ns>/services/<collector>:<port>/proxy/metrics` with the credential
-Modelplane already holds. No inbound exposure, no firewall change, no second credential;
-the only addition is a `ClusterRole` granting `services/proxy`.
+Modelplane already holds, and a field on the `InferenceCluster` to declare which mode a
+cluster used. Both are out. The second mode isn't only a second transport: a pulled cluster
+exposes a scrape endpoint where a pushing one exports and exposes nothing, so it costs a
+second collector configuration, a second exporter shape, a `ClusterRole` granting
+`services/proxy`, and a field with a status mirror and a printer column. That is a lot of
+surface for a fallback whose own analysis was that every series crosses an API server not
+built to carry them, which caps what a cluster in that mode could send.
 
-This changes the collector's exporter and not only its transport. A cluster the center
-pulls from exposes a scrape endpoint for the center to read, where a pushing cluster
-OTLP-exports and exposes nothing. The center is what turns the result back into one stream,
-so the destination and everything downstream of it are the same either way.
+Deferring it costs nothing, which is what makes it easy. The field would be optional and
+default to push, so adding it when a cluster that can't egress actually turns up is
+additive and breaks nobody. Until one does, Modelplane supports one transport and says so.
 
-The cost is that every series crosses the API server, which is not built to carry them.
-That makes this a fallback for a cluster that cannot push rather than a default, and it puts
-a ceiling on how much a cluster in that mode can send.
+**Pull direct** stays ruled out either way: a LoadBalancer or Ingress per cluster needs
+inbound exposure on every GPU cluster, which pushing avoids.
 
-**Pull direct.** A LoadBalancer or Ingress per cluster for the center to scrape. It needs
-inbound exposure on every GPU cluster, which the other two avoid. Named here only to rule
-it out.
-
-The mode is per cluster, and the platform team declares it. Modelplane can't detect it: a
-composition function does no network probing, so nothing at compose time knows whether a
-cluster can reach the destination. That makes it a field on the `InferenceCluster`
-alongside the rest of what a platform team says about a cluster, defaulting to push, with
-the resolved mode on status and as a printer column so an operator reads it rather than
-inferring it.
-
-Writing the user-facing page for this is what surfaced it. The draft said "Modelplane
-notices it can't reach out", which is the behaviour a reader would want and not one anything
-here can implement.
+If the fallback is ever built, the platform team declares the mode rather than Modelplane
+detecting it. A composition function does no network probing, so nothing at compose time
+knows whether a cluster can reach the destination. Writing the user-facing page is what
+surfaced that: the draft said "Modelplane notices it can't reach out", which is the
+behaviour a reader would want and not one anything here can implement.
 
 The roll-up is a set of `modelplane_*` series over the aggregate: capacity, GPU usage,
 cost, degraded deployments, and SLO attainment such as the fraction of requests under a
@@ -450,11 +444,17 @@ a fleet-level resource and a kind of its own both work, and the choice is the sa
 `MetricMapping` faced: a typed kind validates on apply and lists under `kubectl get`, at
 the cost of another kind.
 
+What to call it is settled either way, and it's telemetry rather than metrics. An OTLP
+endpoint carries metrics, logs and traces on the same wire, so the destination is already
+signal-agnostic and a name like `MetricsDestination` would describe it narrower than it is.
+`TelemetryDestination` as a kind, or `spec.telemetry.destination` as a field. The rename is
+free while nothing has been built and costs a deprecation window and a migration for every
+user once something has.
+
 It blocks more than the implementation. Configuring a destination is the first thing a user
 does, since nothing is collected until one exists, so it is the first thing the docs
-describe, and a draft of that page had to invent a `MetricsDestination` kind to say
-anything at all. Its scope and owner go with the decision: the platform team owns it and
-one destination serves the fleet, which points cluster-scoped rather than namespaced.
+describe. Its scope and owner go with the decision: the platform team owns it and one
+destination serves the fleet, which points cluster-scoped rather than namespaced.
 
 ### Cardinality
 
@@ -557,7 +557,7 @@ flowchart LR
     OP["operator\ndashboards + alerting"]
     SA --> CA
     CA -->|"push (OTLP)"| CENT
-    CENT -->|"pull via API proxy<br/>(no egress)"| CB
+    CB -->|"push (OTLP)"| CENT
     XP -->|scraped by| CENT
     CENT --> OP
     classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
