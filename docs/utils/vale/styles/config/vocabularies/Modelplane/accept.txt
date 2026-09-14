@@ -31,6 +31,8 @@ ModelReplica
 ModelReplicas
 ModelService
 ModelServices
+TelemetryDestination
+TelemetryDestinations
 
 # Spec fields and config keys
 clusterSelector
