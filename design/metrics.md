@@ -477,13 +477,13 @@ A Modelplane user does not write collector YAML. The destination is fleet-level
 configuration, one endpoint to match one view, propagated to each cluster's `ServingStack`
 and rendered into the collector's config there.
 
-**That configuration is a cluster-scoped `TelemetryDestination`,** following
-`MetricMapping` and `InferenceClass`: a config kind the platform team owns, validated on
-apply and listed under `kubectl get`. The alternative is a field on an existing resource,
-and every resource that is fleet-wide today is one piece of the fleet rather than the fleet
-itself, so a field would put the endpoint somewhere arbitrary. Its credential is a
-`secretRef` resolved in `modelplane-system`, the way `InferenceCluster` resolves a
-kubeconfig.
+**That configuration is a cluster-scoped `TelemetryDestination`,** and its shape is
+borrowed rather than invented. Grafana's Kubernetes monitoring chart calls the same thing a
+[destination](https://github.com/grafana/k8s-monitoring-helm/blob/main/charts/k8s-monitoring/docs/destinations/README.md)
+and gives it a type, an endpoint and an auth block backed by a Secret. Crossplane's own
+`StoreConfig`, and every `ProviderConfig`, is cluster-scoped and carries a
+`credentials.secretRef`. Modelplane already has config kinds of that shape in
+`InferenceClass` and `MetricMapping`. So:
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -491,20 +491,34 @@ kind: TelemetryDestination
 metadata:
   name: default
 spec:
-  exporter: OTLP                       # OTLP | PrometheusRemoteWrite
+  type: OTLP                           # OTLP | PrometheusRemoteWrite
   otlp:
     endpoint: otlp.acme.example:4317
+    protocol: gRPC                     # gRPC | HTTP
   auth:
+    type: Bearer                       # None | Basic | Bearer
     secretRef:
       name: telemetry-destination      # in modelplane-system
 ```
 
-The discriminator and its CEL rule match the rest of the API: `self.exporter != 'OTLP' ||
-has(self.otlp)`.
+`type` discriminates with a CEL rule the way `ModelCache.spec.source` does:
+`self.type != 'OTLP' || has(self.otlp)`. The variant object earns its place on its first
+field, since OTLP is gRPC or HTTP and remote write is neither. `auth.type` starts with the
+three that cover most backends and grows, where Grafana's chart also carries `oauth2` and
+`sigv4`. The Secret resolves in `modelplane-system`, the way `InferenceCluster` resolves a
+kubeconfig.
+
+A kind rather than a field, because there is nothing fleet-level to hold the field.
+`InferenceCluster` and `InferenceClass` are each a piece of the fleet, so a field on either
+stores one fleet fact N times. Grafana puts its destinations in Helm values because it
+ships a chart, and Modelplane ships a Crossplane package, where a config XRD is how a
+chart's values are expressed. It is the same decision in the packaging system we have.
 
 A fleet usually has one. Where there are several, every cluster's collector exports to all
 of them, which is one exporter per destination in the same pipeline and is how an operator
-moves between backends without a gap.
+moves between backends without a gap. Grafana routes per feature with an explicit
+destination list, which is where this grows if a fleet wants engine metrics in one place
+and gateway metrics in another, and nothing asks for that yet.
 
 The name is telemetry rather than metrics. An OTLP endpoint carries metrics, logs and
 traces on the same wire, so the destination is signal-agnostic and `MetricsDestination`
@@ -648,6 +662,22 @@ on the `InferenceCluster` status. That is close to what this design does and dif
 it matters: every cluster exports to one destination under one vocabulary, so the fleet
 view is a query someone writes once. Publishing N URLs leaves each operator to find them,
 stitch them, and reconcile three engines' metric names by hand.
+
+### Let the OpenTelemetry Operator hold the destination
+
+Install the operator on each cluster, compose an `OpenTelemetryCollector` per cluster, and
+the destination is that resource's `exporters` block, with no Modelplane kind at all. It
+moves the rendering rather than the decision: the exporter block is per cluster, and a
+fleet still has to say once where telemetry goes and have that reach every cluster. It also
+puts an operator and a CRD on every cluster to hold configuration Modelplane generates, and
+pointed at a user it means writing collector YAML, which this design keeps off them.
+
+### OpAMP
+
+[OpAMP](https://opentelemetry.io/docs/specs/opamp/) is the standard for configuring a fleet
+of collectors from one place, and its agents connect out to the server, which suits the
+reachability this design works around. The server is a pod, and the place it belongs is the
+control plane, which runs none. It gets interesting the day there is somewhere to run one.
 
 ### Raw engine metric names, no normalization
 
