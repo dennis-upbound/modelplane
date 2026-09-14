@@ -13,8 +13,7 @@ view. It builds on [design.md](./design.md) and addresses
 
 **Collect on every cluster.** Modelplane collects from every source it owns, the engines,
 the endpoint pickers, and the substrate, with no per-deployment toggle. A fleet with no
-destination configured collects nothing, since a collector nothing reads is cost with no
-reader.
+destination configured collects nothing.
 
 **Normalize to `modelplane_*`.** Each engine names its metrics its own way (`vllm:*`,
 `sglang:*`). The collector renames them to one Modelplane vocabulary, picked by an
@@ -26,10 +25,10 @@ vocabulary and the same dimensions, so a query there answers across the fleet ra
 per cluster. Modelplane runs no store and routes nothing through the control plane, which
 it could not deploy a collector into anyway.
 
-**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector run by the
-OpenTelemetry Operator, so Modelplane composes one `OpenTelemetryCollector` per cluster,
-and it replaces the kube-prometheus-stack `compose-serving-stack` installs today. The
-section below gives the reasons and what covers each thing that stack did.
+**Collect with OpenTelemetry.** An OpenTelemetry collector replaces the
+kube-prometheus-stack `compose-serving-stack` installs today. The OpenTelemetry Operator
+runs it, so Modelplane composes one `OpenTelemetryCollector` per cluster. The section below
+gives the reasons and what covers each thing that stack did.
 
 Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
 `engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
@@ -112,12 +111,6 @@ server on a `Dynamo` one. The substrate selector follows the stack. The ModelExp
 server goes in it, and where it serves no metrics endpoint its readiness still arrives
 through `k8s_cluster`, which is what the substrate question needs from it.
 
-**GPU utilization needs a source the stack doesn't install today.** `k8s_cluster` reports
-allocatable and requested `nvidia.com/gpu`, which answers how much of the fleet is claimed.
-Whether a claimed GPU is busy comes from DCGM, so `compose-serving-stack` installs the DCGM
-exporter next to the DRA driver and the collector scrapes it as an ordinary pod. That adds
-one component to the stack and answers the question a GPU fleet exists to ask.
-
 Scrape the engine port by name, not by number, which needs a change first: no backend
 names it today. `native.py`, `llmd.py`, and `grove.py` all compose
 `{"containerPort": 8000}` with no `name`, so the `__meta_kubernetes_pod_container_port_name`
@@ -129,6 +122,12 @@ dedicated metrics one. The reason to go by name at all is prefill/decode: the de
 engine serves on `_DECODE_ENGINE_PORT` (8001) because the pd-sidecar takes 8000, so
 matching 8000 by number scrapes the sidecar. By name, the scrape follows the engine on
 every pod, on every backend.
+
+**GPU utilization needs a source the stack doesn't install today.** `k8s_cluster` reports
+allocatable and requested `nvidia.com/gpu`, which answers how much of the fleet is claimed.
+Whether a claimed GPU is busy comes from DCGM, so `compose-serving-stack` installs the DCGM
+exporter next to the DRA driver and the collector scrapes it as an ordinary pod. That adds
+one component to the stack and answers the question a GPU fleet exists to ask.
 
 ## Capture from an opaque engine
 
@@ -181,10 +180,9 @@ informed.
   sanitizes `:` to `_`, so an unmapped `vllm:gpu_cache_usage_perc` is published as
   `vllm_gpu_cache_usage_perc`. Passthrough keeps the name and not the punctuation.
 
-Selecting by label rather than by metric name looks redundant at first, because engine
+Selecting by label rather than by metric name looks redundant at first, since engine
 metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
-rename them unambiguously with no selector at all. It is not, and the reasons are worth
-writing down so the field is not optimized away later. Degradation above is label-based by
+rename them unambiguously with no selector at all. Degradation above is label-based by
 construction: reporting "no mapping for `X`" means reading a pod's claimed engine and
 finding no mapping for it. Name matching cannot tell that apart from a successful rename of
 nothing. The consistent label set is per pod, not per series, so name matching cannot
@@ -221,10 +219,10 @@ spec:
 
 `compose-serving-stack` reads every `MetricMapping` as a required resource, the same way
 `compose-model-deployment` reads `InferenceCluster` and `ModelCache`. It renders them into
-the collector's config, which is the `config` block of the `OpenTelemetryCollector` the
-section below composes on each cluster. The
-`rename` map becomes transform-processor rules, applied to metrics from the pods the
-`selector` matches. A new engine is a new `MetricMapping`, not a package change.
+the collector's config, which is the `config` block of the `OpenTelemetryCollector`
+composed on each cluster. The `rename` map becomes transform-processor rules, applied to
+metrics from the pods the `selector` matches. A new engine is a new `MetricMapping`, not
+a package change.
 
 What that renders, with the vLLM mapping above as the only one installed:
 
@@ -320,8 +318,8 @@ from end-to-end.
 
 vLLM and SGLang map cleanly. Their names already nearly match, and both align to the
 OpenTelemetry set. Triton and TensorRT-LLM expose batch-manager stats rather than native
-TTFT and ITL histograms, so those rows are derived or wait on newer TensorRT-LLM metrics.
-That gap is stated, not hidden.
+TTFT and ITL histograms, so those rows are derived or wait on newer TensorRT-LLM
+metrics.
 
 Inter-token latency and time per output token stay separate. ITL is the per-token gap a
 streaming user feels. TPOT is the amortized decode rate. Only TPOT is in the OpenTelemetry
@@ -396,9 +394,8 @@ an on-premise or neocloud GPU cluster behind a firewall. So transport is a real 
 rather than a detail of the exporter.
 
 **Every cluster exports to the destination.** Each cluster's collector OTLP-exports
-straight to the endpoint the fleet configures, and the control plane exports its own
-metrics the same way. A cluster needs egress and nothing inbound, and nothing on it is
-exposed.
+straight to the endpoint the fleet configures. A cluster needs egress and nothing inbound,
+and nothing on it is exposed.
 
 Credentials are already solved. `ModelCache` propagates an `authSecret` from the control
 plane to every matched cluster so hydration can read a HuggingFace token. The destination's
@@ -578,9 +575,9 @@ Operator](https://opentelemetry.io/docs/platforms/kubernetes/operator/) and comp
 `OpenTelemetryCollector` per cluster, rather than composing a Deployment and a ConfigMap by
 hand. Modelplane writes that resource; a user never sees it.
 
-The operator earns it on four things. Its admission webhook rejects an invalid collector
-config on apply, where a hand-composed ConfigMap reports the same mistake as
-CrashLoopBackOff after the fact. It regenerates the ConfigMap and rolls the pods when the
+The operator earns that. Its admission webhook rejects an invalid collector config on
+apply, where a hand-composed ConfigMap reports the same mistake as CrashLoopBackOff after
+the fact. It regenerates the ConfigMap and rolls the pods when the
 config changes, which a hand-composed pair needs a checksum annotation or a reloader to
 match. `mode` is `deployment`, `daemonset` or `statefulset`, so the two tiers below are one
 field rather than two hand-written workloads. And the [Target
@@ -591,11 +588,11 @@ is there when one collector stops being enough for a cluster's engines, which wa
 It costs a Helm release and a CRD on every cluster, in the change that removes
 kube-prometheus-stack, which is an operator with a larger CRD set of its own. Its one hard
 prerequisite is cert-manager, for the webhook's certificate, and `compose-serving-stack`
-already installs cert-manager. Composing an `Object` that waits for a chart's CRD is what the GatewayClass
-and the Envoy Gateway already do here. Two things it doesn't solve: the operator and the
-collector image are separate versions to pin, and the ServiceAccount it creates carries no
-policy, so the ClusterRole that `k8sattributes` and `k8s_cluster` need is composed either
-way.
+already installs cert-manager. Composing an `Object` that waits for a chart's CRD is what
+the GatewayClass and the Envoy Gateway already do here. It leaves two things alone: the
+operator and the collector image are separate versions to pin, and the ServiceAccount it
+creates carries no policy, so the ClusterRole that `k8sattributes` and `k8s_cluster` need
+is composed either way.
 
 This adopts an operator for the collector's lifecycle, not for discovery. Targets stay a
 scrape config inside the `OpenTelemetryCollector`, so the `PodMonitor` argument above is
@@ -614,10 +611,10 @@ Each thing kube-prometheus-stack does today has a receiver that does it.
 | node-exporter | `hostmetrics` receiver |
 
 That splits the collector in two, which is two `OpenTelemetryCollector` resources
-differing by `mode`. Node-scoped
-receivers (`kubeletstats`, `hostmetrics`, and the `filelog` receiver when logs follow) need
-a collector on every node, so they run as a DaemonSet. Cluster-scoped ones (`k8s_cluster`,
-and the engine and EPP scrapes) run as one Deployment. The engine scrape could run in
+differing by `mode`. Node-scoped receivers (`kubeletstats`, `hostmetrics`, and the
+`filelog` receiver when logs follow) need a collector on every node, so they run as a
+DaemonSet. Cluster-scoped ones (`k8s_cluster`, and the engine and EPP scrapes) run as one
+Deployment. The engine scrape could run in
 either; putting it in the Deployment keeps one scrape config rather than N node-local ones.
 
 The Deployment tier ships first and the DaemonSet tier follows. Engines, the EPP, DCGM and
@@ -633,10 +630,10 @@ Prometheus and query it. After this there is no per-cluster store, so ad-hoc que
 to whatever consumes the export. That is the same trade the roll-up section already makes
 for the center, applied to each cluster.
 
-Which inverts what a fresh install gives you, and the inversion is worth stating rather
-than discovering. Today Modelplane installs a working per-cluster store with no
-aggregation. After this it aggregates across the fleet and stores nothing, so an install
-with no destination configured collects nothing at all. That is the right trade for a fleet
+What a fresh install gives you inverts. Today Modelplane installs a working per-cluster
+store with no aggregation. After this it aggregates across the fleet and stores nothing, so
+an install with no destination configured collects nothing at all. That is the right trade
+for a fleet
 and the wrong one for a first afternoon with Modelplane, so the getting started guide
 installs one Prometheus-compatible store on the cluster it creates and points a
 `TelemetryDestination` at it. That is a step in a guide rather than a default in the API,
@@ -652,20 +649,22 @@ follow-up.
 ```mermaid
 flowchart LR
     subgraph icA["InferenceCluster: serving"]
-        SA["engines / EPPs / substrate"]
-        CA["OTel collector\n(scrape + rename to modelplane_*)"]
+        SA["engines / EPPs / substrate / DCGM"]
+        CA["OpenTelemetryCollector\n(scrape + rename to modelplane_*)"]
     end
     subgraph icB["InferenceCluster: gateway only"]
         SB["Envoy AI Gateway"]
-        CB["OTel collector"]
+        CB["OpenTelemetryCollector"]
     end
     subgraph cp["control plane (composes, collects nothing)"]
         XP["Crossplane\n(functions, fleet scheduler, XRs)"]
+        TD["TelemetryDestination"]
     end
     DEST["destination\n(OTLP or Prometheus-compatible)"]
     OP["operator\ndashboards + alerting"]
     SA --> CA
     SB --> CB
+    TD -.-> XP
     XP -.->|"composes the collectors"| CA
     XP -.-> CB
     CA -->|"OTLP"| DEST
