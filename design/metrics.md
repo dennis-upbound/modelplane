@@ -392,10 +392,9 @@ propagate rather than a way to propagate Secrets.
 
 **Nothing routes through the control plane, because nothing can run there.** A collector
 at the control plane reads naturally, since the control plane is the thing that knows about
-every cluster, and it is the shape to rule out first. A control
-plane hosts Crossplane and the API it serves, not workloads, and one running in a Space
-schedules no pods at all, so there is nowhere to put a collector, a listener or the
-certificate it would need. Modelplane composes into the clusters it holds credentials for,
+every cluster, and it is the shape to rule out first. A control plane hosts Crossplane and
+the API it serves, not workloads, and a hosted one schedules no pods at all, so there is
+nowhere to put a collector, a listener or the certificate it would need. Modelplane composes into the clusters it holds credentials for,
 and its own control plane is not one of them.
 
 It would be the wrong place even if a pod could run there. A Crossplane control plane is
@@ -415,12 +414,12 @@ cluster's telemetry working while the control plane is upgrading.
 **Control-plane health comes from whoever runs the control plane, and Modelplane documents
 the path.** Crossplane's reconcile rates, function latency and the fleet scheduler's
 decisions are exactly what an operator wants when Modelplane itself misbehaves, and the
-constraint above means Modelplane cannot collect them. Two paths already serve it. A Space
-observes the control planes it hosts and exposes that to the account that owns them. A
-self-hosted Crossplane serves `/metrics` on the core pod and on each provider and function
-pod, which an operator's existing cluster-level scrape picks up once those endpoints are
-added. Modelplane's part is to document both and to name the series worth alerting on,
-which lands in the docs rather than in a composition function.
+constraint above means Modelplane cannot collect them. The path depends on how the control
+plane runs. A self-hosted Crossplane serves `/metrics` on the core pod and on each provider
+and function pod, which an operator's existing cluster-level scrape picks up once those
+endpoints are added. A hosted control plane reports its own health to whoever hosts it.
+Modelplane's part is to name the series worth alerting on, which lands in the docs rather
+than in a composition function.
 
 Reconcile state stays on the API either way. `Ready` and `Synced` on every XR say whether
 Modelplane converged, over the same connection an operator already uses. This design covers
