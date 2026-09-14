@@ -24,7 +24,7 @@ label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeploym
 **Aggregate to one view.** Every cluster exports straight to one destination, under one
 vocabulary and the same dimensions, so a query there answers across the fleet rather than
 per cluster. Modelplane runs no store and routes nothing through the control plane, which
-is what lets this work in a Space.
+it could not deploy a collector into anyway.
 
 **Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, and it
 replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
@@ -62,9 +62,10 @@ function latency and panics, the fleet scheduler placing replicas, and XR `Ready
 **Fleet roll-up.** Across every cluster and deployment: total capacity, GPU usage,
 degraded deployments, and cost.
 
-Every one of these is in the central view. The data plane and substrate are collected on
-each cluster and aggregated up, the control plane is scraped at the center, and the fleet
-roll-up is the collector's aggregation over the collected series.
+The first two are collected on each cluster and exported to one destination, where the
+fleet roll-up is a query over them. Control-plane health is the exception and the section
+on getting the series across says why: Modelplane has no way to deploy a collector
+alongside its own Crossplane, so that one belongs to whoever runs the control plane.
 
 ## Collect on every cluster
 
@@ -396,18 +397,25 @@ plane to every matched cluster so hydration can read a HuggingFace token. The de
 credential travels the same way, through the same mechanism, so this adds a Secret to
 propagate rather than a way to propagate Secrets.
 
-**Nothing routes through the control plane, and that is deliberate.** An earlier draft sent
+**Nothing routes through the control plane, because nothing can.** An earlier draft sent
 every cluster's series to a collector there, which reads naturally when the control plane is
-the thing that knows about every cluster. It doesn't survive contact with a Space. A
-control plane running in one has no ingress of its own to hang an OTLP listener on, so the
-whole path assumed a surface that isn't available where Modelplane is meant to run. And
-where it is available, a Crossplane control plane is the wrong thing to size for a fleet's
-telemetry volume: it is built to reconcile resources, not to carry a stream that grows with
-every engine pod.
+the thing that knows about every cluster. Modelplane can't deploy that collector. A
+composition function's reach is the clusters it holds credentials for, and its own control
+plane isn't one of them, so there is no way to compose a collector, a listener or a
+certificate alongside Crossplane. In a Space that is doubly true, since the control plane is
+managed and hosts Crossplane rather than arbitrary workloads.
 
-Sending direct also removes a hop that could fail, halves the number of places a
-destination credential lives, and leaves a cluster's telemetry working while the control
-plane is being upgraded or is unreachable.
+It would be the wrong place even if it were reachable. A Crossplane control plane is built
+to reconcile resources, not to carry a stream that grows with every engine pod. Exporting
+direct also removes a hop that can fail and leaves a cluster's telemetry working while the
+control plane is upgrading.
+
+**The same constraint decides control-plane health, and costs us something.** Crossplane's
+reconcile rates, function latency and the fleet scheduler's decisions are exactly what an
+operator wants when Modelplane itself misbehaves, and Modelplane cannot collect them for
+the reason above. They belong to whoever runs the control plane: a Space observes the
+control planes it hosts, and a self-hosted Crossplane is the operator's to scrape. This
+design covers the clusters Modelplane manages and says plainly that it stops there.
 
 **Pull direct** stays ruled out: a LoadBalancer or Ingress per cluster needs inbound
 exposure on every GPU cluster, which exporting avoids. A cluster with no egress at all is
@@ -559,21 +567,20 @@ flowchart LR
         SB["Envoy AI Gateway"]
         CB["OTel collector"]
     end
-    subgraph cp["control plane"]
+    subgraph cp["control plane (composes, collects nothing)"]
         XP["Crossplane\n(functions, fleet scheduler, XRs)"]
-        CC["OTel collector"]
     end
     DEST["destination\n(OTLP or Prometheus-compatible)"]
     OP["operator\ndashboards + alerting"]
     SA --> CA
     SB --> CB
-    XP --> CC
+    XP -.->|"composes the collectors"| CA
+    XP -.-> CB
     CA -->|"OTLP"| DEST
     CB -->|"OTLP"| DEST
-    CC -->|"OTLP"| DEST
     DEST --> OP
     classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
-    class CA,CB,CC new
+    class CA,CB new
 ```
 
 ## Alternatives considered
@@ -591,11 +598,12 @@ Prometheus-compatible one, at the center, once.
 
 ### Stop at per-cluster collection
 
-An earlier shape collected on each cluster and left aggregation to the platform team,
-publishing a Prometheus URL on the `InferenceCluster` status. Aggregating up to a
-Modelplane view is the actual ask, so leaving it out means everyone rebuilds the same
-fleet view by hand. Per-cluster collection stays, but as the bottom half of the pipeline,
-not the whole of it.
+An earlier shape collected on each cluster and left the rest to the platform team,
+publishing a Prometheus URL on the `InferenceCluster` status. That is close to what this
+design does and differs where it matters: every cluster exports to one destination under
+one vocabulary, so the fleet view is a query someone writes once. Publishing N URLs leaves
+each operator to find them, stitch them, and reconcile three engines' metric names by
+hand.
 
 ### Raw engine metric names, no normalization
 
