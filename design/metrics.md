@@ -394,8 +394,9 @@ propagate rather than a way to propagate Secrets.
 at the control plane reads naturally, since the control plane is the thing that knows about
 every cluster, and it is the shape to rule out first. A control plane hosts Crossplane and
 the API it serves, not workloads, and a hosted one schedules no pods at all, so there is
-nowhere to put a collector, a listener or the certificate it would need. Modelplane composes into the clusters it holds credentials for,
-and its own control plane is not one of them.
+nowhere to put a collector, a listener or the certificate it would need. Modelplane
+composes into the clusters it holds credentials for, and its own control plane is not one
+of them.
 
 It would be the wrong place even if a pod could run there. A Crossplane control plane is
 built to reconcile resources, not to carry a stream that grows with every engine pod.
@@ -406,10 +407,10 @@ routing OTLP through an Envoy AI Gateway means teaching it a protocol it has no 
 know, to reach a collector that still has nowhere to run. It also couples telemetry to a
 component a fleet might deploy several of, or none of.
 
-**The destination is the operator's, which is the point.** It sits where their observability
-already is, inside their network as often as not, so a cluster that can reach their backend
-needs no path to ours. Exporting direct also removes a hop that can fail and leaves a
-cluster's telemetry working while the control plane is upgrading.
+**The destination is the operator's, which is the point.** It sits where their
+observability already is, inside their network as often as not, so a cluster that can reach
+their backend needs no path anywhere else. Exporting direct also removes a hop that can
+fail and leaves a cluster's telemetry working while the control plane is upgrading.
 
 **Control-plane health comes from whoever runs the control plane, and Modelplane documents
 the path.** Crossplane's reconcile rates, function latency and the fleet scheduler's
