@@ -123,9 +123,9 @@ Alongside the engines, Modelplane collects its routers and the stack it installs
 cluster, all under `modelplane_*`. Across the fleet it also reports totals for capacity,
 GPU allocation, and degraded deployments.
 
-Your control plane's own health comes from wherever you run it: a Space reports on the
-control planes it hosts, and a self-hosted Crossplane serves `/metrics` for your cluster
-scrape to pick up.
+Your control plane's own health comes from wherever you run it. A self-hosted Crossplane
+serves `/metrics` on its core, provider, and function pods for your own cluster scrape to
+pick up. A hosted control plane reports its health through whoever hosts it.
 
 ## Migrating from a hand-written `PodMonitor`
 
