@@ -21,10 +21,10 @@ reader.
 engine-type label, so a dashboard reads Modelplane's names and not each engine's. That
 label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeployment`.
 
-**Aggregate to one view.** Every cluster's collector pushes to the control plane, where
-the series roll up and leave as one stream, so what consumes them answers across the fleet
-rather than per cluster. Modelplane runs no store, so the view is whatever that destination
-is.
+**Aggregate to one view.** Every cluster exports straight to one destination, under one
+vocabulary and the same dimensions, so a query there answers across the fleet rather than
+per cluster. Modelplane runs no store and routes nothing through the control plane, which
+is what lets this work in a Space.
 
 **Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, and it
 replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
@@ -76,6 +76,14 @@ since one destination is what makes the fleet's series one view.
 
 Once a destination exists, collection is on for everything Modelplane owns, and a
 `ModelDeployment` author doesn't get a toggle over telemetry the platform team consumes.
+
+**Every cluster means every cluster, including one with no engines on it.** An
+`InferenceGateway` can be hosted on an `InferenceCluster` of its own, and a fleet can run
+several. Such a cluster serves no model and still answers the questions an operator asks
+first: what the fleet was asked for, what it returned, how long it took, and what it cost.
+So the collector is composed per cluster rather than per serving stack, and a gateway-only
+cluster gets one with the gateway's Envoy and the substrate as its sources and no engine
+scrape at all. A cluster's collector reports what that cluster has.
 
 The pieces are already there.
 
@@ -366,10 +374,9 @@ under its own names, and Modelplane surfaces that rather than guessing.
 
 ## Aggregate to one view
 
-Per-cluster collection is half the ask. Each cluster's collector sends its series up to the
-control plane, which also collects the control plane's own metrics (Crossplane, the
-functions, the fleet scheduler). One query then covers the whole deployment rather than a
-per-cluster island an operator stitches together by hand.
+Per-cluster collection is half the ask. Every cluster's series have to land in one place,
+under one vocabulary, so one query covers the whole deployment rather than a per-cluster
+island an operator stitches together by hand.
 
 ### Getting the series across
 
@@ -379,60 +386,61 @@ kubeconfig `provider-kubernetes` holds. Nothing guarantees a path back, least of
 an on-premise or neocloud GPU cluster behind a firewall. So transport is a real question
 rather than a detail of the exporter.
 
-**Every cluster pushes.** Each cluster's collector OTLP-exports to one collector at the
-control plane, which is OpenTelemetry's own multi-cluster pattern. The cluster needs egress
-and nothing inbound, and nothing on it is exposed. The control plane exposes one OTLP
-endpoint, a Gateway API listener with TLS, the same kind of surface the inference gateway
-already serves.
+**Every cluster exports to the destination.** Each cluster's collector OTLP-exports
+straight to the endpoint the fleet configures, and the control plane exports its own
+metrics the same way. A cluster needs egress and nothing inbound, and nothing on it is
+exposed.
 
 Credentials are already solved. `ModelCache` propagates an `authSecret` from the control
-plane to every matched cluster so hydration can read a HuggingFace token. A bearer token or
-client certificate for the OTLP endpoint travels the same way, through the same mechanism,
-so this adds a Secret to propagate rather than a way to propagate Secrets.
+plane to every matched cluster so hydration can read a HuggingFace token. The destination's
+credential travels the same way, through the same mechanism, so this adds a Secret to
+propagate rather than a way to propagate Secrets.
 
-One transport, and no field selecting it. An earlier draft offered a second mode for a
-cluster with no egress, pulling through the API server proxy at
-`/api/v1/namespaces/<ns>/services/<collector>:<port>/proxy/metrics` with the credential
-Modelplane already holds, and a field on the `InferenceCluster` to declare which mode a
-cluster used. Both are out. The second mode isn't only a second transport: a pulled cluster
-exposes a scrape endpoint where a pushing one exports and exposes nothing, so it costs a
-second collector configuration, a second exporter shape, a `ClusterRole` granting
-`services/proxy`, and a field with a status mirror and a printer column. That is a lot of
-surface for a fallback whose own analysis was that every series crosses an API server not
-built to carry them, which caps what a cluster in that mode could send.
+**Nothing routes through the control plane, and that is deliberate.** An earlier draft sent
+every cluster's series to a collector there, which reads naturally when the control plane is
+the thing that knows about every cluster. It doesn't survive contact with a Space. A
+control plane running in one has no ingress of its own to hang an OTLP listener on, so the
+whole path assumed a surface that isn't available where Modelplane is meant to run. And
+where it is available, a Crossplane control plane is the wrong thing to size for a fleet's
+telemetry volume: it is built to reconcile resources, not to carry a stream that grows with
+every engine pod.
 
-Deferring it costs nothing, which is what makes it easy. The field would be optional and
-default to push, so adding it when a cluster that can't egress actually turns up is
-additive and breaks nobody. Until one does, Modelplane supports one transport and says so.
+Sending direct also removes a hop that could fail, halves the number of places a
+destination credential lives, and leaves a cluster's telemetry working while the control
+plane is being upgraded or is unreachable.
 
-**Pull direct** stays ruled out either way: a LoadBalancer or Ingress per cluster needs
-inbound exposure on every GPU cluster, which pushing avoids.
+**Pull direct** stays ruled out: a LoadBalancer or Ingress per cluster needs inbound
+exposure on every GPU cluster, which exporting avoids. A cluster with no egress at all is
+unserved, and stays that way until someone brings one, at which point a collector on a
+neighbouring cluster is a smaller answer than a mode field.
 
-If the fallback is ever built, the platform team declares the mode rather than Modelplane
-detecting it. A composition function does no network probing, so nothing at compose time
-knows whether a cluster can reach the destination. Writing the user-facing page is what
-surfaced that: the draft said "Modelplane notices it can't reach out", which is the
-behaviour a reader would want and not one anything here can implement.
+### What aggregates, and where
 
-The roll-up is a set of `modelplane_*` series over the aggregate: capacity, GPU usage,
-cost, degraded deployments, and SLO attainment such as the fraction of requests under a
-TTFT target. The control-plane collector produces them in memory, because each is a spatial
-aggregation it already does. It sums gauges and counters across clusters and merges
-per-cluster histograms into a fleet histogram. SLO attainment is a ratio of buckets in
-that merged histogram when a boundary sits at the target, which is ours to set. So
-Modelplane runs no store and the control plane stays stateless, as running in a Space
-requires.
+With no collector in the middle, the destination aggregates. That is a change of owner
+rather than of capability: `sum` across clusters and a histogram merge are what every
+Prometheus-compatible backend does, and Modelplane's job is to make them answerable by
+naming the series the same way everywhere and stamping the same dimensions on them.
 
-Computing a percentile value or answering an ad-hoc query is read-time work for whatever
-consumes the export, a dashboard or an operator's own Prometheus-compatible backend.
+So the `modelplane_*` roll-up is a set of queries Modelplane ships rather than a collector
+it runs. Capacity, GPU usage, cost and degraded deployments are sums over the fleet. SLO
+attainment, the fraction of requests under a TTFT target, is a ratio of buckets in the
+merged histogram when a boundary sits at the target, which is ours to set when we define
+the histogram. Modelplane runs no store and now hosts no pipeline either.
+
+What that costs is a guarantee. Before, the fleet series existed because Modelplane
+computed them; now they exist because the destination can, which means a backend that
+can't do histogram math gives an operator per-cluster series and no fleet TTFT. `otlp` and
+`prometheusremotewrite` destinations both can, and a destination that can't is one a
+dashboard couldn't have used either.
 
 ### Exporters and destination
 
-The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, taken by the gateway
-collector and by any OpenTelemetry-compatible backend. `prometheusremotewrite` covers an
-operator who wants the series in a Prometheus-compatible store instead. Vendor-specific
-exporters are out of scope: an operator who wants one puts it behind the gateway, where one
-configuration serves the fleet rather than one per cluster.
+The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, taken by any
+OpenTelemetry-compatible backend. `prometheusremotewrite` covers an operator who wants the
+series in a Prometheus-compatible store instead. Vendor-specific exporters are out of
+scope: an operator who wants one puts a collector of their own in front of it, which is one
+configuration for the fleet rather than one per cluster and keeps that dependency out of
+every GPU cluster.
 
 A Modelplane user does not write collector YAML. The destination is fleet-level
 configuration, one endpoint to match one view, propagated to each cluster's `ServingStack`
@@ -543,25 +551,29 @@ follow-up.
 
 ```mermaid
 flowchart LR
-    subgraph icA["InferenceCluster A"]
+    subgraph icA["InferenceCluster: serving"]
         SA["engines / EPPs / substrate"]
         CA["OTel collector\n(scrape + rename to modelplane_*)"]
     end
-    subgraph icB["InferenceCluster B"]
+    subgraph icB["InferenceCluster: gateway only"]
+        SB["Envoy AI Gateway"]
         CB["OTel collector"]
     end
     subgraph cp["control plane"]
         XP["Crossplane\n(functions, fleet scheduler, XRs)"]
-        CENT["control-plane collector\n+ in-memory roll-up"]
+        CC["OTel collector"]
     end
+    DEST["destination\n(OTLP or Prometheus-compatible)"]
     OP["operator\ndashboards + alerting"]
     SA --> CA
-    CA -->|"push (OTLP)"| CENT
-    CB -->|"push (OTLP)"| CENT
-    XP -->|scraped by| CENT
-    CENT --> OP
+    SB --> CB
+    XP --> CC
+    CA -->|"OTLP"| DEST
+    CB -->|"OTLP"| DEST
+    CC -->|"OTLP"| DEST
+    DEST --> OP
     classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
-    class CENT,CA,CB new
+    class CA,CB,CC new
 ```
 
 ## Alternatives considered
