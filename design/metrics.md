@@ -397,18 +397,27 @@ plane to every matched cluster so hydration can read a HuggingFace token. The de
 credential travels the same way, through the same mechanism, so this adds a Secret to
 propagate rather than a way to propagate Secrets.
 
-**Nothing routes through the control plane, because nothing can.** An earlier draft sent
-every cluster's series to a collector there, which reads naturally when the control plane is
-the thing that knows about every cluster. Modelplane can't deploy that collector. A
-composition function's reach is the clusters it holds credentials for, and its own control
-plane isn't one of them, so there is no way to compose a collector, a listener or a
-certificate alongside Crossplane. In a Space that is doubly true, since the control plane is
-managed and hosts Crossplane rather than arbitrary workloads.
+**Nothing routes through the control plane, because nothing can run there.** An earlier
+draft sent every cluster's series to a collector at the control plane, which reads
+naturally when the control plane is the thing that knows about every cluster. A control
+plane hosts Crossplane and the API it serves, not workloads, and one running in a Space
+schedules no pods at all, so there is nowhere to put a collector, a listener or the
+certificate it would need. Modelplane composes into the clusters it holds credentials for,
+and its own control plane is not one of them.
 
-It would be the wrong place even if it were reachable. A Crossplane control plane is built
-to reconcile resources, not to carry a stream that grows with every engine pod. Exporting
-direct also removes a hop that can fail and leaves a cluster's telemetry working while the
-control plane is upgrading.
+It would be the wrong place even if a pod could run there. A Crossplane control plane is
+built to reconcile resources, not to carry a stream that grows with every engine pod.
+
+**The gateway doesn't rescue it either,** and it is the obvious next thought, since an
+`InferenceGateway` is a surface a cluster can already reach. It speaks the inference APIs:
+routing OTLP through an Envoy AI Gateway means teaching it a protocol it has no reason to
+know, to reach a collector that still has nowhere to run. It also couples telemetry to a
+component a fleet might deploy several of, or none of.
+
+**The destination is the operator's, which is the point.** It sits where their observability
+already is, inside their network as often as not, so a cluster that can reach their backend
+needs no path to ours. Exporting direct also removes a hop that can fail and leaves a
+cluster's telemetry working while the control plane is upgrading.
 
 **The same constraint decides control-plane health, and costs us something.** Crossplane's
 reconcile rates, function latency and the fleet scheduler's decisions are exactly what an
