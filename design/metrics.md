@@ -26,9 +26,10 @@ vocabulary and the same dimensions, so a query there answers across the fleet ra
 per cluster. Modelplane runs no store and routes nothing through the control plane, which
 it could not deploy a collector into anyway.
 
-**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector, and it
-replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
-below gives the reasons and what covers each thing that stack did.
+**Collect with OpenTelemetry.** The collector is an OpenTelemetry collector run by the
+OpenTelemetry Operator, so Modelplane composes one `OpenTelemetryCollector` per cluster,
+and it replaces the kube-prometheus-stack `compose-serving-stack` installs today. The
+section below gives the reasons and what covers each thing that stack did.
 
 Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
 `engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
@@ -220,7 +221,8 @@ spec:
 
 `compose-serving-stack` reads every `MetricMapping` as a required resource, the same way
 `compose-model-deployment` reads `InferenceCluster` and `ModelCache`. It renders them into
-the collector's config, the ConfigMap the OTel collector loads on each cluster. The
+the collector's config, which is the `config` block of the `OpenTelemetryCollector` the
+section below composes on each cluster. The
 `rename` map becomes transform-processor rules, applied to metrics from the pods the
 `selector` matches. A new engine is a new `MetricMapping`, not a package change.
 
@@ -566,8 +568,38 @@ The collector is an OpenTelemetry collector, and it replaces the kube-prometheus
 Prometheus looks load-bearing here, since its operator defines the `PodMonitor` CRD, and
 the dependency runs the other way. `PodMonitor` is a consequence of having chosen
 Prometheus rather than a requirement of collection. The collector's `prometheus` receiver
-does Kubernetes service discovery itself, so discovery is a scrape config in the
-collector's own ConfigMap and no CRD is involved.
+does Kubernetes service discovery itself, so discovery is a scrape config the collector
+carries rather than a CRD per target.
+
+### The OpenTelemetry Operator runs it
+
+`compose-serving-stack` installs the [OpenTelemetry
+Operator](https://opentelemetry.io/docs/platforms/kubernetes/operator/) and composes one
+`OpenTelemetryCollector` per cluster, rather than composing a Deployment and a ConfigMap by
+hand. Modelplane writes that resource; a user never sees it.
+
+The operator earns it on four things. Its admission webhook rejects an invalid collector
+config on apply, where a hand-composed ConfigMap reports the same mistake as
+CrashLoopBackOff after the fact. It regenerates the ConfigMap and rolls the pods when the
+config changes, which a hand-composed pair needs a checksum annotation or a reloader to
+match. `mode` is `deployment`, `daemonset` or `statefulset`, so the two tiers below are one
+field rather than two hand-written workloads. And the [Target
+Allocator](https://opentelemetry.io/docs/platforms/kubernetes/operator/target-allocator/)
+is there when one collector stops being enough for a cluster's engines, which wants
+`statefulset` or `daemonset` mode and a receiver named exactly `prometheus`.
+
+It costs a Helm release and a CRD on every cluster, in the change that removes
+kube-prometheus-stack, which is an operator with a larger CRD set of its own. Its one hard
+prerequisite is cert-manager, for the webhook's certificate, and `compose-serving-stack`
+already installs cert-manager. Composing an `Object` that waits for a chart's CRD is what the GatewayClass
+and the Envoy Gateway already do here. Two things it doesn't solve: the operator and the
+collector image are separate versions to pin, and the ServiceAccount it creates carries no
+policy, so the ClusterRole that `k8sattributes` and `k8s_cluster` need is composed either
+way.
+
+This adopts an operator for the collector's lifecycle, not for discovery. Targets stay a
+scrape config inside the `OpenTelemetryCollector`, so the `PodMonitor` argument above is
+unchanged.
 
 ### What replaces the stack
 
@@ -581,7 +613,8 @@ Each thing kube-prometheus-stack does today has a receiver that does it.
 | cAdvisor and kubelet | `kubeletstats` receiver |
 | node-exporter | `hostmetrics` receiver |
 
-That splits the collector in two, which the current design doesn't describe. Node-scoped
+That splits the collector in two, which is two `OpenTelemetryCollector` resources
+differing by `mode`. Node-scoped
 receivers (`kubeletstats`, `hostmetrics`, and the `filelog` receiver when logs follow) need
 a collector on every node, so they run as a DaemonSet. Cluster-scoped ones (`k8s_cluster`,
 and the engine and EPP scrapes) run as one Deployment. The engine scrape could run in
@@ -663,14 +696,17 @@ it matters: every cluster exports to one destination under one vocabulary, so th
 view is a query someone writes once. Publishing N URLs leaves each operator to find them,
 stitch them, and reconcile three engines' metric names by hand.
 
-### Let the OpenTelemetry Operator hold the destination
+### Compose the collector's Deployment and ConfigMap directly
 
-Install the operator on each cluster, compose an `OpenTelemetryCollector` per cluster, and
-the destination is that resource's `exporters` block, with no Modelplane kind at all. It
-moves the rendering rather than the decision: the exporter block is per cluster, and a
-fleet still has to say once where telemetry goes and have that reach every cluster. It also
-puts an operator and a CRD on every cluster to hold configuration Modelplane generates, and
-pointed at a user it means writing collector YAML, which this design keeps off them.
+No operator, no CRD, and `compose-serving-stack` writes the two objects itself. It is fewer
+moving parts on each cluster and it gives up validation on apply, rollout on config change,
+and the `mode` field that makes the second tier free. Each of those is something we would
+write and then maintain. The operator's own prerequisite, cert-manager, is already in the
+stack.
+
+An `OpenTelemetryCollector` also doesn't answer where the fleet sends telemetry. Its
+exporters block is per cluster, so `TelemetryDestination` says it once and the composed
+resource renders it N times. The two are layers rather than alternatives.
 
 ### OpAMP
 
