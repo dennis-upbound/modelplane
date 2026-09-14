@@ -121,7 +121,7 @@ rolling update would otherwise leave a dead series behind for every pod it repla
 
 Alongside the engines, Modelplane collects its routers and the stack it installs on each
 cluster, all under `modelplane_*`. Across the fleet it also reports totals for capacity,
-GPU usage, and degraded deployments.
+GPU allocation, and degraded deployments.
 
 Your control plane's own health comes from wherever you run it: a Space reports on the
 control planes it hosts, and a self-hosted Crossplane serves `/metrics` for your cluster

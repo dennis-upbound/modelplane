@@ -58,7 +58,7 @@ Scheduler, and a ModelExpress server.
 function latency and panics, the fleet scheduler placing replicas, and XR `Ready`/`Synced`.
 "Is the thing I operate working?"
 
-**Fleet roll-up.** Across every cluster and deployment: total capacity, GPU usage,
+**Fleet roll-up.** Across every cluster and deployment: total capacity, GPU allocation,
 degraded deployments, and cost.
 
 The first two are collected on each cluster and exported to one destination, where the
@@ -123,11 +123,13 @@ engine serves on `_DECODE_ENGINE_PORT` (8001) because the pd-sidecar takes 8000,
 matching 8000 by number scrapes the sidecar. By name, the scrape follows the engine on
 every pod, on every backend.
 
-**GPU utilization needs a source the stack doesn't install today.** `k8s_cluster` reports
-allocatable and requested `nvidia.com/gpu`, which answers how much of the fleet is claimed.
-Whether a claimed GPU is busy comes from DCGM, so `compose-serving-stack` installs the DCGM
-exporter next to the DRA driver and the collector scrapes it as an ordinary pod. That adds
-one component to the stack and answers the question a GPU fleet exists to ask.
+**GPU numbers come from `k8s_cluster`, which reports allocatable and requested
+`nvidia.com/gpu`.** That is allocation: how much of the fleet is claimed, which is what the
+roll-up sums. Whether a claimed GPU is busy is a different question, it needs DCGM, and
+`compose-serving-stack` installs neither DCGM nor the GPU Operator today. For LLM serving
+the saturation signals are the engine's own KV-cache occupancy and queue depth, which
+arrive already, so DCGM waits until someone wants the cost question answered rather than
+the serving one.
 
 ## Capture from an opaque engine
 
@@ -182,15 +184,11 @@ informed.
 
 Selecting by label rather than by metric name looks redundant at first, since engine
 metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
-rename them unambiguously with no selector at all. Degradation above is label-based by
-construction: reporting "no mapping for `X`" means reading a pod's claimed engine and
-finding no mapping for it. Name matching cannot tell that apart from a successful rename of
-nothing. The consistent label set is per pod, not per series, so name matching cannot
-attach `engine` and `cluster` to the series a mapping does not rename. A forked
-engine emits the upstream names while needing its own mapping, and two mappings matching
-one name cannot be told apart without the pod. And not every name is namespaced:
-kube-scheduler's are plain `scheduler_*`, so the scheduler section needs the selector
-most of all.
+rename them unambiguously. The label carries what a name cannot: which engine a pod claims
+to run, so "no mapping for `X`" is distinguishable from a rename that matched nothing; the
+per-pod labels a mapping attaches to series it does not rename; and a forked engine, which
+emits the upstream names while needing its own mapping. Scheduler names are plain
+`scheduler_*` with no namespace at all.
 
 In collector terms that makes the rename an OTTL transform gated on a resource attribute,
 rather than the simpler metrics-transform processor, which matches on metric name only.
@@ -348,36 +346,26 @@ A gang scheduler runs as in-cluster pods the collector reaches, and on a `Dynamo
 Modelplane now installs one itself. `compose-serving-stack` composes the KAI Scheduler and
 the queues its pods schedule against, so KAI's series are first-party rather than something
 a platform team might have brought: the queue is `modelplane` under an unbounded
-`modelplane-root`, and every Grove pod carries `kai.scheduler/queue: modelplane`. A fleet
-that brought Volcano itself is the same problem one mapping further out.
+`modelplane-root`, and every Grove pod carries `kai.scheduler/queue: modelplane`.
 
 Modelplane treats a scheduler like an engine. A per-scheduler mapping, keyed by the one
 installed, normalizes to a `modelplane_cluster_scheduler_*` surface. The name says cluster
 because a future Modelplane fleet scheduler, placing replicas across clusters rather than
 pods across nodes, would get its own `modelplane_fleet_scheduler_*` surface.
 
-These signals answer whether a replica's pods reach GPUs, and whether a cluster's capacity
-is shared fairly across teams.
+The signals are waiting work, scheduling latency, gang readiness, per-queue GPU
+allocation against quota, and preemptions. KAI publishes all five, `kai_queue_*` for the
+queue-shaped ones, which answers whether a replica's pods reach GPUs and whether a
+cluster's capacity is shared fairly across teams.
 
-- **Pending or unschedulable work.** kube-scheduler's `scheduler_pending_pods{queue}`,
-  Volcano's `volcano_unschedule_job_counts`, a KAI queue's waiting podgroups.
-- **Scheduling latency.** `scheduler_scheduling_attempt_duration_seconds`,
-  `volcano_e2e_job_scheduling_latency_milliseconds`.
-- **Gang readiness.** Whether a podgroup's pods can all start at once,
-  `volcano_queue_pod_group_pending_count` against `_running_count`. A gang that never forms
-  is a stuck multi-node deployment. On a Dynamo cluster this has to come from KAI, not from
-  Grove: `PodCliqueSet.status.podGangStatuses` exists on the type and nothing writes it, so
-  `availableReplicas` is the only signal Grove publishes, and it can't distinguish a gang
-  that never formed from one still forming.
-- **Per-queue GPU allocation against quota.** `kai_queue_allocated_gpus`, Volcano's
-  `volcano_queue_allocated_scalar_resources` against `_deserved_` and `_capacity_`, with
-  `volcano_queue_overused` for fairness.
-- **Preemptions and evictions.** `scheduler_preemption_victims`,
-  `volcano_pod_preemption_victims`.
+Gang readiness has to come from the scheduler rather than from Grove.
+`PodCliqueSet.status.podGangStatuses` exists on the type and nothing writes it, so
+`availableReplicas` is all Grove publishes, and it can't tell a gang that never formed from
+one still forming.
 
 A scheduler's mapping is a `MetricMapping` like an engine's, and the degradation rule
-carries over, punctuation caveat included. An unmapped scheduler still gets scraped
-under its own names, and Modelplane surfaces that rather than guessing.
+carries over, punctuation caveat included. A fleet that brought Volcano writes one mapping,
+which is the mechanism working rather than a new problem.
 
 ## Aggregate to one view
 
@@ -451,7 +439,7 @@ Prometheus-compatible backend does, and Modelplane's job is to make them answera
 naming the series the same way everywhere and stamping the same dimensions on them.
 
 So the `modelplane_*` roll-up is a set of queries Modelplane ships rather than a collector
-it runs. Capacity, GPU usage, cost and degraded deployments are sums over the fleet. SLO
+it runs. Capacity, GPU allocation, cost and degraded deployments are sums over the fleet. SLO
 attainment, the fraction of requests under a TTFT target, is a ratio of buckets in the
 merged histogram, which works because Modelplane owns the histogram boundaries and puts one
 on the target. Modelplane runs no store and now hosts no pipeline either.
@@ -617,7 +605,7 @@ DaemonSet. Cluster-scoped ones (`k8s_cluster`, and the engine and EPP scrapes) r
 Deployment. The engine scrape could run in
 either; putting it in the Deployment keeps one scrape config rather than N node-local ones.
 
-The Deployment tier ships first and the DaemonSet tier follows. Engines, the EPP, DCGM and
+The Deployment tier ships first and the DaemonSet tier follows. Engines, the EPP and
 `k8s_cluster` answer the inference and substrate questions above, and every one of them is
 a pod scrape. Node CPU, memory and disk answer a question a platform team usually has
 another agent for, so a per-node pod on every GPU cluster is worth adding when logs need
@@ -649,7 +637,7 @@ follow-up.
 ```mermaid
 flowchart LR
     subgraph icA["InferenceCluster: serving"]
-        SA["engines / EPPs / substrate / DCGM"]
+        SA["engines / EPPs / substrate"]
         CA["OpenTelemetryCollector\n(scrape + rename to modelplane_*)"]
     end
     subgraph icB["InferenceCluster: gateway only"]
@@ -721,26 +709,15 @@ hands an operator a different vocabulary per engine and per component. The `mode
 surface is the point of aggregating in the first place: one set of names and labels for the
 whole deployment.
 
-### A PodMonitor per replica
+### Smaller shapes, rejected
 
-`compose-model-replica` could compose a `PodMonitor` per replica, so collection comes and
-goes with the deployment. It buys nothing over one cluster-wide scrape config, and composes
-N objects where one does the same job. It also assumes the CRD, which goes with the
-Prometheus stack.
-
-### A per-deployment opt-out field
-
-An `enabled` toggle on the deployment covers only the data plane and asks a
-`ModelDeployment` author to opt in or out of collection the platform team consumes.
-Always-on collection fits the ownership better, so there is no toggle.
-
-### Authenticate the EPP metrics endpoint
-
-The EPP can serve `/metrics` behind controller-runtime auth (a `ClusterRole` with
-`nonResourceURLs: /metrics` plus a bearer token). Since Modelplane owns the EPP args and
-the endpoint carries non-sensitive routing stats reachable only in-cluster,
-`--metrics-endpoint-auth=false` collects them with nothing to manage. Auth would add a
-`ClusterRole` and a bearer token for no gain here.
+A `PodMonitor` per replica from `compose-model-replica` buys nothing over one cluster-wide
+scrape config, composes N objects where one does the same job, and assumes the CRD that
+goes with the Prometheus stack. An `enabled` toggle on a `ModelDeployment` covers only the
+data plane and asks its author to opt in or out of collection the platform team consumes.
+The EPP's `/metrics` could sit behind controller-runtime auth, and since Modelplane owns
+the EPP args and the endpoint carries routing stats reachable only in-cluster,
+`--metrics-endpoint-auth=false` collects them with nothing to manage.
 
 ## Interaction with #264
 
