@@ -5,8 +5,8 @@
 **Author:** Dennis Ramdass
 
 This document proposes collecting metrics on every cluster, normalizing them to a
-`modelplane_*` namespace, and aggregating them up to one Modelplane view at the control
-plane. It builds on [design.md](./design.md) and addresses
+`modelplane_*` namespace, and exporting them to one destination where the fleet is a single
+view. It builds on [design.md](./design.md) and addresses
 [#269](https://github.com/modelplaneai/modelplane/issues/269).
 
 ## Summary
@@ -30,16 +30,15 @@ it could not deploy a collector into anyway.
 replaces the kube-prometheus-stack `compose-serving-stack` installs today. The section
 below gives the reasons and what covers each thing that stack did.
 
-Three API changes carry it. Two are settled: a `MetricMapping` kind holding one engine's
-renames, and `engines[].type` on a `ModelDeployment`. The third needs deciding before this
-is built: where a fleet's telemetry destination lives, though what to call it is settled
-below. Naming the engine port is a fourth change, to `compose-model-replica` rather than to
-an API.
+Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
+`engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
+where the fleet's telemetry goes. Naming the engine port is a fourth change, to
+`compose-model-replica` rather than to an API.
 
 Approving this means agreeing that normalization and aggregation are Modelplane's job
 rather than the platform team's, that collection is on for every source once a destination
-exists, and that the collector is OpenTelemetry in place of the Prometheus stack we install
-today.
+exists, that the collector is OpenTelemetry in place of the Prometheus stack we install
+today, and that control-plane health stays with whoever runs the control plane.
 
 ## What to monitor
 
@@ -63,9 +62,10 @@ function latency and panics, the fleet scheduler placing replicas, and XR `Ready
 degraded deployments, and cost.
 
 The first two are collected on each cluster and exported to one destination, where the
-fleet roll-up is a query over them. Control-plane health is the exception and the section
-on getting the series across says why: Modelplane has no way to deploy a collector
-alongside its own Crossplane, so that one belongs to whoever runs the control plane.
+fleet roll-up is a query over them. Control-plane health comes from whoever runs the
+control plane, since Modelplane has no way to deploy a collector alongside its own
+Crossplane. The section on getting the series across names the two paths that already
+serve it.
 
 ## Collect on every cluster
 
@@ -107,9 +107,15 @@ deployment, so collection is a cluster property rather than something composed p
 replica. A second selector covers the endpoint pickers, and a third the substrate
 `compose-serving-stack` installs, which is now stack-dependent: the LeaderWorkerSet
 controller on a `Standard` cluster, or Grove, the KAI Scheduler and the ModelExpress
-server on a `Dynamo` one. The substrate selector has to follow the stack, and the
-ModelExpress server is a Modelplane-owned component we have not yet checked for a metrics
-endpoint.
+server on a `Dynamo` one. The substrate selector follows the stack. The ModelExpress
+server goes in it, and where it serves no metrics endpoint its readiness still arrives
+through `k8s_cluster`, which is what the substrate question needs from it.
+
+**GPU utilization needs a source the stack doesn't install today.** `k8s_cluster` reports
+allocatable and requested `nvidia.com/gpu`, which answers how much of the fleet is claimed.
+Whether a claimed GPU is busy comes from DCGM, so `compose-serving-stack` installs the DCGM
+exporter next to the DRA driver and the collector scrapes it as an ordinary pod. That adds
+one component to the stack and answers the question a GPU fleet exists to ask.
 
 Scrape the engine port by name, not by number, which needs a change first: no backend
 names it today. `native.py`, `llmd.py`, and `grove.py` all compose
@@ -397,9 +403,9 @@ plane to every matched cluster so hydration can read a HuggingFace token. The de
 credential travels the same way, through the same mechanism, so this adds a Secret to
 propagate rather than a way to propagate Secrets.
 
-**Nothing routes through the control plane, because nothing can run there.** An earlier
-draft sent every cluster's series to a collector at the control plane, which reads
-naturally when the control plane is the thing that knows about every cluster. A control
+**Nothing routes through the control plane, because nothing can run there.** A collector
+at the control plane reads naturally, since the control plane is the thing that knows about
+every cluster, and it is the shape to rule out first. A control
 plane hosts Crossplane and the API it serves, not workloads, and one running in a Space
 schedules no pods at all, so there is nowhere to put a collector, a listener or the
 certificate it would need. Modelplane composes into the clusters it holds credentials for,
@@ -419,17 +425,24 @@ already is, inside their network as often as not, so a cluster that can reach th
 needs no path to ours. Exporting direct also removes a hop that can fail and leaves a
 cluster's telemetry working while the control plane is upgrading.
 
-**The same constraint decides control-plane health, and costs us something.** Crossplane's
-reconcile rates, function latency and the fleet scheduler's decisions are exactly what an
-operator wants when Modelplane itself misbehaves, and Modelplane cannot collect them for
-the reason above. They belong to whoever runs the control plane: a Space observes the
-control planes it hosts, and a self-hosted Crossplane is the operator's to scrape. This
-design covers the clusters Modelplane manages and says plainly that it stops there.
+**Control-plane health comes from whoever runs the control plane, and Modelplane documents
+the path.** Crossplane's reconcile rates, function latency and the fleet scheduler's
+decisions are exactly what an operator wants when Modelplane itself misbehaves, and the
+constraint above means Modelplane cannot collect them. Two paths already serve it. A Space
+observes the control planes it hosts and exposes that to the account that owns them. A
+self-hosted Crossplane serves `/metrics` on the core pod and on each provider and function
+pod, which an operator's existing cluster-level scrape picks up once those endpoints are
+added. Modelplane's part is to document both and to name the series worth alerting on,
+which lands in the docs rather than in a composition function.
+
+Reconcile state stays on the API either way. `Ready` and `Synced` on every XR say whether
+Modelplane converged, over the same connection an operator already uses. This design covers
+the clusters Modelplane manages and says plainly that it stops there.
 
 **Pull direct** stays ruled out: a LoadBalancer or Ingress per cluster needs inbound
 exposure on every GPU cluster, which exporting avoids. A cluster with no egress at all is
-unserved, and stays that way until someone brings one, at which point a collector on a
-neighbouring cluster is a smaller answer than a mode field.
+out of scope. If one turns up, a collector on a neighbouring cluster it can reach is a
+smaller answer than a mode field on the API.
 
 ### What aggregates, and where
 
@@ -441,14 +454,15 @@ naming the series the same way everywhere and stamping the same dimensions on th
 So the `modelplane_*` roll-up is a set of queries Modelplane ships rather than a collector
 it runs. Capacity, GPU usage, cost and degraded deployments are sums over the fleet. SLO
 attainment, the fraction of requests under a TTFT target, is a ratio of buckets in the
-merged histogram when a boundary sits at the target, which is ours to set when we define
-the histogram. Modelplane runs no store and now hosts no pipeline either.
+merged histogram, which works because Modelplane owns the histogram boundaries and puts one
+on the target. Modelplane runs no store and now hosts no pipeline either.
 
-What that costs is a guarantee. Before, the fleet series existed because Modelplane
-computed them; now they exist because the destination can, which means a backend that
-can't do histogram math gives an operator per-cluster series and no fleet TTFT. `otlp` and
-`prometheusremotewrite` destinations both can, and a destination that can't is one a
-dashboard couldn't have used either.
+Those queries ship as documentation, with a Grafana dashboard built on them, since a
+Prometheus-compatible store is the common destination. An operator points it at their
+backend rather than writing the fleet math themselves. The one requirement that puts on a
+destination is that it sums across clusters and merges histogram buckets, which every OTLP
+backend and every Prometheus-compatible store does, so it is the population the two
+exporters below already reach.
 
 ### Exporters and destination
 
@@ -461,25 +475,43 @@ every GPU cluster.
 
 A Modelplane user does not write collector YAML. The destination is fleet-level
 configuration, one endpoint to match one view, propagated to each cluster's `ServingStack`
-and rendered into the collector's config there. Its credential is a Secret reference
-resolved per cluster, as above.
+and rendered into the collector's config there.
 
-Where that configuration lives needs deciding before this is built, not during. A field on
-a fleet-level resource and a kind of its own both work, and the choice is the same one
-`MetricMapping` faced: a typed kind validates on apply and lists under `kubectl get`, at
-the cost of another kind.
+**That configuration is a cluster-scoped `TelemetryDestination`,** following
+`MetricMapping` and `InferenceClass`: a config kind the platform team owns, validated on
+apply and listed under `kubectl get`. The alternative is a field on an existing resource,
+and every resource that is fleet-wide today is one piece of the fleet rather than the fleet
+itself, so a field would put the endpoint somewhere arbitrary. Its credential is a
+`secretRef` resolved in `modelplane-system`, the way `InferenceCluster` resolves a
+kubeconfig.
 
-What to call it is settled either way, and it's telemetry rather than metrics. An OTLP
-endpoint carries metrics, logs and traces on the same wire, so the destination is already
-signal-agnostic and a name like `MetricsDestination` would describe it narrower than it is.
-`TelemetryDestination` as a kind, or `spec.telemetry.destination` as a field. The rename is
-free while nothing has been built and costs a deprecation window and a migration for every
-user once something has.
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: TelemetryDestination
+metadata:
+  name: default
+spec:
+  exporter: OTLP                       # OTLP | PrometheusRemoteWrite
+  otlp:
+    endpoint: otlp.acme.example:4317
+  auth:
+    secretRef:
+      name: telemetry-destination      # in modelplane-system
+```
 
-It blocks more than the implementation. Configuring a destination is the first thing a user
-does, since nothing is collected until one exists, so it is the first thing the docs
-describe. Its scope and owner go with the decision: the platform team owns it and one
-destination serves the fleet, which points cluster-scoped rather than namespaced.
+The discriminator and its CEL rule match the rest of the API: `self.exporter != 'OTLP' ||
+has(self.otlp)`.
+
+A fleet usually has one. Where there are several, every cluster's collector exports to all
+of them, which is one exporter per destination in the same pipeline and is how an operator
+moves between backends without a gap.
+
+The name is telemetry rather than metrics. An OTLP endpoint carries metrics, logs and
+traces on the same wire, so the destination is signal-agnostic and `MetricsDestination`
+would describe it narrower than it is.
+
+Creating one is the first thing a user does, since nothing is collected until a destination
+exists, so it is also the first thing the docs describe.
 
 ### Cardinality
 
@@ -517,11 +549,11 @@ The collector is an OpenTelemetry collector, and it replaces the kube-prometheus
 - **One pipeline carries three signals.** Metrics, the #77 traces, and logs travel
   together, where a Prometheus stack is metrics only.
 
-An earlier draft argued Prometheus had to stay because its operator defines the
-`PodMonitor` CRD this design composes against. That has the dependency backwards.
-`PodMonitor` is a consequence of having chosen Prometheus, not a requirement of collection.
-The collector's `prometheus` receiver does Kubernetes service discovery itself, so
-discovery is a scrape config in the collector's own ConfigMap and no CRD is involved.
+Prometheus looks load-bearing here, since its operator defines the `PodMonitor` CRD, and
+the dependency runs the other way. `PodMonitor` is a consequence of having chosen
+Prometheus rather than a requirement of collection. The collector's `prometheus` receiver
+does Kubernetes service discovery itself, so discovery is a scrape config in the
+collector's own ConfigMap and no CRD is involved.
 
 ### What replaces the stack
 
@@ -541,9 +573,11 @@ a collector on every node, so they run as a DaemonSet. Cluster-scoped ones (`k8s
 and the engine and EPP scrapes) run as one Deployment. The engine scrape could run in
 either; putting it in the Deployment keeps one scrape config rather than N node-local ones.
 
-Whether the DaemonSet tier is in the first cut is worth deciding separately. Engines, the
-EPP and `k8s_cluster` answer the inference and substrate questions above. Node CPU, memory
-and disk answer a question a platform team may already have another agent for.
+The Deployment tier ships first and the DaemonSet tier follows. Engines, the EPP, DCGM and
+`k8s_cluster` answer the inference and substrate questions above, and every one of them is
+a pod scrape. Node CPU, memory and disk answer a question a platform team usually has
+another agent for, so a per-node pod on every GPU cluster is worth adding when logs need
+that tier anyway.
 
 ### What we give up
 
@@ -556,8 +590,10 @@ Which inverts what a fresh install gives you, and the inversion is worth stating
 than discovering. Today Modelplane installs a working per-cluster store with no
 aggregation. After this it aggregates across the fleet and stores nothing, so an install
 with no destination configured collects nothing at all. That is the right trade for a fleet
-and the wrong one for a first afternoon with Modelplane, which argues for the getting
-started path shipping a destination rather than leaving the field empty.
+and the wrong one for a first afternoon with Modelplane, so the getting started guide
+installs one Prometheus-compatible store on the cluster it creates and points a
+`TelemetryDestination` at it. That is a step in a guide rather than a default in the API,
+and an operator who already has a backend points the same resource at theirs instead.
 
 The [#264](https://github.com/modelplaneai/modelplane/issues/264) guide. Its whole workflow
 is a hand-written `PodMonitor` plus a port-forward to the in-cluster Prometheus, and both
@@ -607,12 +643,11 @@ Prometheus-compatible one, at the center, once.
 
 ### Stop at per-cluster collection
 
-An earlier shape collected on each cluster and left the rest to the platform team,
-publishing a Prometheus URL on the `InferenceCluster` status. That is close to what this
-design does and differs where it matters: every cluster exports to one destination under
-one vocabulary, so the fleet view is a query someone writes once. Publishing N URLs leaves
-each operator to find them, stitch them, and reconcile three engines' metric names by
-hand.
+Collect on each cluster, leave the rest to the platform team, and publish a Prometheus URL
+on the `InferenceCluster` status. That is close to what this design does and differs where
+it matters: every cluster exports to one destination under one vocabulary, so the fleet
+view is a query someone writes once. Publishing N URLs leaves each operator to find them,
+stitch them, and reconcile three engines' metric names by hand.
 
 ### Raw engine metric names, no normalization
 
@@ -630,9 +665,9 @@ Prometheus stack.
 
 ### A per-deployment opt-out field
 
-An earlier shape put an `enabled` toggle on the deployment. It covers only the data plane
-and asks an MD author to opt in or out of collection the platform team consumes. Always-on
-collection fits the ownership better, so the toggle is dropped.
+An `enabled` toggle on the deployment covers only the data plane and asks a
+`ModelDeployment` author to opt in or out of collection the platform team consumes.
+Always-on collection fits the ownership better, so there is no toggle.
 
 ### Authenticate the EPP metrics endpoint
 
