@@ -123,13 +123,23 @@ engine serves on `_DECODE_ENGINE_PORT` (8001) because the pd-sidecar takes 8000,
 matching 8000 by number scrapes the sidecar. By name, the scrape follows the engine on
 every pod, on every backend.
 
-**GPU numbers come from `k8s_cluster`, which reports allocatable and requested
-`nvidia.com/gpu`.** That is allocation: how much of the fleet is claimed, which is what the
-roll-up sums. Whether a claimed GPU is busy is a different question, it needs DCGM, and
-`compose-serving-stack` installs neither DCGM nor the GPU Operator today. For LLM serving
-the saturation signals are the engine's own KV-cache occupancy and queue depth, which
-arrive already, so DCGM waits until someone wants the cost question answered rather than
-the serving one.
+**A `ModelCache` and its volume are in scope, and cost nothing extra.** `k8s_cluster`
+reports a PVC's capacity and how much of it is used, and it reports the hydration Job's
+status, so a cache that fills its volume or fails to stage shows up without a new
+component. The cache's own convergence stays on the API, as `Ready` and `Synced` on the
+`ModelCache`.
+
+**GPU allocation comes from `k8s_cluster`, and the GPU itself comes from DCGM.**
+`k8s_cluster` reports allocatable and requested `nvidia.com/gpu`, which is what the
+roll-up sums. The hardware underneath needs the DCGM exporter, which
+`compose-serving-stack` installs alongside the DRA driver and the collector scrapes as an
+ordinary pod.
+
+Utilization is the least of what that buys. Thermal throttling, ECC errors and XID faults
+are production failure modes that present as slow inference with healthy-looking engine
+metrics, and nothing else in this design catches them. Memory used per device is the other
+one, since an engine reports its KV-cache occupancy and not what else is resident. The
+serving question stays answered by the engine's own queue depth and cache occupancy.
 
 ## Capture from an opaque engine
 
@@ -333,8 +343,12 @@ by the engine's scheduler loop.
 These series feed more than dashboards. An autoscaler or an SLA planner reads the same
 normalized latency, sequence-length, and queue series to size prefill against decode and
 hold TTFT and ITL under target. NVIDIA's Dynamo Planner is the reference for such a
-consumer. It samples on the order of seconds, faster than a dashboard needs, so the scrape
-interval is a knob rather than a fixed value.
+consumer. It samples on the order of seconds, faster than a dashboard needs, which sets
+the default: 15s for the engine and picker jobs, where queue depth and KV-cache occupancy
+move between scrapes and a 30s sample smooths away the burst that caused the incident. The
+substrate and `k8s_cluster` jobs stay at 30s, since a controller's health doesn't move that
+fast. Both are fields on the composed scrape config, so a fleet that wants faster or
+cheaper changes them.
 
 ## Cluster scheduler metrics
 
@@ -520,6 +534,10 @@ Every label multiplies series, and an inference fleet has labels that churn. Dro
 in the collector before export is cheaper than paying for them downstream and then
 aggregating them away.
 
+For sizing, one vLLM 0.23.0 pod publishes 359 metric lines, measured on the GKE cluster
+above. An engine pod, its share of the EPP, and DCGM's per-device series are what a cluster
+pays per replica, times the scrape interval above.
+
 Dropped: `pod`, `pod_uid`, and `container_id`. Each is new on every restart, so each turns
 a rolling update into a fresh set of series that never gets written to again. Kept:
 `engine`, `cluster`, `model`, `deployment`, and `namespace`, which are the dimensions the
@@ -605,7 +623,7 @@ DaemonSet. Cluster-scoped ones (`k8s_cluster`, and the engine and EPP scrapes) r
 Deployment. The engine scrape could run in
 either; putting it in the Deployment keeps one scrape config rather than N node-local ones.
 
-The Deployment tier ships first and the DaemonSet tier follows. Engines, the EPP and
+The Deployment tier ships first and the DaemonSet tier follows. Engines, the EPP, DCGM and
 `k8s_cluster` answer the inference and substrate questions above, and every one of them is
 a pod scrape. Node CPU, memory and disk answer a question a platform team usually has
 another agent for, so a per-node pod on every GPU cluster is worth adding when logs need
@@ -637,7 +655,7 @@ follow-up.
 ```mermaid
 flowchart LR
     subgraph icA["InferenceCluster: serving"]
-        SA["engines / EPPs / substrate"]
+        SA["engines / EPPs / substrate / DCGM"]
         CA["OpenTelemetryCollector\n(scrape + rename to modelplane_*)"]
     end
     subgraph icB["InferenceCluster: gateway only"]
