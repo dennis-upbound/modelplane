@@ -22,41 +22,81 @@ The required `source` enum names the kind, with the matching source object set
 alongside it. Setting `source: HuggingFace` selects `spec.huggingFace`, which
 carries the `repo` to fetch and an optional `revision` (branch, tag, or commit).
 
-A `HuggingFace` cache sizes itself. Modelplane reads the repository's file
-listing and asks for what the staged files need, reporting the result in
-`status.artifact`:
+A `HuggingFace` cache sizes its own storage. Modelplane reads the repository's
+file listing and asks for what the staged files need, so caching a 480B coder
+model is the repo name and nothing else:
+
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelCache
+metadata:
+  name: qwen3-coder
+  namespace: ml-team
+spec:
+  source: HuggingFace
+  huggingFace:
+    repo: Qwen/Qwen3-Coder-480B-A35B-Instruct
+```
+
+`status.artifact` reports what that resolved to:
 
 ```yaml {nocopy=true}
 status:
   artifact:
-    revision: a09a35457c702d95a4c1cd0fa9b91a01d6d5b2e0
-    fileCount: 11
-    sizeGiB: 18
+    revision: 9d90cf8fca1bf7b7acca42d3fc9ae694a2194069
+    fileCount: 253
+    sizeGiB: 1029
 ```
 
-Set `sizeGiB` yourself to override it. An explicit size also skips the listing
-entirely, which is what a control plane with no egress to HuggingFace needs.
+The 1029 GiB is the repository's 253 files plus headroom, not a round number
+someone guessed. Set `sizeGiB` yourself to override it. An explicit size also
+skips the listing entirely, which is what a control plane with no egress to
+HuggingFace needs.
 
-`include` and `exclude` narrow what a `HuggingFace` cache stages, and the derived
-size follows them. A repository is a distribution, not a model, and a popular one
-publishes the same weights more than once:
-`meta-llama/Llama-3.1-405B-Instruct` publishes 2.4 TB, of which an engine reads
-812 GB.
+Most repositories need nothing here. The Qwen Coder repo above publishes one copy
+of its weights, and Qwen ships its quantizations as separate repositories
+(`-FP8`, `-AWQ`, `-GPTQ-Int4`), so a cache of any of them stages the model and no
+more.
+
+Some publish several copies. `openai/gpt-oss-20b` carries three of a 13.8 GB
+model: the safetensors shards vLLM reads, an `original/` single-file checkpoint,
+and a `metal/model.bin` for llama.cpp. Cached as-is it asks for 45 GiB where 15
+would do. The same shape at scale: `meta-llama/Llama-3.1-405B-Instruct` publishes
+2.4 TB, of which 1.6 TB is `original/*` PyTorch checkpoints sitting beside the
+safetensors shards.
+
+`include` and `exclude` narrow what a `HuggingFace` cache stages, and the
+derived size follows them:
 
 ```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelCache
+metadata:
+  name: gpt-oss-20b
+  namespace: ml-team
 spec:
   source: HuggingFace
   huggingFace:
-    repo: meta-llama/Llama-3.1-405B-Instruct
-    exclude: ["original/*"]
+    repo: openai/gpt-oss-20b
+    exclude: ["original/*", "metal/*"]
 ```
 
-They're glob patterns matched against each file's path, the same ones
-`hf download` accepts, and `exclude` applies after `include`. Narrowing is yours
-to declare because a cache doesn't know which engine reads it: `openai/gpt-oss-20b`
-ships a `metal/model.bin` beside its safetensors shards, and dropping it would
-break a llama.cpp engine while leaving vLLM fine. Check `status.artifact.files`
-to see what a pattern selected before the weights move.
+```yaml {nocopy=true}
+status:
+  artifact:
+    revision: 6cee5e81ee83917806bbde320786a8fb61efebee
+    fileCount: 14
+    sizeGiB: 15
+```
+
+Patterns are globs matched against each file's path, the same ones `hf download`
+accepts, and `exclude` applies after `include`.
+
+Narrowing is yours to declare because a cache doesn't know which engine reads it.
+One cache serves many deployments, and which file a deployment needs depends on
+its loader: the exclusion above is right for vLLM and wrong for a llama.cpp
+engine, which reads the `metal/model.bin` it drops. `status.artifact.files` lists
+what a pattern selected, so check it before the weights move.
 
 Setting `source: OCI` selects `spec.oci` and reads the weights from a registry
 you already publish to. Nothing is staged onto a volume: each node pulls the
@@ -210,11 +250,15 @@ kubectl create secret generic hf-token \
 spec:
   source: HuggingFace
   huggingFace:
-    repo: Qwen/Qwen3-Coder-480B-A35B-Instruct
+    repo: meta-llama/Llama-3.1-405B-Instruct
     authSecret:
       name: hf-token         # a Secret in this ModelCache's namespace
       key: HF_TOKEN          # defaults to HF_TOKEN
 ```
+
+The token is read to size the cache as well as to stage it, so a gated
+repository with no `authSecret` reports `ArtifactReady` false with the status
+HuggingFace returned, rather than staging an unsized volume.
 
 Without a cache, the engine fetches the model itself at startup, so the
 credential goes on the `ModelDeployment` instead, as `HF_TOKEN` in the engine

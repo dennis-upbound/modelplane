@@ -70,6 +70,14 @@ class HuggingFace(BaseModel):
     """
     Optional Secret holding an HF token for gated or private repos. Names a Secret in the ModelCache's own namespace; Modelplane propagates it to each matched cluster for the hydration Job to read.
     """
+    exclude: list[constr(min_length=1)] | None = None
+    """
+    Glob patterns naming files to skip, applied after include.
+    """
+    include: list[constr(min_length=1)] | None = None
+    """
+    Glob patterns naming the files to stage. Defaults to every file in the repository. A repository often publishes the same weights more than once, in the format each framework wants; narrowing is declared here because a cache doesn't know which engine reads it.
+    """
     repo: constr(min_length=1)
     """
     HuggingFace repository ID.
@@ -78,9 +86,9 @@ class HuggingFace(BaseModel):
     """
     Branch, tag, or commit SHA. Defaults to the repo's default branch.
     """
-    sizeGiB: conint(ge=1, le=100000)
+    sizeGiB: conint(ge=1, le=100000) | None = None
     """
-    Capacity to allocate for the staged artifact on each matched cluster.
+    Capacity to allocate for the staged artifact on each matched cluster. Defaults to the size of the files selected from the repository, plus headroom. Set it to stage without resolving the repository, which is what a control plane with no egress to HuggingFace needs.
     """
 
 
@@ -127,6 +135,29 @@ class Spec(BaseModel):
     """
 
 
+class Artifact(BaseModel):
+    fileCount: int | None = None
+    """
+    Number of files selected for staging.
+    """
+    files: list[str] | None = None
+    """
+    The files the hydration Job stages, set only when include or exclude narrowed the repository.
+    """
+    revision: str | None = None
+    """
+    Commit SHA the repo resolved to.
+    """
+    selection: str | None = None
+    """
+    Fingerprint of the inputs that decide which files are staged (repo, revision, include, exclude). A change re-resolves; anything else reuses this.
+    """
+    sizeGiB: int | None = None
+    """
+    Capacity allocated per cluster, derived from the selected files unless spec.huggingFace.sizeGiB overrode it.
+    """
+
+
 class Mount(BaseModel):
     env: list[dict[str, Any]] | None = Field(None, max_length=8)
     """
@@ -169,6 +200,10 @@ class Summary(BaseModel):
 
 
 class Status(BaseModel):
+    artifact: Artifact | None = None
+    """
+    What the source resolved to. Latched once obtained, so a resolution outage doesn't regress a staged cache.
+    """
     clusters: list[Cluster] | None = None
     """
     Per-cluster staging status.

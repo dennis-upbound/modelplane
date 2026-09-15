@@ -17,7 +17,7 @@
 import dataclasses
 import datetime
 import unittest
-from typing import Any
+from typing import Any, Literal
 
 from crossplane.function import logging, resource
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
@@ -57,7 +57,7 @@ def _existing_xr(**extra: Any) -> v1alpha1.ModelCache:
 # An OCI ModelCache. Nothing stages onto a volume, so the cache composes no PVC,
 # no hydration Job and no token Secret; its whole output is the fragment that
 # says how to mount the artifact.
-def _oci_xr(artifact: str, ref: str, **oci_extra: Any) -> v1alpha1.ModelCache:
+def _oci_xr(artifact: Literal["Image", "ModelArtifact"], ref: str, **oci_extra: Any) -> v1alpha1.ModelCache:
     return v1alpha1.ModelCache(
         metadata=metav1.ObjectMeta(name="qwen", namespace="ml-team"),
         spec=v1alpha1.Spec(
