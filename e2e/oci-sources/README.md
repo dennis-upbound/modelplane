@@ -146,8 +146,16 @@ Loading weights took 0.45 seconds
 Model loading took 1.1201 GiB and 0.779908 seconds
 ```
 
-and it answered `/v1/chat/completions` with 15 prompt tokens in and 24
-completion tokens out. The engine names the mount path and nothing else: no
+and it answered `/v1/chat/completions` over a ClusterIP Service, from a separate
+pod rather than from inside its own:
+
+```
+GET  /v1/models            -> {"id": "/mnt/models", "max_model_len": 2048, …}
+POST /v1/chat/completions  -> usage: 17 prompt, 60 completion, 77 total
+```
+
+`/v1/models` naming the mount path is the whole contract in one line: the
+artifact is the model, and the engine addresses it as a directory. The engine names the mount path and nothing else: no
 `HF_HUB_CACHE`, no token, no `--served-model-name`.
 
 Four things had to be fixed first, and none of them was the mount. Each is worth
