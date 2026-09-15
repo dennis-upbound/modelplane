@@ -338,6 +338,43 @@
       );
     };
 
+  # Regenerate schemas/python/ only. `nix run .#build` also regenerates them,
+  # but it symlinks the Nix-built function images first, which builds every
+  # function for both architectures — minutes, for a tree that is derived from
+  # the XRDs and the dependency CRDs alone. Changing an XRD needs the models,
+  # not the images, so this skips them: `crossplane project build` still builds
+  # functions, but without the Nix symlink it builds only what it needs to emit
+  # the packages, and the schema tree is what we keep.
+  #
+  # docker-credential-up is on PATH because dependency CRDs are pulled from
+  # xpkg.upbound.io. A workstation whose ~/.docker/config.json sets
+  # `credsStore: desktop` still fails here (docker-credential-desktop is not in
+  # this closure), so point DOCKER_CONFIG at a config without it.
+  schemas =
+    {
+      crossplane,
+      dockerCredentialUp,
+    }:
+    {
+      type = "app";
+      meta.description = "Regenerate schemas/python from the XRDs";
+      program = pkgs.lib.getExe (
+        pkgs.writeShellApplication {
+          name = "modelplane-schemas";
+          runtimeInputs = [
+            crossplane
+            dockerCredentialUp
+            pkgs.coreutils
+          ];
+          inheritPath = false;
+          text = ''
+            rm -rf schemas
+            crossplane project build -o "$(mktemp -d)" "$@"
+          '';
+        }
+      );
+    };
+
   # Validate the OCI source design's substrate claims against a real registry
   # and a real cluster (see e2e/oci-sources). Unlike .#e2e this needs cloud
   # credentials — a 1.36+ cluster and a registry to push five artifact shapes

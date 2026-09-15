@@ -3,9 +3,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, conint, constr
+from pydantic import AwareDatetime, BaseModel, Field, conint, constr
 
 from ....io.k8s.apimachinery.pkg.apis.meta import v1
 
@@ -69,6 +69,21 @@ class HuggingFace(BaseModel):
     """
 
 
+class Oci(BaseModel):
+    artifact: Literal['Image', 'ModelArtifact']
+    """
+    What kind of artifact the reference names, which decides how it mounts. Image is a container image with the weights inside, mounted by Kubernetes as an image volume. ModelArtifact is built to the model spec and read by a CSI driver, because a container runtime will not mount one. Required, and deliberately not defaulted: mounting a model artifact as an image volume succeeds and yields an EMPTY directory, with no error on the pod or the cache, so a wrong guess here is invisible until an engine fails to find weights. Measured on GKE 1.36 with containerd 2.2.6.
+    """
+    ref: constr(min_length=1)
+    """
+    A tag or digest. Prefer a digest: a tag is re-resolved on every pod start, so moving it changes what the next pod serves. A private registry's credential is configured on the InferenceCluster by the platform team rather than per namespace.
+    """
+    subPath: str | None = None
+    """
+    Directory within the artifact holding the weights. Defaults to its root.
+    """
+
+
 class Spec(BaseModel):
     clusterSelector: ClusterSelector | None = None
     """
@@ -82,14 +97,37 @@ class Spec(BaseModel):
     """
     HuggingFace source. Required when source is HuggingFace.
     """
-    source: Literal['HuggingFace'] = 'HuggingFace'
+    oci: Oci | None = None
+    """
+    OCI source. Required when source is OCI. Nothing is staged onto a volume: the artifact is pulled per node by the cluster itself, so there is no sizeGiB and no hydration Job.
+    """
+    source: Literal['HuggingFace', 'OCI']
     """
     Which kind of artifact source to stage from. The matching source object (e.g. spec.huggingFace) must be set.
     """
 
 
+class Mount(BaseModel):
+    env: list[dict[str, Any]] | None = Field(None, max_length=8)
+    """
+    Environment the mount needs to be resolvable, e.g. HF_HUB_CACHE for a HuggingFace cache root.
+    """
+    volumeMounts: list[dict[str, Any]] | None = Field(None, max_length=4)
+    """
+    Mounts to add to each engine container.
+    """
+    volumes: list[dict[str, Any]] | None = Field(None, max_length=4)
+    """
+    Volumes to add. One of persistentVolumeClaim or image, per source.
+    """
+
+
 class Cluster(BaseModel):
     message: str | None = None
+    mount: Mount | None = None
+    """
+    What a consumer adds to a pod to read this cache on this cluster. A consumer joins on this rather than deriving a claim name, so a second source needs no change in the consumer.
+    """
     name: str
     phase: Literal['Pending', 'Hydrating', 'Ready', 'Failed'] | None = None
 

@@ -691,6 +691,7 @@ class TestLLMDBackend(unittest.TestCase):
             spec=v1alpha1.SpecModel(
                 clusterName="cluster-a",
                 modelCacheRef=v1alpha1.ModelCacheRef(name="c"),
+                mount=_hf_mount(base.cache_pvc_name("ml-team", "c")),
                 engines=[engine],
             ),
         )
@@ -727,15 +728,28 @@ class TestBackendSelection(unittest.TestCase):
         self.assertEqual(base.select_backend(_gang_engine(), "Dynamo"), base.GROVE)
 
 
+# The mount a HuggingFace ModelCache publishes on the cluster a replica is
+# pinned to. compose-model-deployment copies this onto the replica, so a replica
+# with a modelCacheRef and no mount is a cache whose cluster has not reported
+# ready yet, and mounts nothing.
+def _hf_mount(pvc: str) -> v1alpha1.Mount:
+    return v1alpha1.Mount(
+        volumes=[{"name": "model-cache", "persistentVolumeClaim": {"claimName": pvc}}],
+        volumeMounts=[{"name": "model-cache", "mountPath": "/mnt/models"}],
+        env=[{"name": "HF_HUB_CACHE", "value": "/mnt/models"}],
+    )
+
+
 class TestCacheMounts(unittest.TestCase):
     def _replica(
         self, *, cache: str | None = None, args: list[str] | None = None, command: list[str] | None = None
     ) -> v1alpha1.ModelReplica:
         engine = _standalone_engine(args=args or [], command=command)
         modelcache = v1alpha1.ModelCacheRef(name=cache) if cache else None
+        mount = _hf_mount(base.cache_pvc_name("ml-team", cache)) if cache else None
         return v1alpha1.ModelReplica(
             metadata=metav1.ObjectMeta(namespace="ml-team"),
-            spec=v1alpha1.SpecModel(clusterName="c", modelCacheRef=modelcache, engines=[engine]),
+            spec=v1alpha1.SpecModel(clusterName="c", modelCacheRef=modelcache, mount=mount, engines=[engine]),
         )
 
     @staticmethod
@@ -768,6 +782,32 @@ class TestCacheMounts(unittest.TestCase):
     def test_cache_env_empty_without_cache(self) -> None:
         self.assertEqual(base.cache_env(self._replica()), [])
 
+    def test_oci_mount_is_carried_verbatim(self) -> None:
+        # An OCI cache publishes an image volume, read-only, with no env. The
+        # replica composes what it was given rather than deriving anything, so a
+        # source it has never heard of needs no change here.
+        replica = self._replica(cache="qwen")
+        replica.spec.mount = v1alpha1.Mount(
+            volumes=[{"name": "model-cache", "image": {"reference": "acme/qwen:v1", "pullPolicy": "Always"}}],
+            volumeMounts=[{"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True}],
+            env=[],
+        )
+        volumes, mounts = base.cache_mounts(replica)
+        self.assertEqual(
+            volumes, [{"name": "model-cache", "image": {"reference": "acme/qwen:v1", "pullPolicy": "Always"}}]
+        )
+        self.assertEqual(mounts, [{"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True}])
+        self.assertEqual(base.cache_env(replica), [])
+
+    def test_cache_ref_without_a_published_mount_mounts_nothing(self) -> None:
+        # The cluster hasn't reported the cache ready, so there is no fragment.
+        # Mounting nothing fails the engine visibly at startup, where guessing a
+        # claim name would mount an empty or wrong volume.
+        replica = self._replica(cache="qwen")
+        replica.spec.mount = None
+        self.assertEqual(base.cache_mounts(replica), ([], []))
+        self.assertEqual(base.cache_env(replica), [])
+
     def test_cache_env_sets_no_offline_flag(self) -> None:
         # HF_HUB_OFFLINE would break an engine that fetches a *different* repo
         # at startup (kimi-k2's separately-gated tokenizer), and resolution
@@ -784,6 +824,7 @@ class TestNativeBackendCache(unittest.TestCase):
             spec=v1alpha1.SpecModel(
                 clusterName="cluster-a",
                 modelCacheRef=v1alpha1.ModelCacheRef(name="qwen"),
+                mount=_hf_mount(base.cache_pvc_name("ml-team", "qwen")),
                 engines=[engine],
             ),
         )
@@ -841,6 +882,7 @@ class TestGroveBackendCache(unittest.TestCase):
             spec=v1alpha1.SpecModel(
                 clusterName="cluster-a",
                 modelCacheRef=v1alpha1.ModelCacheRef(name="kimi"),
+                mount=_hf_mount(base.cache_pvc_name("ml-team", "kimi")),
                 engines=[engine],
             ),
         )
@@ -1229,6 +1271,7 @@ class TestModelExpressEnv(unittest.TestCase):
             spec=v1alpha1.SpecModel(
                 clusterName="cluster-a",
                 modelCacheRef=v1alpha1.ModelCacheRef(name="qwen") if cache else None,
+                mount=_hf_mount(base.cache_pvc_name("ml-team", "qwen")) if cache else None,
                 engines=engines,
             ),
         )

@@ -192,21 +192,107 @@ def _cluster(name: str, *, ready: bool = True, address: str | None = "10.0.0.1",
 _CLUSTER_A = _cluster("cluster-a")
 
 
-def _cache(name: str, *, match_labels: dict[str, str] | None = None) -> dict:
+def _cache(
+    name: str,
+    *,
+    match_labels: dict[str, str] | None = None,
+    mounts: dict[str, mcv1alpha1.Mount] | None = None,
+) -> dict:
     """Build an observed ModelCache in the ml-team namespace.
 
     match_labels, when given, sets spec.clusterSelector.matchLabels - the
     footprint the deployment scheduler intersects with its own selector.
+
+    mounts, when given, maps a cluster name to the fragment the cache publishes
+    for it, the way compose-model-cache reports one per ready cluster.
     """
     selector = mcv1alpha1.ClusterSelector(matchLabels=match_labels) if match_labels else None
-    return mcv1alpha1.ModelCache(
+    cache = mcv1alpha1.ModelCache(
         metadata=metav1.ObjectMeta(name=name, namespace="ml-team"),
         spec=mcv1alpha1.Spec(
             source="HuggingFace",
             huggingFace=mcv1alpha1.HuggingFace(repo="Qwen/Qwen2.5-7B", sizeGiB=20),
             clusterSelector=selector,
         ),
-    ).model_dump(exclude_none=True, mode="json")
+    )
+    if mounts:
+        # What the cache publishes per cluster once it can serve there. The
+        # deployment copies this cluster's entry onto the replica it composes.
+        cache.status = mcv1alpha1.Status(
+            clusters=[
+                mcv1alpha1.Cluster(name=cluster, phase="Ready", mount=mount) for cluster, mount in mounts.items()
+            ],
+        )
+    return cache.model_dump(exclude_none=True, mode="json")
+
+
+# The cached-deployment response, optionally with the fragment the cache
+# published for cluster-a copied onto the composed replica. Shared so the
+# with-mount and without-mount cases differ by exactly the field under test.
+def _want_cached(mount: dict | None = None) -> fnv1.RunFunctionResponse:
+    spec: dict = {
+        "clusterName": "cluster-a",
+        "modelCacheRef": {"name": "qwen"},
+        "engines": _REPLICA_ENGINES,
+    }
+    if mount:
+        spec["mount"] = mount
+    return _want(
+        fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=fnv1.Resource(
+                    resource=resource.dict_to_struct({"status": {"replicas": {"total": 1, "ready": 0}}}),
+                ),
+                resources={
+                    "replica-cluster-a-0": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "modelplane.ai/v1alpha1",
+                                "kind": "ModelReplica",
+                                "metadata": {
+                                    "name": "my-model-5ab63",
+                                    "namespace": "ml-team",
+                                    "labels": {
+                                        "modelplane.ai/deployment": "my-model",
+                                        "modelplane.ai/cluster": "cluster-a",
+                                        "modelplane.ai/replica-index": "0",
+                                    },
+                                },
+                                "spec": spec,
+                            }
+                        ),
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="ModelCacheResolved",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="ModelCacheResolved",
+                ),
+                fnv1.Condition(
+                    type="ReplicasScheduled",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Scheduling",
+                ),
+                fnv1.Condition(
+                    type="ReplicasReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="ModelStarting",
+                    message="0 of 1 ready",
+                ),
+            ],
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_NORMAL,
+                    message="Scheduled 1 replicas across 1 clusters: cluster-a",
+                ),
+            ],
+            context=structpb.Struct(),
+        ),
+        cache_name="qwen",
+    )
 
 
 def _replica_status(replica: dict, *, ready: bool) -> dict:
@@ -817,68 +903,51 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             Case(
+                # The cache reports how to mount itself per cluster; the
+                # deployment is where the cluster is known, so it is where the
+                # join happens. The replica reads one answer instead of
+                # rebuilding it per source.
+                name="the cache's mount for this cluster is copied onto the replica",
+                req=_req(
+                    xr_cached,
+                    clusters=[_CLUSTER_A],
+                    cache=_cache(
+                        "qwen",
+                        mounts={
+                            "cluster-a": mcv1alpha1.Mount(
+                                volumes=[
+                                    {
+                                        "name": "model-cache",
+                                        "image": {"reference": "acme/qwen:v1", "pullPolicy": "Always"},
+                                    }
+                                ],
+                                volumeMounts=[{"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True}],
+                                env=[],
+                            ),
+                            # A cluster this deployment does not place on. Its
+                            # fragment must not leak onto the replica.
+                            "cluster-z": mcv1alpha1.Mount(
+                                volumes=[{"name": "model-cache", "image": {"reference": "wrong:v0"}}],
+                                volumeMounts=[],
+                                env=[],
+                            ),
+                        },
+                    ),
+                ),
+                want=_want_cached(
+                    {
+                        "volumes": [
+                            {"name": "model-cache", "image": {"reference": "acme/qwen:v1", "pullPolicy": "Always"}}
+                        ],
+                        "volumeMounts": [{"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True}],
+                        "env": [],
+                    }
+                ),
+            ),
+            Case(
                 name="modelCacheRef is propagated onto the composed replica",
                 req=_req(xr_cached, clusters=[_CLUSTER_A], cache=_cache("qwen")),
-                want=_want(
-                    fnv1.RunFunctionResponse(
-                        meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
-                        desired=fnv1.State(
-                            composite=fnv1.Resource(
-                                resource=resource.dict_to_struct({"status": {"replicas": {"total": 1, "ready": 0}}}),
-                            ),
-                            resources={
-                                "replica-cluster-a-0": fnv1.Resource(
-                                    resource=resource.dict_to_struct(
-                                        {
-                                            "apiVersion": "modelplane.ai/v1alpha1",
-                                            "kind": "ModelReplica",
-                                            "metadata": {
-                                                "name": "my-model-5ab63",
-                                                "namespace": "ml-team",
-                                                "labels": {
-                                                    "modelplane.ai/deployment": "my-model",
-                                                    "modelplane.ai/cluster": "cluster-a",
-                                                    "modelplane.ai/replica-index": "0",
-                                                },
-                                            },
-                                            "spec": {
-                                                "clusterName": "cluster-a",
-                                                "modelCacheRef": {"name": "qwen"},
-                                                "engines": _REPLICA_ENGINES,
-                                            },
-                                        }
-                                    ),
-                                ),
-                            },
-                        ),
-                        conditions=[
-                            fnv1.Condition(
-                                type="ModelCacheResolved",
-                                status=fnv1.STATUS_CONDITION_TRUE,
-                                reason="ModelCacheResolved",
-                            ),
-                            fnv1.Condition(
-                                type="ReplicasScheduled",
-                                status=fnv1.STATUS_CONDITION_FALSE,
-                                reason="Scheduling",
-                            ),
-                            fnv1.Condition(
-                                type="ReplicasReady",
-                                status=fnv1.STATUS_CONDITION_FALSE,
-                                reason="ModelStarting",
-                                message="0 of 1 ready",
-                            ),
-                        ],
-                        results=[
-                            fnv1.Result(
-                                severity=fnv1.SEVERITY_NORMAL,
-                                message="Scheduled 1 replicas across 1 clusters: cluster-a",
-                            ),
-                        ],
-                        context=structpb.Struct(),
-                    ),
-                    cache_name="qwen",
-                ),
+                want=_want_cached(),
             ),
             Case(
                 # The cache stages only to a subset of clusters; the scheduler

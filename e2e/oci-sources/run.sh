@@ -124,6 +124,7 @@ kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS" >/dev/null
 if ((DO_PUBLISH)); then
 	WORK="$(mktemp -d)"
 	MODEL_DIR="${MODEL_DIR:-}"
+	PLATFORM="${PLATFORM:-linux/amd64}"
 	if [[ -z "$MODEL_DIR" ]]; then
 		# Mount semantics don't depend on the bytes, and a few MB keeps the loop
 		# fast. Point MODEL_DIR at a real model to measure pull times instead.
@@ -137,9 +138,29 @@ if ((DO_PUBLISH)); then
 
 	# image: weights inside a container image. Standard layer types, a config
 	# with rootfs.diff_ids. The population the image-volume path serves.
+	# --platform matters: a workstation builds arm64 by default and a cloud node
+	# is amd64, and the kubelet reports the mismatch as "no match for platform in
+	# manifest", which reads like a missing image rather than a wrong one.
 	printf 'FROM scratch\nCOPY . /models\n' >"$WORK/Dockerfile"
-	docker build -q -t "$REPO:image" -f "$WORK/Dockerfile" "$MODEL_DIR" >/dev/null
+	docker build -q --platform "$PLATFORM" -t "$REPO:image" -f "$WORK/Dockerfile" "$MODEL_DIR" >/dev/null
 	docker push -q "$REPO:image" >/dev/null
+
+	# modctl builds from a Modelfile rather than a bare directory: it is what
+	# names the config and weight files, and their roles are what become the
+	# per-layer media types and the org.cncf.model.filepath annotations this
+	# whole design keys on.
+	cat >"$MODEL_DIR/Modelfile" <<'MODELFILE'
+NAME fake-model
+ARCH transformer
+FAMILY fake
+FORMAT safetensors
+PARAMSIZE 1b
+PRECISION fp16
+QUANTIZATION fp16
+CONFIG config.json
+CONFIG tokenizer.json
+MODEL model.safetensors
+MODELFILE
 
 	# modelpack: modctl's default, raw layers and custom media types, a config
 	# carrying modelfs.diffIds rather than rootfs.diff_ids.

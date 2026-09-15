@@ -66,6 +66,33 @@ spec:
                   name:
                     type: string
                     minLength: 1
+              mount:
+                type: object
+                description: >-
+                  What to add to the engine pods to read the referenced
+                  ModelCache on THIS replica's cluster, copied by
+                  compose-model-deployment from the cache's
+                  status.clusters[] entry. Set only when modelCacheRef
+                  is; absent means derive nothing and mount nothing.
+                properties:
+                  volumes:
+                    type: array
+                    maxItems: 4
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  volumeMounts:
+                    type: array
+                    maxItems: 4
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  env:
+                    type: array
+                    maxItems: 8
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
               serving:
                 type: object
                 description: >-

@@ -28,6 +28,24 @@ runs today, which is the point: get the substrate right before building on it.
 
 Claims 1, 2 and 3 are the ones that would change the design. They run first.
 
+## What it found, 15 September 2026
+
+Run against GKE 1.36.4-gke.1082000, containerd 2.2.6.
+
+| # | Result |
+| --- | --- |
+| 1 | **Confirmed.** Zero files, pod exit 0, no event anywhere. |
+| 2 | **Not reproducible on Artifact Registry**, which rejects the hand-built manifest with `manifest invalid`. The loud failure needs a registry that stores the shape. |
+| 3 | Pushes fine; the pull fails. |
+| 4 | 4 files, at the image's own path, so `subPath` is what makes `/mnt/models` the model directory. |
+| 5 | 3 files, flat. Needs a static credential: the driver does not use the node's identity. |
+| 6 | **Refuted.** `--raw=false` mounts empty too, because `IsLayerType` matches the media type's name and tar bytes don't change it. |
+| 7 | Works, after three fixes the chart doesn't ship: the GKE critical-pods quota, an image reference with no registry, and a `k8s.gcr.io` registrar. |
+
+Claim 6 was a prediction the design made and this removed. Claim 1 holding is
+what keeps the two-mechanism split, and what made `spec.oci.artifact` a required
+field rather than something Modelplane infers.
+
 | Tested | Not tested |
 | --- | --- |
 | What a runtime does with each artifact shape | The `ModelCache` API (unbuilt) |

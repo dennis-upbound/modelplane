@@ -23,9 +23,45 @@ alongside it. Setting `source: HuggingFace` selects `spec.huggingFace`, which
 carries the `repo` to fetch, an optional `revision` (branch, tag, or commit), and
 `sizeGiB`, how much storage the weights get on each cluster. Size it to the
 model, since a value below the model's size leaves no room to stage the weights.
-`HuggingFace` is the only source today.
 
-The engine's args name the model the same way with or without a cache. A
+Setting `source: OCI` selects `spec.oci` and reads the weights from a registry
+you already publish to. Nothing is staged onto a volume: each node pulls the
+artifact itself, so there is no `sizeGiB` and no ReadWriteMany StorageClass to
+provide.
+
+```yaml
+spec:
+  source: OCI
+  oci:
+    artifact: Image                                 # or ModelArtifact
+    ref: us-docker.pkg.dev/acme/models/qwen:v1
+    subPath: models                                 # where the weights sit inside it
+```
+
+`artifact` says what the reference names, which decides how it mounts, and it has
+no default on purpose. `Image` is an ordinary container image with the weights
+inside, mounted by Kubernetes as an image volume. `ModelArtifact` is built to the
+[model spec](https://modelpack.org/) and read by a CSI driver, because a
+container runtime will not mount one. Naming the wrong kind is worth avoiding
+rather than guessing at: mounting a model artifact as an image volume *succeeds*
+and gives an empty directory, with no error on the pod or on the cache, so the
+first sign is an engine that cannot find weights.
+
+`subPath` is the directory inside the artifact that holds the weights, and it is
+what makes `/mnt/models` the model directory rather than the artifact's root. An
+image built with the weights under `/models` wants `subPath: models`; one that
+puts them at the root wants no `subPath` at all.
+
+A private reference is pulled with the cluster's own credential rather than one
+on the cache, so it is configured on the `InferenceCluster` by the platform team.
+
+Prefer a digest to a tag. A tag is re-resolved on every pod start, so moving it
+changes what the next pod serves; a digest never moves, and Modelplane pulls it
+`IfNotPresent` rather than re-checking the registry each time.
+
+The engine's args name the model the same way with or without a cache, and the
+mount is `/mnt/models` whichever source fills it. An `OCI` or `Existing` source
+holds a model directory, so the engine names the path: `--model=/mnt/models`. A
 `HuggingFace` source stages into HuggingFace's own cache layout on the mount, and
 Modelplane sets `HF_HUB_CACHE` on every consuming pod, so `--model=<repo>`
 resolves to the staged weights instead of pulling them. Adding or removing a
@@ -132,8 +168,10 @@ args:
 ## Storage prerequisites
 
 <!-- vale Google.Acronyms = NO -->
-The cache PVC needs a `ReadWriteMany` (RWX) StorageClass on the workload cluster.
-What the platform admin must set up depends on the cloud:
+A `HuggingFace` cache needs a `ReadWriteMany` (RWX) StorageClass on the workload
+cluster, because it stages the weights onto a volume every pod shares. An `OCI`
+cache needs none: each node pulls the artifact itself, onto the node's own disk.
+What the platform admin must set up for the RWX case depends on the cloud:
 <!-- vale Google.Acronyms = YES -->
 
 - **GKE** and **EKS:** auto-provisioned. Nothing for the admin to do.

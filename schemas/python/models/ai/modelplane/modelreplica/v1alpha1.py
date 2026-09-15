@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, Field, conint, constr
 
@@ -154,6 +154,12 @@ class ModelCacheRef(BaseModel):
     name: constr(min_length=1)
 
 
+class Mount(BaseModel):
+    env: list[dict[str, Any]] | None = Field(None, max_length=8)
+    volumeMounts: list[dict[str, Any]] | None = Field(None, max_length=4)
+    volumes: list[dict[str, Any]] | None = Field(None, max_length=4)
+
+
 class Serving(BaseModel):
     mode: Literal['Unified', 'PrefillDecode'] | None = 'Unified'
 
@@ -174,6 +180,10 @@ class SpecModel(BaseModel):
     modelCacheRef: ModelCacheRef | None = None
     """
     Optional reference to a ModelCache mounted into the engine pods. Inherited verbatim from the parent ModelDeployment.
+    """
+    mount: Mount | None = None
+    """
+    What to add to the engine pods to read the referenced ModelCache on THIS replica's cluster, copied by compose-model-deployment from the cache's status.clusters[] entry. Set only when modelCacheRef is; absent means derive nothing and mount nothing.
     """
     serving: Serving | None = None
     """

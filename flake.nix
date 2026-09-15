@@ -177,6 +177,10 @@
           };
           stop = apps.stop { inherit crossplane; };
           e2e = apps.e2e { inherit crossplane functionsPkg; };
+          schemas = apps.schemas {
+            inherit crossplane;
+            dockerCredentialUp = pkgs.upbound;
+          };
           e2e-oci = apps.e2e-oci { };
           stacks = apps.stacks { inherit (pkgs) aicr; };
           docs-serve = apps.docsServe { };

@@ -82,26 +82,42 @@ def cache_pvc_name(namespace: str, cache_name: str) -> str:
     return resource.child_name("modelcache", namespace, cache_name)
 
 
+def _fragment(items: list | None) -> list[dict]:
+    """Plain dicts from a published fragment's list.
+
+    The XRD leaves these entries unstructured (they are corev1 Volume,
+    VolumeMount and EnvVar, whose shapes belong to Kubernetes rather than to
+    Modelplane), so the generated model types them loosely. Normalising here
+    keeps every backend composing dicts, the way it composes every other part of
+    a pod spec.
+    """
+    out = []
+    for item in items or []:
+        dump = getattr(item, "model_dump", None)
+        out.append(dump(exclude_unset=True) if dump else dict(item))
+    return out
+
+
 def cache_mounts(replica: v1alpha1.ModelReplica) -> tuple[list[dict], list[dict]]:
     """Return (volumes, volumeMounts) for the replica's cache, or ([], []).
 
-    The cache is a per-cache PVC qualified by the replica's namespace
-    (modelCacheRef carries only a name, and the ModelCache is in the replica's
-    own namespace). The PVC is shared across every engine and member of the
-    replica.
+    The cache publishes what to mount per cluster and compose-model-deployment
+    copies this cluster's entry onto spec.mount, so the answer arrives rather
+    than being reconstructed. That is what keeps a second source from needing a
+    branch here: a HuggingFace cache is a shared read-write claim, an OCI
+    artifact is a read-only image volume, and both are the same field.
+
+    A cache whose cluster hasn't published a fragment yet mounts nothing. That
+    is the right failure: an engine with no weights fails visibly at startup,
+    where a guessed claim name would mount an empty or wrong volume.
     """
     ref = replica.spec.modelCacheRef
     if not ref:
         return [], []
-    pvc = cache_pvc_name(_namespace(replica.metadata), ref.name)
-    # Mounted read-write (NOT readOnly): engines write into the model dir
-    # (tokenizer/compile/lock artifacts), and a readOnly mount hard-fails them.
-    # The PVC is ReadWriteMany, so every pod in the gang shares one read-write
-    # mount; the hydration Job populates it once and serving pods read N times.
-    return (
-        [{"name": _CACHE_VOLUME, "persistentVolumeClaim": {"claimName": pvc}}],
-        [{"name": _CACHE_VOLUME, "mountPath": CACHE_MOUNT_PATH}],
-    )
+    mount = replica.spec.mount
+    if not mount:
+        return [], []
+    return _fragment(mount.volumes), _fragment(mount.volumeMounts)
 
 
 def cache_env(replica: v1alpha1.ModelReplica) -> list[dict]:
@@ -121,12 +137,14 @@ def cache_env(replica: v1alpha1.ModelReplica) -> list[dict]:
     HF_HUB_CACHE is a cache root, not a pin, so an engine fetching some other
     repo by id writes it to the shared PVC rather than its own filesystem.
 
-    HuggingFace-specific because the source is. A second ModelCache source would
-    stage its own layout and gate this on the source.
+    Published by the cache rather than assumed here, so a source that needs no
+    env (an OCI artifact holds a model directory, which an engine names by path)
+    contributes none.
     """
-    if not replica.spec.modelCacheRef:
+    mount = replica.spec.mount
+    if not replica.spec.modelCacheRef or not mount:
         return []
-    return [{"name": "HF_HUB_CACHE", "value": CACHE_MOUNT_PATH}]
+    return _fragment(mount.env)
 
 
 # Well-known name of the per-cluster shared ModelExpress server that

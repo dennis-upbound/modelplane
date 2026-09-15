@@ -158,6 +158,12 @@ class Composer:
         self.clusters = []
         self.all_replicas = []
 
+        # Per-cluster mount fragments published by the referenced ModelCache,
+        # keyed by cluster name. Populated by resolve_cache_footprint and copied
+        # onto each replica so the replica joins on what the cache decided
+        # rather than deriving a claim name of its own.
+        self.cache_mounts: dict[str, mcv1alpha1.Mount] = {}
+
         # Whether the scheduler may place NEW replicas this reconcile. Cleared
         # when a referenced ModelCache can't be resolved: we keep retained
         # replicas but don't spread new ones onto clusters that might be outside
@@ -325,6 +331,11 @@ class Composer:
         )
 
         cache = mcv1alpha1.ModelCache.model_validate(cache_dict)
+        # A cluster reports a fragment only once it can serve the artifact, so
+        # an entry here means "mount it this way", and its absence means the
+        # replica mounts nothing yet rather than mounting something wrong.
+        if cache.status and cache.status.clusters:
+            self.cache_mounts = {c.name: c.mount for c in cache.status.clusters if c.mount}
         if cache.spec.clusterSelector and cache.spec.clusterSelector.matchLabels:
             return resolution, dict(cache.spec.clusterSelector.matchLabels)
 
@@ -395,6 +406,12 @@ class Composer:
                 replica.spec.modelCacheRef = mrv1alpha1.ModelCacheRef(
                     name=self.xr.spec.template.spec.modelCacheRef.name
                 )
+                # Copy this cluster's fragment down. The deployment is where the
+                # cluster is known, so it is where the join belongs; the replica
+                # reads one answer rather than reconstructing it per source.
+                mount = self.cache_mounts.get(cluster_info.name)
+                if mount:
+                    replica.spec.mount = mrv1alpha1.Mount.model_validate(mount.model_dump(exclude_unset=True))
             # The replica backend reads serving to pick unified vs. disaggregated
             # routing; copy it down unchanged.
             if self.xr.spec.template.spec.serving:

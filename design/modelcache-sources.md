@@ -30,9 +30,10 @@ leaves the others alone and a consumer joins on the entry instead of guessing.
 What does the mounting depends on what the artifact is, and the contract is what
 keeps that off the consumer. A container image with weights in it is mounted by
 Kubernetes as an image volume. A model artifact, which containerd won't mount,
-is read by a CSI driver Modelplane installs. Modelplane resolves the reference
-once to tell them apart, which also turns a reference it can't serve into a
-`Failed` cluster rather than an empty directory at pod start.
+is read by a CSI driver. The `ModelCache` says which it has, in
+`spec.oci.artifact`, because getting it wrong is invisible: measured on GKE, a
+model artifact mounted as an image volume produces an empty directory, an exit-0
+pod and no event anywhere.
 
 ## Background
 
@@ -109,15 +110,18 @@ spec:
         bring-your-own.
     huggingFace: {}                    # unchanged
     oci:
-      required: [ref]
+      required: [ref, artifact]
       properties:
+        artifact:
+          type: string
+          enum: [Image, ModelArtifact]
+          description: >-
+            What the reference names, which decides how it mounts. No
+            default: see "Why this is a field" below.
         ref:
           type: string
           description: >-
-            A tag or digest. A container image with the weights in it, and a
-            model artifact built to the model spec, are both served; Modelplane
-            resolves the reference to tell which it is and mounts it the way
-            that kind is mounted. A private registry's credential is configured
+            A tag or digest. A private registry's credential is configured
             on the InferenceCluster by the platform team rather than per
             namespace. Prefer a digest: a tag is re-resolved on every pod start,
             so moving it changes what the next pod serves.
@@ -173,9 +177,9 @@ argument a user writes follows the artifact.
 | `Existing` | a claim you populated | Kubernetes, as a PVC | the claim bound in `default` |
 
 The two `OCI` rows are the modelcar pattern and what `modctl`, [KitOps][kitops]
-and `docker model package --format=cncf` produce. Modelplane resolves the
-reference and works out which it has, so a `ModelCache` names a tag and stops
-there.
+and `docker model package --format=cncf` produce. A `ModelCache` names which it
+has, and the next section says why that is a field rather than something
+Modelplane works out.
 
 Not supported, and what to do instead:
 
@@ -369,6 +373,13 @@ credential already in place.
 
 ### Why a typed artifact mounts empty
 
+Measured, not inferred. On GKE 1.36.4 with containerd 2.2.6, a `modctl` artifact
+mounted as an image volume gave `/mnt/models` with zero files, a pod that exited
+0, and no event on the pod or the volume. The same artifact built with
+`--raw=false`, whose layers are tar rather than raw, mounted empty too. A
+container image with the same weights mounted 4 files, and the CSI driver read
+the artifact and mounted 3.
+
 containerd decides two things separately, and a model artifact fails both
 quietly. `images.IsLayerType` matches a descriptor's media type by name against
 the `application/vnd.oci.image.layer.` prefix, five Docker schema 2 types and
@@ -395,6 +406,33 @@ Row two is where every model packaging format lands, and what both
 [containerd#11381][containerd11381] and [kitops#1144][kitops1144] report. Row
 three is [containerd#11907][containerd11907]. Row four follows from the same
 arithmetic rather than from a report.
+
+Tar layers do not rescue row two, which is worth saying because it looks like
+they should. `IsLayerType` matches the media type's *name*, so a
+`vnd.cnai.model.weight.v1.tar` layer is not a layer however unpackable its bytes
+are, and the `--raw=false` artifact above mounted just as empty as the raw one.
+
+### Why this is a field
+
+`spec.oci.artifact` is required, with no default, and that follows from the
+measurement. Modelplane could resolve the reference and work out which kind it
+has, and an earlier shape of this design did exactly that. Two things argue
+against starting there.
+
+It would be the first network call in a composition path, which is a larger
+change to how functions behave than this document should smuggle in.
+
+More importantly, a wrong answer is invisible. Every other way of getting this
+wrong announces itself: a bad reference fails the pull, a missing credential
+fails the pull, an unreadable artifact fails the driver. Mounting a model
+artifact as an image volume succeeds, and the first sign is an engine that
+cannot find weights on a mount that is present and empty. Where a wrong guess is
+silent, asking is better than inferring, and a user who publishes the artifact
+knows which kind they built.
+
+Resolution stays available as a convenience later: it would fill the field in
+rather than replace it, and a filled field can be checked against the manifest
+instead of trusted.
 
 [containerd#11381][containerd11381] would close this and isn't close itself: its
 maintainers asked for a KEP and OCI spec coordination first, because an artifact
@@ -487,14 +525,29 @@ is filling before debugging the wrong one.
 **The driver costs a component, and a private model artifact costs a
 credential.** A DaemonSet in the pull path is a thing to install, upgrade and be
 broken by, and the project is young and quiet, with no commit since March 2026.
-Modelplane installs it with the rest of the
-serving stack, on every cluster, since a composition function sees one cluster
-rather than the fleet's caches and can't tell in advance which artifacts land
-there. Its registry auth is static Helm configuration keyed by host, where the
-kubelet authenticates to ECR, Artifact Registry and ACR from the node's own
-identity, so IRSA and Workload Identity serve the image path alone. A fleet that
-publishes images pays neither cost: the DaemonSet idles and its `registryAuths`
-stays empty.
+Modelplane installs it with the rest of the serving stack, on every cluster,
+since a composition function sees one cluster rather than the fleet's caches and
+can't tell in advance which artifacts land there. A fleet that publishes images
+pays neither cost: the DaemonSet idles and its `registryAuths` stays empty.
+
+The credential is the sharper half, and it is worse than "no per-volume secret".
+Measured on GKE: the kubelet pulled a private Artifact Registry image using the
+node's Workload Identity, and the driver, given the same reference, made an
+**unauthenticated** request and took a 403. It does not fall back to the node's
+identity at all. So every private model artifact needs a long-lived credential in
+the chart's `registryAuths`, where the image path needs none.
+
+**Installing the driver on GKE takes three fixes that its chart doesn't ship.**
+Also measured, in this order: its DaemonSet runs at `system-node-critical`, which
+GKE admits only in a namespace carrying a `gcp-critical-pods` ResourceQuota, so
+pod creation is rejected with `FailedCreate` and nothing explains why. This is
+the same failure Modelplane already hit with the NVIDIA DRA driver
+([#202][202]), and `compose-serving-stack` already composes an
+`allow-critical-pods` quota for it: installing the driver means composing the
+same quota into its namespace. Then the chart's default image is
+`model-csi-driver:latest`, with no registry, which resolves to Docker Hub and
+does not exist. Then its registrar sidecar is pinned to `k8s.gcr.io`, frozen
+since 2023. After all three it runs, and mounts.
 
 **On CRI-O the driver is redundant, and this doesn't exploit that.** CRI-O has
 mounted model artifacts natively since v1.33 ([cri-o#9131][crio9131]), so an
@@ -558,6 +611,7 @@ way, and it splits where a user says where their model lives.
 [coldstart]: https://arxiv.org/abs/2607.16596
 [crio9131]: https://github.com/cri-o/cri-o/pull/9131
 [csi]: https://github.com/modelpack/model-csi-driver
+[202]: https://github.com/modelplaneai/modelplane/issues/202
 [kitops1144]: https://github.com/kitops-ml/kitops/issues/1144
 [186]: https://github.com/modelplaneai/modelplane/issues/186
 [362]: https://github.com/modelplaneai/modelplane/pull/362

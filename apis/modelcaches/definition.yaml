@@ -32,10 +32,12 @@ spec:
             x-kubernetes-validations:
             - rule: "self.source != 'HuggingFace' || has(self.huggingFace)"
               message: spec.huggingFace is required when spec.source is HuggingFace.
+            - rule: "self.source != 'OCI' || has(self.oci)"
+              message: spec.oci is required when spec.source is OCI.
             properties:
               source:
                 type: string
-                enum: [HuggingFace]
+                enum: [HuggingFace, OCI]
                 description: >-
                   Which kind of artifact source to stage from. The
                   matching source object (e.g. spec.huggingFace) must
@@ -78,6 +80,46 @@ spec:
                       each matched cluster.
                     minimum: 1
                     maximum: 100000
+              oci:
+                type: object
+                description: >-
+                  OCI source. Required when source is OCI. Nothing is
+                  staged onto a volume: the artifact is pulled per node
+                  by the cluster itself, so there is no sizeGiB and no
+                  hydration Job.
+                required: [ref, artifact]
+                properties:
+                  artifact:
+                    type: string
+                    enum: [Image, ModelArtifact]
+                    description: >-
+                      What kind of artifact the reference names, which
+                      decides how it mounts. Image is a container image
+                      with the weights inside, mounted by Kubernetes as
+                      an image volume. ModelArtifact is built to the
+                      model spec and read by a CSI driver, because a
+                      container runtime will not mount one. Required,
+                      and deliberately not defaulted: mounting a model
+                      artifact as an image volume succeeds and yields
+                      an EMPTY directory, with no error on the pod or
+                      the cache, so a wrong guess here is invisible
+                      until an engine fails to find weights. Measured
+                      on GKE 1.36 with containerd 2.2.6.
+                  ref:
+                    type: string
+                    description: >-
+                      A tag or digest. Prefer a digest: a tag is
+                      re-resolved on every pod start, so moving it
+                      changes what the next pod serves. A private
+                      registry's credential is configured on the
+                      InferenceCluster by the platform team rather than
+                      per namespace.
+                    minLength: 1
+                  subPath:
+                    type: string
+                    description: >-
+                      Directory within the artifact holding the
+                      weights. Defaults to its root.
               clusterSelector:
                 type: object
                 description: >-
@@ -117,3 +159,37 @@ spec:
                       enum: [Pending, Hydrating, Ready, Failed]
                     message:
                       type: string
+                    mount:
+                      type: object
+                      description: >-
+                        What a consumer adds to a pod to read this
+                        cache on this cluster. A consumer joins on this
+                        rather than deriving a claim name, so a second
+                        source needs no change in the consumer.
+                      properties:
+                        volumes:
+                          type: array
+                          description: >-
+                            Volumes to add. One of
+                            persistentVolumeClaim or image, per source.
+                          maxItems: 4
+                          items:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                        volumeMounts:
+                          type: array
+                          description: Mounts to add to each engine container.
+                          maxItems: 4
+                          items:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                        env:
+                          type: array
+                          description: >-
+                            Environment the mount needs to be
+                            resolvable, e.g. HF_HUB_CACHE for a
+                            HuggingFace cache root.
+                          maxItems: 8
+                          items:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true

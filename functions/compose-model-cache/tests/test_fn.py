@@ -45,6 +45,56 @@ def setUpModule() -> None:
     logging.configure(level=logging.Level.DISABLED)
 
 
+# An OCI ModelCache. Nothing stages onto a volume, so the cache composes no PVC,
+# no hydration Job and no token Secret; its whole output is the fragment that
+# says how to mount the artifact.
+def _oci_xr(artifact: str, ref: str, **oci_extra: Any) -> v1alpha1.ModelCache:
+    return v1alpha1.ModelCache(
+        metadata=metav1.ObjectMeta(name="qwen", namespace="ml-team"),
+        spec=v1alpha1.Spec(
+            source="OCI",
+            oci=v1alpha1.Oci(artifact=artifact, ref=ref, **oci_extra),
+        ),
+    )
+
+
+# An OCI cache is Ready the moment a cluster matches: nothing stages, so there
+# is no Pending or Hydrating to pass through and no resource to compose. Every
+# OCI case therefore wants the same response but for the fragment.
+def _want_oci(volume: dict, volume_mount: dict) -> fnv1.RunFunctionResponse:
+    return fnv1.RunFunctionResponse(
+        meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+        desired=fnv1.State(
+            composite=fnv1.Resource(
+                resource=resource.dict_to_struct(
+                    {
+                        "status": {
+                            "summary": {"ready": "1/1"},
+                            "clusters": [
+                                {
+                                    "name": "cluster-a",
+                                    "phase": "Ready",
+                                    "mount": {"volumes": [volume], "volumeMounts": [volume_mount], "env": []},
+                                },
+                            ],
+                        },
+                    },
+                ),
+                ready=fnv1.READY_TRUE,
+            ),
+        ),
+        conditions=[
+            fnv1.Condition(type="ClustersMatched", status=fnv1.STATUS_CONDITION_TRUE, reason="Matched"),
+            fnv1.Condition(type="ArtifactReady", status=fnv1.STATUS_CONDITION_TRUE, reason="Staged"),
+        ],
+        results=[
+            fnv1.Result(severity=fnv1.SEVERITY_NORMAL, message="Artifact staged on all 1 clusters"),
+        ],
+        context=structpb.Struct(),
+        requirements=fnv1.Requirements(resources={"clusters": _CLUSTERS_SELECTOR}),
+    )
+
+
 # The XR used across cases: a HuggingFace ModelCache in the ml-team namespace.
 # Both the PVC and Job derive their names from
 # resource.child_name("modelcache", "ml-team", "qwen", ...).
@@ -445,7 +495,24 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                         {
                             "status": {
                                 "summary": {"ready": "1/1"},
-                                "clusters": [{"name": "cluster-a", "phase": "Ready"}],
+                                "clusters": [
+                                    {
+                                        "name": "cluster-a",
+                                        "phase": "Ready",
+                                        "mount": {
+                                            "volumes": [
+                                                {
+                                                    "name": "model-cache",
+                                                    "persistentVolumeClaim": {
+                                                        "claimName": "modelcache-ml-team-qwen-17db2"
+                                                    },
+                                                }
+                                            ],
+                                            "volumeMounts": [{"name": "model-cache", "mountPath": "/mnt/models"}],
+                                            "env": [{"name": "HF_HUB_CACHE", "value": "/mnt/models"}],
+                                        },
+                                    }
+                                ],
                             },
                         },
                     ),
@@ -552,7 +619,22 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                             "status": {
                                 "summary": {"ready": "1/2"},
                                 "clusters": [
-                                    {"name": "a", "phase": "Ready"},
+                                    {
+                                        "name": "a",
+                                        "phase": "Ready",
+                                        "mount": {
+                                            "volumes": [
+                                                {
+                                                    "name": "model-cache",
+                                                    "persistentVolumeClaim": {
+                                                        "claimName": "modelcache-ml-team-qwen-17db2"
+                                                    },
+                                                }
+                                            ],
+                                            "volumeMounts": [{"name": "model-cache", "mountPath": "/mnt/models"}],
+                                            "env": [{"name": "HF_HUB_CACHE", "value": "/mnt/models"}],
+                                        },
+                                    },
                                     {"name": "b", "phase": "Hydrating"},
                                 ],
                             },
@@ -604,7 +686,24 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                         {
                             "status": {
                                 "summary": {"ready": "1/1"},
-                                "clusters": [{"name": "cluster-a", "phase": "Ready"}],
+                                "clusters": [
+                                    {
+                                        "name": "cluster-a",
+                                        "phase": "Ready",
+                                        "mount": {
+                                            "volumes": [
+                                                {
+                                                    "name": "model-cache",
+                                                    "persistentVolumeClaim": {
+                                                        "claimName": "modelcache-ml-team-qwen-17db2"
+                                                    },
+                                                }
+                                            ],
+                                            "volumeMounts": [{"name": "model-cache", "mountPath": "/mnt/models"}],
+                                            "env": [{"name": "HF_HUB_CACHE", "value": "/mnt/models"}],
+                                        },
+                                    }
+                                ],
                             },
                         },
                     ),
@@ -699,7 +798,24 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                         {
                             "status": {
                                 "summary": {"ready": "1/1"},
-                                "clusters": [{"name": "cluster-a", "phase": "Ready"}],
+                                "clusters": [
+                                    {
+                                        "name": "cluster-a",
+                                        "phase": "Ready",
+                                        "mount": {
+                                            "volumes": [
+                                                {
+                                                    "name": "model-cache",
+                                                    "persistentVolumeClaim": {
+                                                        "claimName": "modelcache-ml-team-qwen-17db2"
+                                                    },
+                                                }
+                                            ],
+                                            "volumeMounts": [{"name": "model-cache", "mountPath": "/mnt/models"}],
+                                            "env": [{"name": "HF_HUB_CACHE", "value": "/mnt/models"}],
+                                        },
+                                    }
+                                ],
                             },
                         },
                     ),
@@ -751,7 +867,24 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                         {
                             "status": {
                                 "summary": {"ready": "1/1"},
-                                "clusters": [{"name": "cluster-a", "phase": "Ready"}],
+                                "clusters": [
+                                    {
+                                        "name": "cluster-a",
+                                        "phase": "Ready",
+                                        "mount": {
+                                            "volumes": [
+                                                {
+                                                    "name": "model-cache",
+                                                    "persistentVolumeClaim": {
+                                                        "claimName": "modelcache-ml-team-qwen-17db2"
+                                                    },
+                                                }
+                                            ],
+                                            "volumeMounts": [{"name": "model-cache", "mountPath": "/mnt/models"}],
+                                            "env": [{"name": "HF_HUB_CACHE", "value": "/mnt/models"}],
+                                        },
+                                    }
+                                ],
                             },
                         },
                     ),
@@ -881,6 +1014,56 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 name="authSecret missing with no clusters reports NoClusters not AuthSecretMissing",
                 req=_req(xr13, [], auth=_auth_secret(data={"OTHER": _TOKEN_B64})),
                 want=want13,
+            ),
+            Case(
+                name="OCI Image composes no staging resources and publishes an image-volume mount",
+                req=_req(
+                    _oci_xr("Image", "us-docker.pkg.dev/acme/models/qwen:v1"),
+                    [_cluster_dict("cluster-a", "cluster-a-pc")],
+                ),
+                want=_want_oci(
+                    {
+                        "name": "model-cache",
+                        "image": {"reference": "us-docker.pkg.dev/acme/models/qwen:v1", "pullPolicy": "Always"},
+                    },
+                    {"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True},
+                ),
+            ),
+            Case(
+                name="OCI Image by digest pulls IfNotPresent, since a digest cannot move",
+                req=_req(
+                    _oci_xr("Image", "us-docker.pkg.dev/acme/models/qwen@sha256:" + "a" * 64),
+                    [_cluster_dict("cluster-a", "cluster-a-pc")],
+                ),
+                want=_want_oci(
+                    {
+                        "name": "model-cache",
+                        "image": {
+                            "reference": "us-docker.pkg.dev/acme/models/qwen@sha256:" + "a" * 64,
+                            "pullPolicy": "IfNotPresent",
+                        },
+                    },
+                    {"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True},
+                ),
+            ),
+            Case(
+                name="OCI ModelArtifact mounts through the CSI driver, because a runtime mounts one empty",
+                req=_req(
+                    _oci_xr("ModelArtifact", "us-docker.pkg.dev/acme/models/qwen:v1", subPath="weights"),
+                    [_cluster_dict("cluster-a", "cluster-a-pc")],
+                ),
+                want=_want_oci(
+                    {
+                        "name": "model-cache",
+                        "csi": {
+                            "driver": "model.csi.modelpack.org",
+                            "volumeAttributes": {
+                                "model.csi.modelpack.org/reference": "us-docker.pkg.dev/acme/models/qwen:v1"
+                            },
+                        },
+                    },
+                    {"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True, "subPath": "weights"},
+                ),
             ),
         ]
 
