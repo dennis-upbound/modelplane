@@ -177,6 +177,7 @@
           };
           stop = apps.stop { inherit crossplane; };
           e2e = apps.e2e { inherit crossplane functionsPkg; };
+          e2e-oci = apps.e2e-oci { };
           stacks = apps.stacks { inherit (pkgs) aicr; };
           docs-serve = apps.docsServe { };
           docs-generate = apps.docsGenerate { };

@@ -18,7 +18,7 @@ spec:
     - { name: model, mountPath: /mnt/models, readOnly: true }
   volumes:
   - name: model
-    image: { reference: "$REGISTRY/fake-model:image", pullPolicy: Always }
+    image: { reference: "$REGISTRY:image", pullPolicy: Always }
 ---
 # Claim 1. Custom layer media types, config carries modelfs.diffIds rather than
 # rootfs.diff_ids. The design says containerd compares zero layers against zero
@@ -38,7 +38,7 @@ spec:
     - { name: model, mountPath: /mnt/models, readOnly: true }
   volumes:
   - name: model
-    image: { reference: "$REGISTRY/fake-model:modelpack", pullPolicy: Always }
+    image: { reference: "$REGISTRY:modelpack", pullPolicy: Always }
 ---
 # Claim 6. Tar layers, so the media types are still custom but the blobs are
 # what containerd expects to unpack. Predicted to mount; never run.
@@ -57,7 +57,7 @@ spec:
     - { name: model, mountPath: /mnt/models, readOnly: true }
   volumes:
   - name: model
-    image: { reference: "$REGISTRY/fake-model:modelraw", pullPolicy: Always }
+    image: { reference: "$REGISTRY:modelraw", pullPolicy: Always }
 ---
 # Claim 3. No image config at all. Expected to fail the pull rather than mount,
 # and the event is what a ModelCache would surface as its Failed reason.
@@ -76,7 +76,7 @@ spec:
     - { name: model, mountPath: /mnt/models, readOnly: true }
   volumes:
   - name: model
-    image: { reference: "$REGISTRY/fake-model:oras", pullPolicy: Always }
+    image: { reference: "$REGISTRY:oras", pullPolicy: Always }
 ---
 # Claim 2. Standard layer media types, config with no rootfs.diff_ids. Built by
 # publish-mismatched.sh. Expected to fail the pull with "mismatched image rootfs
@@ -96,4 +96,4 @@ spec:
     - { name: model, mountPath: /mnt/models, readOnly: true }
   volumes:
   - name: model
-    image: { reference: "$REGISTRY/fake-model:mismatched", pullPolicy: Always }
+    image: { reference: "$REGISTRY:mismatched", pullPolicy: Always }

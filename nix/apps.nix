@@ -338,6 +338,37 @@
       );
     };
 
+  # Validate the OCI source design's substrate claims against a real registry
+  # and a real cluster (see e2e/oci-sources). Unlike .#e2e this needs cloud
+  # credentials — a 1.36+ cluster and a registry to push five artifact shapes
+  # to — so it is run by hand rather than in CI, and it records each run rather
+  # than gating a merge. No function images: every case is a pod with a volume,
+  # so nothing of Modelplane's is under test here.
+  e2e-oci = _: {
+    type = "app";
+    meta.description = "Validate the OCI source design against a real registry";
+    program = pkgs.lib.getExe (
+      pkgs.writeShellApplication {
+        name = "modelplane-e2e-oci";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.gnused
+          pkgs.kubectl
+          pkgs.docker-client
+          pkgs.crane
+          pkgs.oras
+          pkgs.unstable.modctl
+          pkgs.python312
+          pkgs.bash
+        ];
+        inheritPath = false;
+        text = ''
+          exec bash e2e/oci-sources/run.sh "$@"
+        '';
+      }
+    );
+  };
+
   # Regenerate the AICR-derived serving stack component lists (see
   # design/serving-stack-generation.md). Writes
   # functions/compose-serving-stack/function/stacks/clouds/generated/aicr/,

@@ -23,4 +23,4 @@ spec:
     csi:
       driver: model.csi.modelpack.org
       volumeAttributes:
-        model.csi.modelpack.org/reference: "$REGISTRY/fake-model:modelpack"
+        model.csi.modelpack.org/reference: "$REGISTRY:modelpack"

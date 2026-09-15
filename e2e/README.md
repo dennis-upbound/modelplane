@@ -1,5 +1,10 @@
 # Local end-to-end test (no cloud, no GPU)
 
+> There is a second suite alongside this one:
+> [`oci-sources/`](oci-sources/README.md) validates the OCI source design
+> against a real registry and a real 1.36+ cluster. It needs cloud credentials,
+> so it runs by hand and records each run rather than gating a merge.
+
 Exercise the full Modelplane path — publish capacity, register a cluster, deploy
 a model, route a request through the control-plane gateway — on local `kind`
 clusters, with **no cloud provider and no GPU**.
