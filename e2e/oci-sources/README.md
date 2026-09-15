@@ -42,6 +42,35 @@ Run against GKE 1.36.4-gke.1082000, containerd 2.2.6.
 | 6 | **Refuted.** `--raw=false` mounts empty too, because `IsLayerType` matches the media type's name and tar bytes don't change it. |
 | 7 | Works, after three fixes the chart doesn't ship: the GKE critical-pods quota, an image reference with no registry, and a `k8s.gcr.io` registrar. |
 
+### An engine served from the mount
+
+Beyond the claim table, a real engine on real hardware: vLLM 0.11.0 on an NVIDIA
+L4, `--model=/mnt/models` against an `Image` artifact holding Qwen3-0.6B.
+
+```
+Loading safetensors checkpoint shards: 100% Completed | 1/1
+Loading weights took 0.45 seconds
+Model loading took 1.1201 GiB and 0.779908 seconds
+```
+
+and it answered `/v1/chat/completions` with 15 prompt tokens in and 24
+completion tokens out. The engine names the mount path and nothing else: no
+`HF_HUB_CACHE`, no token, no `--served-model-name`.
+
+Four things had to be fixed first, and none of them was the mount. Each is worth
+knowing because each looks like a GPU problem:
+
+| Symptom | Cause |
+| --- | --- |
+| `no match for platform in manifest` | image built arm64 on a workstation, node is amd64 |
+| `Failed to infer device type` | pod scheduled before the GPU driver daemonset finished |
+| `Failed to infer device type`, persisting | `NVIDIA_VISIBLE_DEVICES=all` overrides the device plugin's own injection |
+| `libcuda.so.1: cannot open shared object file` | GKE mounts drivers at `/usr/local/nvidia/lib64`; an image that isn't CUDA-based needs it on `LD_LIBRARY_PATH` |
+
+The last one matters beyond this test: any engine image Modelplane composes on
+GKE needs that path, and its absence reads as "no GPU" rather than "missing
+library".
+
 Claim 6 was a prediction the design made and this removed. Claim 1 holding is
 what keeps the two-mechanism split, and what made `spec.oci.artifact` a required
 field rather than something Modelplane infers.

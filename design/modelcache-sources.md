@@ -375,7 +375,10 @@ credential already in place.
 
 Measured, not inferred. On GKE 1.36.4 with containerd 2.2.6, a `modctl` artifact
 mounted as an image volume gave `/mnt/models` with zero files, a pod that exited
-0, and no event on the pod or the volume. The same artifact built with
+0, and no event on the pod or the volume. The same cluster served a real model
+the other way: vLLM 0.11.0 on an L4, `--model=/mnt/models` against an `Image`
+artifact holding Qwen3-0.6B, weights loaded in 0.45s and a completion answered
+over the OpenAI API. The same artifact built with
 `--raw=false`, whose layers are tar rather than raw, mounted empty too. A
 container image with the same weights mounted 4 files, and the CSI driver read
 the artifact and mounted 3.
