@@ -49,7 +49,7 @@ spec:
                 description: >-
                   HuggingFace source. Required when source is
                   HuggingFace.
-                required: [repo, sizeGiB]
+                required: [repo]
                 properties:
                   repo:
                     type: string
@@ -75,11 +75,35 @@ spec:
                       key:
                         type: string
                         default: HF_TOKEN
+                  include:
+                    type: array
+                    description: >-
+                      Glob patterns naming the files to stage. Defaults
+                      to every file in the repository. A repository
+                      often publishes the same weights more than once,
+                      in the format each framework wants; narrowing is
+                      declared here because a cache doesn't know which
+                      engine reads it.
+                    items:
+                      type: string
+                      minLength: 1
+                  exclude:
+                    type: array
+                    description: >-
+                      Glob patterns naming files to skip, applied after
+                      include.
+                    items:
+                      type: string
+                      minLength: 1
                   sizeGiB:
                     type: integer
                     description: >-
                       Capacity to allocate for the staged artifact on
-                      each matched cluster.
+                      each matched cluster. Defaults to the size of the
+                      files selected from the repository, plus
+                      headroom. Set it to stage without resolving the
+                      repository, which is what a control plane with no
+                      egress to HuggingFace needs.
                     minimum: 1
                     maximum: 100000
               oci:
@@ -235,3 +259,35 @@ spec:
                           items:
                             type: object
                             x-kubernetes-preserve-unknown-fields: true
+              artifact:
+                type: object
+                description: >-
+                  What the source resolved to. Latched once obtained,
+                  so a resolution outage doesn't regress a staged
+                  cache.
+                properties:
+                  selection:
+                    type: string
+                    description: >-
+                      Fingerprint of the inputs that decide which files
+                      are staged (repo, revision, include, exclude). A
+                      change re-resolves; anything else reuses this.
+                  revision:
+                    type: string
+                    description: Commit SHA the repo resolved to.
+                  fileCount:
+                    type: integer
+                    description: Number of files selected for staging.
+                  files:
+                    type: array
+                    description: >-
+                      The files the hydration Job stages, set only when
+                      include or exclude narrowed the repository.
+                    items:
+                      type: string
+                  sizeGiB:
+                    type: integer
+                    description: >-
+                      Capacity allocated per cluster, derived from the
+                      selected files unless spec.huggingFace.sizeGiB
+                      overrode it.

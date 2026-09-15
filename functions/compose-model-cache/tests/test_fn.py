@@ -117,6 +117,48 @@ def _cache_xr(**hf_extra: Any) -> v1alpha1.ModelCache:
     )
 
 
+def _artifact(**hf_extra: Any) -> dict:
+    """status.artifact for a cache that set sizeGiB.
+
+    An explicit size is authoritative, so the repo is never listed and the
+    artifact carries only the size and the fingerprint that decides when a
+    latched resolution is stale.
+    """
+    return {"selection": _fingerprint(_cache_xr(**hf_extra)), "sizeGiB": 20}
+
+
+def _fingerprint(xr: v1alpha1.ModelCache) -> str:
+    """The selection fingerprint the function publishes for this XR."""
+    hf = xr.spec.huggingFace
+    assert hf is not None
+    return fn._selection_fingerprint(hf)
+
+
+def _cache_xr_unsized(**hf_extra: Any) -> v1alpha1.ModelCache:
+    """The same cache with no sizeGiB, so the size comes from the repo."""
+    return v1alpha1.ModelCache(
+        metadata=metav1.ObjectMeta(name="qwen", namespace="ml-team"),
+        spec=v1alpha1.Spec(
+            source="HuggingFace",
+            huggingFace=v1alpha1.HuggingFace(repo="Qwen/Qwen3-0.6B", **hf_extra),
+        ),
+    )
+
+
+def _pvc_request(rsp: fnv1.RunFunctionResponse) -> str:
+    """The composed PVC's requested storage."""
+    got = json_format.MessageToDict(rsp)
+    pvc = got["desired"]["resources"]["pvc-cluster-a"]["resource"]["spec"]["forProvider"]["manifest"]
+    return pvc["spec"]["resources"]["requests"]["storage"]
+
+
+def _job_command(rsp: fnv1.RunFunctionResponse) -> str:
+    """The hydration Job's shell command."""
+    got = json_format.MessageToDict(rsp)
+    job = got["desired"]["resources"]["hydrate-cluster-a"]["resource"]["spec"]["forProvider"]["manifest"]
+    return job["spec"]["template"]["spec"]["containers"][0]["command"][2]
+
+
 def _cluster_dict(name: str, pc: str, *, source: str = "GKE", storage_class: str | None = None) -> dict:
     """An InferenceCluster as Crossplane returns it in a required-resource set.
 
@@ -428,6 +470,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "0/1"},
                                 "clusters": [{"name": "cluster-a", "phase": "Pending"}],
                             },
@@ -471,6 +514,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(revision="main", authSecret=v1alpha1.AuthSecret(name="hf-token")),
                                 "summary": {"ready": "0/1"},
                                 "clusters": [{"name": "cluster-a", "phase": "Pending"}],
                             },
@@ -512,6 +556,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "0/1"},
                                 "clusters": [{"name": "eks-a", "phase": "Pending"}],
                             },
@@ -559,6 +604,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "1/1"},
                                 "clusters": [
                                     {
@@ -610,6 +656,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "0/1"},
                                 "clusters": [{"name": "cluster-a", "phase": "Hydrating"}],
                             },
@@ -646,6 +693,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "0/1"},
                                 "clusters": [{"name": "cluster-a", "phase": "Failed"}],
                             },
@@ -682,6 +730,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "1/2"},
                                 "clusters": [
                                     {
@@ -750,6 +799,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "1/1"},
                                 "clusters": [
                                     {
@@ -815,6 +865,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "0/1"},
                                 "clusters": [{"name": "cluster-a", "phase": "Pending"}],
                             },
@@ -862,6 +913,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "1/1"},
                                 "clusters": [
                                     {
@@ -931,6 +983,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     resource=resource.dict_to_struct(
                         {
                             "status": {
+                                "artifact": _artifact(),
                                 "summary": {"ready": "1/1"},
                                 "clusters": [
                                     {
@@ -979,7 +1032,9 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 composite=fnv1.Resource(
-                    resource=resource.dict_to_struct({"status": {"summary": {"ready": "0/0"}, "clusters": []}}),
+                    resource=resource.dict_to_struct(
+                        {"status": {"artifact": _artifact(), "summary": {"ready": "0/0"}, "clusters": []}}
+                    ),
                 ),
             ),
             conditions=[
@@ -1174,3 +1229,149 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                     json_format.MessageToDict(got),
                     "-want, +got",
                 )
+
+    def test_select(self) -> None:
+        """include and exclude pick the files the PVC is sized for."""
+        # A repo that publishes its weights twice: sharded safetensors beside a
+        # consolidated checkpoint, which is the shape that makes a cache cost
+        # twice the model.
+        siblings = [
+            {"rfilename": "config.json", "size": 1_000},
+            {"rfilename": "model-00001-of-00002.safetensors", "size": 6_000},
+            {"rfilename": "model-00002-of-00002.safetensors", "size": 4_000},
+            {"rfilename": "original/consolidated.00.pth", "size": 10_000},
+        ]
+
+        @dataclasses.dataclass
+        class SelectCase:
+            name: str
+            include: list[str] | None
+            exclude: list[str] | None
+            want_files: list[str]
+            want_bytes: int
+
+        for case in [
+            SelectCase(
+                "no patterns stages the whole repo",
+                None,
+                None,
+                [
+                    "config.json",
+                    "model-00001-of-00002.safetensors",
+                    "model-00002-of-00002.safetensors",
+                    "original/consolidated.00.pth",
+                ],
+                21_000,
+            ),
+            SelectCase(
+                "exclude drops the redundant copy",
+                None,
+                ["original/*"],
+                ["config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+                11_000,
+            ),
+            SelectCase(
+                "include narrows to a prefix",
+                ["model-*"],
+                None,
+                ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+                10_000,
+            ),
+            SelectCase(
+                "exclude applies after include",
+                ["*"],
+                ["original/*", "*.json"],
+                ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+                10_000,
+            ),
+            SelectCase("a pattern matching nothing selects nothing", ["*.gguf"], None, [], 0),
+        ]:
+            with self.subTest(case.name):
+                self.assertEqual(
+                    (case.want_files, case.want_bytes),
+                    fn._select(siblings, case.include, case.exclude),
+                )
+
+    async def test_resolve(self) -> None:
+        """The cache sizes itself from the repo when spec doesn't."""
+        # 10 GiB of files rounds up to 12 GiB: engines write tokenizer, compile
+        # and lock artifacts into the mount beside the weights.
+        resolved = ("abc123", ["config.json", "model.safetensors"], 12)
+
+        def _stub(*_: Any, **__: Any) -> tuple[str, list[str], int]:
+            return resolved
+
+        def _boom(*_: Any, **__: Any) -> tuple[str, list[str], int]:
+            raise RuntimeError("HuggingFace returned 401 for Qwen/Qwen3-0.6B")
+
+        original = fn._resolve_repo
+        try:
+            # --- No sizeGiB: the repo is listed and the PVC follows it. ---
+            fn._resolve_repo = _stub  # ty: ignore[invalid-assignment]
+            xr = _cache_xr_unsized()
+            got = await self.runner.RunFunction(_req(xr, [_cluster_dict("cluster-a", "cluster-a-pc")]), None)
+            status = json_format.MessageToDict(got)["desired"]["composite"]["resource"]["status"]
+            self.assertEqual(
+                {"selection": _fingerprint(xr), "revision": "abc123", "fileCount": 2, "sizeGiB": 12},
+                status["artifact"],
+                "artifact records what the repo resolved to",
+            )
+            self.assertEqual("12Gi", _pvc_request(got), "the PVC is sized from the resolved files")
+
+            # --- Narrowed: the Job names its files, so it stages exactly what
+            # the PVC was sized for. ---
+            xr = _cache_xr_unsized(exclude=["original/*"])
+            got = await self.runner.RunFunction(_req(xr, [_cluster_dict("cluster-a", "cluster-a-pc")]), None)
+            status = json_format.MessageToDict(got)["desired"]["composite"]["resource"]["status"]
+            self.assertEqual(["config.json", "model.safetensors"], status["artifact"]["files"])
+            self.assertIn("hf download Qwen/Qwen3-0.6B config.json model.safetensors;", _job_command(got))
+
+            # --- Latched: a resolution the selection still matches is reused,
+            # so a reconcile doesn't re-list the repo. The stub would raise. ---
+            fn._resolve_repo = _boom  # ty: ignore[invalid-assignment]
+            xr = _cache_xr_unsized()
+            xr.status = v1alpha1.Status(
+                artifact=v1alpha1.Artifact(selection=_fingerprint(xr), sizeGiB=12, revision="abc123"),
+            )
+            got = await self.runner.RunFunction(_req(xr, [_cluster_dict("cluster-a", "cluster-a-pc")]), None)
+            self.assertEqual("12Gi", _pvc_request(got), "the latched size is reused")
+
+            # --- An explicit size with patterns: no listing happens, so the
+            # Job filters with the patterns itself. The stub would raise. ---
+            xr = _cache_xr(include=["*.safetensors"], exclude=["original/*"])
+            got = await self.runner.RunFunction(_req(xr, [_cluster_dict("cluster-a", "cluster-a-pc")]), None)
+            self.assertEqual("20Gi", _pvc_request(got), "an explicit size beats a resolution")
+            self.assertIn(
+                "hf download Qwen/Qwen3-0.6B --include '*.safetensors' --exclude 'original/*';",
+                _job_command(got),
+                "patterns still apply when the size is explicit",
+            )
+
+            # --- An explicit size added to an already-resolved cache wins over
+            # the latched one, rather than the latch shadowing it. ---
+            xr = _cache_xr()
+            xr.status = v1alpha1.Status(
+                artifact=v1alpha1.Artifact(selection=_fingerprint(xr), sizeGiB=99),
+            )
+            got = await self.runner.RunFunction(_req(xr, [_cluster_dict("cluster-a", "cluster-a-pc")]), None)
+            self.assertEqual("20Gi", _pvc_request(got))
+
+            # --- Unresolved with nothing latched: say why, compose nothing.
+            # There is no size to make a PVC with. ---
+            got = await self.runner.RunFunction(
+                _req(_cache_xr_unsized(), [_cluster_dict("cluster-a", "cluster-a-pc")]), None
+            )
+            self.assertEqual(
+                [
+                    {
+                        "type": "ArtifactReady",
+                        "status": "STATUS_CONDITION_FALSE",
+                        "reason": "Unresolved",
+                        "message": "HuggingFace returned 401 for Qwen/Qwen3-0.6B",
+                    }
+                ],
+                json_format.MessageToDict(got)["conditions"],
+            )
+            self.assertEqual({}, json_format.MessageToDict(got).get("desired", {}).get("resources", {}))
+        finally:
+            fn._resolve_repo = original

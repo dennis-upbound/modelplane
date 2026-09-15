@@ -20,9 +20,43 @@ single-node cold-start optimization.
 
 The required `source` enum names the kind, with the matching source object set
 alongside it. Setting `source: HuggingFace` selects `spec.huggingFace`, which
-carries the `repo` to fetch, an optional `revision` (branch, tag, or commit), and
-`sizeGiB`, how much storage the weights get on each cluster. Size it to the
-model, since a value below the model's size leaves no room to stage the weights.
+carries the `repo` to fetch and an optional `revision` (branch, tag, or commit).
+
+A `HuggingFace` cache sizes itself. Modelplane reads the repository's file
+listing and asks for what the staged files need, reporting the result in
+`status.artifact`:
+
+```yaml {nocopy=true}
+status:
+  artifact:
+    revision: a09a35457c702d95a4c1cd0fa9b91a01d6d5b2e0
+    fileCount: 11
+    sizeGiB: 18
+```
+
+Set `sizeGiB` yourself to override it. An explicit size also skips the listing
+entirely, which is what a control plane with no egress to HuggingFace needs.
+
+`include` and `exclude` narrow what a `HuggingFace` cache stages, and the derived
+size follows them. A repository is a distribution, not a model, and a popular one
+publishes the same weights more than once:
+`meta-llama/Llama-3.1-405B-Instruct` publishes 2.4 TB, of which an engine reads
+812 GB.
+
+```yaml
+spec:
+  source: HuggingFace
+  huggingFace:
+    repo: meta-llama/Llama-3.1-405B-Instruct
+    exclude: ["original/*"]
+```
+
+They're glob patterns matched against each file's path, the same ones
+`hf download` accepts, and `exclude` applies after `include`. Narrowing is yours
+to declare because a cache doesn't know which engine reads it: `openai/gpt-oss-20b`
+ships a `metal/model.bin` beside its safetensors shards, and dropping it would
+break a llama.cpp engine while leaving vLLM fine. Check `status.artifact.files`
+to see what a pattern selected before the weights move.
 
 Setting `source: OCI` selects `spec.oci` and reads the weights from a registry
 you already publish to. Nothing is staged onto a volume: each node pulls the
@@ -180,7 +214,6 @@ spec:
     authSecret:
       name: hf-token         # a Secret in this ModelCache's namespace
       key: HF_TOKEN          # defaults to HF_TOKEN
-    sizeGiB: 1100
 ```
 
 Without a cache, the engine fetches the model itself at startup, so the

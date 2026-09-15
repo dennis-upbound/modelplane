@@ -21,6 +21,14 @@ at /mnt/models, so weights are downloaded once per cluster and read N
 times by every pod in an LWS gang.
 """
 
+import base64
+import fnmatch
+import hashlib
+import json
+import math
+import shlex
+import urllib.error
+import urllib.request
 from typing import Literal
 
 import grpc
@@ -58,6 +66,7 @@ CONDITION_REASON_STAGED = "Staged"
 CONDITION_REASON_PARTIAL = "Partial"
 CONDITION_REASON_FAILED = "Failed"
 CONDITION_REASON_AUTH_SECRET_MISSING = "AuthSecretMissing"
+CONDITION_REASON_UNRESOLVED = "Unresolved"
 
 # CEL readiness queries: each wrapped Object derives its own Ready condition
 # from the remote resource's status (DeriveFromCelQuery), so mark_ready_resources
@@ -149,7 +158,79 @@ _HYDRATED_MARKER = f"{HYDRATION_MOUNT}/.modelplane-hydrated"
 _SKIP_IF_HYDRATED = f"if [ -f {_HYDRATED_MARKER} ]; then echo 'already hydrated, skipping'; exit 0; fi; "
 
 
-def _hf_hydration(hf: v1alpha1.HuggingFace, auth_secret_name: str | None) -> tuple[list[dict], str]:
+# Resolution reads the repository's file listing so the PVC can be sized before
+# anything writes to it. The hydration Job downloads the same files on the
+# workload cluster; this call runs on the control plane because that is where the
+# PVC is composed, and a volume needs a size before it exists. It is latched in
+# status against a fingerprint of the selection, so it runs when the repo,
+# revision or patterns change rather than on every reconcile.
+_HF_API = "https://huggingface.co/api/models"
+_RESOLVE_TIMEOUT_SECONDS = 15
+
+# Headroom over the selected bytes. Engines write tokenizer, compile and lock
+# artifacts into the mount beside the weights, so a volume that fits the download
+# exactly leaves them nowhere to go.
+_SIZE_HEADROOM = 1.15
+_GIB = 1024**3
+
+
+def _selection_fingerprint(hf: v1alpha1.HuggingFace) -> str:
+    """Identify what a resolution was for, so a stale latch is detected.
+
+    Covers every input that changes which files are staged. Changing any of them
+    re-resolves; changing anything else (sizeGiB, authSecret, clusterSelector)
+    does not.
+    """
+    raw = json.dumps(
+        [hf.repo, hf.revision, list(hf.include or []), list(hf.exclude or [])],
+        sort_keys=True,
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+def _select(siblings: list[dict], include: list[str] | None, exclude: list[str] | None) -> tuple[list[str], int]:
+    """(selected paths, total bytes) after applying include then exclude.
+
+    fnmatch is what huggingface_hub matches its allow/ignore patterns with, so a
+    pattern selects the same files here as it would in the Job.
+    """
+    files = {s["rfilename"]: s.get("size") or 0 for s in siblings}
+    if include:
+        files = {p: n for p, n in files.items() if any(fnmatch.fnmatch(p, g) for g in include)}
+    if exclude:
+        files = {p: n for p, n in files.items() if not any(fnmatch.fnmatch(p, g) for g in exclude)}
+    return sorted(files), sum(files.values())
+
+
+def _resolve_repo(hf: v1alpha1.HuggingFace, token: str | None) -> tuple[str, list[str], int]:
+    """Resolve a repo to (revision, selected files, sizeGiB).
+
+    Raises RuntimeError with a message fit for a status condition: the user sees
+    a gated repo, a typo'd name, or a pattern that matched nothing, rather than a
+    traceback.
+    """
+    path = f"{hf.repo}/revision/{hf.revision}" if hf.revision else hf.repo
+    req = urllib.request.Request(  # scheme is the _HF_API literal
+        f"{_HF_API}/{path}?blobs=true",
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_RESOLVE_TIMEOUT_SECONDS) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HuggingFace returned {e.code} for {hf.repo}") from e
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        raise RuntimeError(f"cannot read {hf.repo} from HuggingFace: {e}") from e
+
+    files, total = _select(body.get("siblings", []), hf.include, hf.exclude)
+    if not files:
+        raise RuntimeError(f"no file in {hf.repo} matches the include/exclude patterns")
+    return body.get("sha") or "", files, max(1, math.ceil(total * _SIZE_HEADROOM / _GIB))
+
+
+def _hf_hydration(
+    hf: v1alpha1.HuggingFace, auth_secret_name: str | None, files: list[str] | None = None
+) -> tuple[list[dict], str]:
     """Return (env, shell command) for a HuggingFace source.
 
     Uses `hf download` (huggingface_hub 1.x; `huggingface-cli` is removed).
@@ -180,11 +261,22 @@ def _hf_hydration(hf: v1alpha1.HuggingFace, auth_secret_name: str | None) -> tup
             }
         )
     revision_arg = f" --revision {hf.revision}" if hf.revision else ""
+    # A resolved narrowing names its files, so the Job stages exactly the set the
+    # PVC was sized for rather than re-deriving it from patterns the two could
+    # then disagree about. Without a resolution - an explicit sizeGiB skips it -
+    # the patterns go to the Job instead, which matches them with the same
+    # fnmatch semantics _select() does. An un-narrowed cache stages the whole
+    # repo, where naming every file would only bloat the manifest.
+    if files:
+        select_arg = "".join(f" {shlex.quote(f)}" for f in files)
+    else:
+        select_arg = "".join(f" --include {shlex.quote(g)}" for g in hf.include or [])
+        select_arg += "".join(f" --exclude {shlex.quote(g)}" for g in hf.exclude or [])
     command = (
         "set -e; "
         f"{_SKIP_IF_HYDRATED}"
         "pip install --quiet huggingface_hub; "
-        f"hf download {hf.repo}{revision_arg}; "
+        f"hf download {hf.repo}{revision_arg}{select_arg}; "
         f"touch {_HYDRATED_MARKER}"
     )
     return env, command
@@ -216,6 +308,13 @@ class Composer:
         # control-plane Secret. Populated by resolve_inputs() once the XR
         # references an authSecret and that key is present; empty otherwise.
         self.auth_data: dict[str, str] = {}
+        # What spec.huggingFace resolved to: the commit SHA, the files to stage
+        # (empty when the whole repo is staged) and the PVC size in GiB. Set by
+        # resolve_artifact(), which latches the previous value when the selection
+        # hasn't changed.
+        self.artifact: v1alpha1.Artifact | None = None
+        self.size_gib = 0
+        self.files: list[str] = []
 
     @property
     def _is_oci(self) -> bool:
@@ -313,6 +412,8 @@ class Composer:
 
     def compose(self) -> None:
         if not self.resolve_inputs():
+            return
+        if not self.resolve_artifact():
             return
         matched = self.match_clusters()
         # Derive each cluster's phase first (from observed state), then compose:
@@ -489,9 +590,94 @@ class Composer:
                 self._wrap_remote(pc, self._job_manifest(), _JOB_READY_CEL, management_policies=_JOB_MANAGEMENT),
             )
 
-    def _pvc_manifest(self, cluster: icv1alpha1.InferenceCluster) -> dict:
+    def resolve_artifact(self) -> bool:
+        """Resolve the repo to a size and file list, or explain why not.
+
+        An explicit spec.huggingFace.sizeGiB is authoritative and skips the
+        listing entirely, which is what a control plane with no egress to
+        HuggingFace needs. Otherwise the previous resolution is reused while the
+        selection is unchanged, so the call happens on a spec change rather than
+        every reconcile.
+
+        Returns False when there is no size to compose a PVC with. A resolution
+        outage doesn't regress a staged cache, because the latched size survives
+        it; only a cache that never resolved has nothing to fall back to.
+
+        A source that stages nothing has no volume to size, so it resolves
+        trivially. `OCI` lands in the node's image filesystem and `Existing`
+        names a claim the user already sized.
+        """
+        if self._stages_nothing:
+            return True
+
         hf = self.xr.spec.huggingFace
-        size_gib = int(hf.sizeGiB)  # ty: ignore[unresolved-attribute]  # XRD guarantees huggingFace is set; protobuf delivers XRD ints as float
+        if hf is None:  # unreachable: the XRD requires huggingFace when the source is HuggingFace
+            return False
+        selection = _selection_fingerprint(hf)
+
+        # An explicit size is checked before the latch, so setting one on an
+        # already-resolved cache takes effect. The Job filters with the patterns
+        # themselves on this path (see _hf_hydration), so include and exclude
+        # still apply without listing the repo.
+        if hf.sizeGiB:
+            self.size_gib = int(hf.sizeGiB)
+            self.artifact = v1alpha1.Artifact(selection=selection, sizeGiB=self.size_gib)
+            return True
+
+        prior = self.xr.status.artifact if self.xr.status else None
+        if prior and prior.selection == selection and prior.sizeGiB:
+            self.artifact = prior
+            self.size_gib = int(prior.sizeGiB)
+            self.files = list(prior.files or [])
+            return True
+
+        try:
+            revision, files, size_gib = _resolve_repo(hf, self._auth_token())
+        except RuntimeError as e:
+            response.set_conditions(
+                self.rsp,
+                resource.Condition(
+                    typ=CONDITION_TYPE_ARTIFACT_READY,
+                    status="False",
+                    reason=CONDITION_REASON_UNRESOLVED,
+                    message=str(e),
+                ),
+            )
+            return False
+
+        # The Job stages an explicit list only when the selection was narrowed;
+        # see _hf_hydration. Fields are passed only when set, since a field
+        # assigned None is "set" to exclude_unset and would publish a null.
+        self.files = files if (hf.include or hf.exclude) else []
+        self.size_gib = size_gib
+        self.artifact = v1alpha1.Artifact(
+            selection=selection,
+            fileCount=len(files),
+            sizeGiB=size_gib,
+            **({"revision": revision} if revision else {}),
+            **({"files": self.files} if self.files else {}),
+        )
+        return True
+
+    def _auth_token(self) -> str | None:
+        """The HuggingFace token, decoded from the control-plane Secret.
+
+        auth_data holds the Secret's base64 values verbatim, since they're copied
+        to the workload cluster untouched; resolving needs the plaintext.
+        """
+        auth = self.xr.spec.huggingFace.authSecret  # ty: ignore[unresolved-attribute]  # XRD guarantees huggingFace is set
+        if not auth:
+            return None
+        encoded = self.auth_data.get(auth.key or "HF_TOKEN")
+        if not encoded:
+            return None
+        return base64.b64decode(encoded).decode().strip()
+
+    def _pvc_manifest(self, cluster: icv1alpha1.InferenceCluster) -> dict:
+        # resolve_artifact() sets size_gib from spec.huggingFace.sizeGiB, a
+        # latched resolution, or the repo listing, and compose() returns before
+        # composing anything when it can't.
+        size_gib = self.size_gib
         return {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
@@ -566,7 +752,7 @@ class Composer:
         return {"modelplane.ai/modelcache": _name(self.xr.metadata)}
 
     def _job_manifest(self) -> dict:
-        env, command = _hf_hydration(self.xr.spec.huggingFace, self._auth_secret_name())  # ty: ignore[invalid-argument-type]  # XRD guarantees huggingFace is set
+        env, command = _hf_hydration(self.xr.spec.huggingFace, self._auth_secret_name(), self.files)  # ty: ignore[invalid-argument-type]  # XRD guarantees huggingFace is set
         return {
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -687,13 +873,14 @@ class Composer:
             summary=v1alpha1.Summary(ready=f"{ready_count}/{len(matched)}"),
             # mount is passed only when there is one: update_status serializes
             # what the caller set, and an explicit None would publish a null
-            # field rather than omitting it.
+            # field rather than omitting it. artifact follows the same rule.
             clusters=[
                 v1alpha1.Cluster(name=n, phase=p, mount=self._mount_fragment())
                 if p == PHASE_READY
                 else v1alpha1.Cluster(name=n, phase=p)
                 for n, p in per_cluster_phase
             ],
+            **({"artifact": self.artifact} if self.artifact else {}),
         )
         resource.update_status(self.rsp.desired.composite, status)
 
