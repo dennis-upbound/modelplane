@@ -463,6 +463,31 @@ has no defined rootfs mapping the way an image does. CRI-O shipped the narrow
 version by declining to treat an artifact as a rootfs at all, which gives #11381
 a design to point at rather than an answer to the objection.
 
+### What a live run showed
+
+The contract above is not only unit-tested. On a control plane running this
+branch, against a GKE cluster registered with `source: Existing`:
+
+```
+ModelCache/qwen-oci  status.clusters[0]:
+  name: gke-oci
+  phase: Ready
+  mount:
+    volumes:      [{name: model-cache, image: {reference: .../qwen3-06b:v2, pullPolicy: Always}}]
+    volumeMounts: [{name: model-cache, mountPath: /mnt/models, readOnly: true, subPath: models}]
+    env:          []
+```
+
+and the `ModelReplica` that `compose-model-deployment` composed for that cluster
+carried the same fragment on `spec.mount`, which became the engine pod's
+`volumes[]`. The join is the contract working: the cache decided, the deployment
+copied this cluster's entry, and the replica mounted what it was handed without
+deriving anything.
+
+Before that, the cache reported `NoClusters` while none matched, and
+`InferenceCluster.spec.modelRegistryAuthSecret` reached the CSI driver's Helm
+release as a `valuesFrom` reference rather than a value.
+
 ### Fan-out
 
 A cluster's entry becomes the whole answer for that cluster: whether the

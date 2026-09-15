@@ -59,7 +59,18 @@ pointed at this GKE cluster registered with `source: Existing`:
 - that release appeared only after its ResourceQuota went Ready, which is the
   `depends_on` gating working in a live reconcile rather than in a unit test.
 
-Two things the unit tests could not have found:
+The whole chain composed, end to end, on that control plane:
+
+| Step | What it produced |
+| --- | --- |
+| `ModelCache` (`source: OCI`, `artifact: Image`, `subPath: models`) | `status.clusters[0].mount` with an `image` volume, `pullPolicy: Always` derived from the tag, `readOnly`, and an empty `env` |
+| `ModelDeployment` referencing it | a `ModelReplica` pinned to `gke-oci` carrying that fragment verbatim on `spec.mount` |
+| `ModelReplica` | an engine pod on the workload cluster whose `volumes[]` holds the OCI image volume |
+
+The engine pod does not run, for a reason unrelated to any of this: see the
+driver-root finding below.
+
+Three things the unit tests could not have found:
 
 **A `gcloud`-generated kubeconfig does not work for `source: Existing` on GKE.**
 It authenticates through the `gke-gcloud-auth-plugin` exec credential, which does
@@ -70,6 +81,26 @@ problem, and it is a gap in the bring-your-own-cluster path.
 
 **provider-helm caches the credential.** Replacing the Secret is not enough; the
 provider deployment has to be restarted before it re-reads it.
+
+**A GKE cluster registered with `source: Existing` cannot schedule a DRA GPU.**
+The serving stack is selected by `spec.cluster.source`, so a GKE cluster
+registered this way gets the `Existing` component list, which leaves the NVIDIA
+DRA driver's `nvidiaDriverRoot` at the chart default of `/`. The driver's init
+container then reports `nvidia-smi: not found` under `/`, publishes no
+`ResourceSlice`, and every GPU pod stays Pending with `cannot allocate all
+claims`. `clouds/generated/aicr/gke.py` sets `/home/kubernetes/bin/nvidia` for a
+provisioned GKE cluster; nothing carries that to a registered one.
+
+That pin may also be stale. On GKE 1.36.4 with COS,
+`/home/kubernetes/bin/nvidia` holds only `nvidia-drivers-580.173.02.tgz` and an
+installer log, and pointing the driver at either that path or `/var/lib/nvidia`
+still reported the libraries missing. A pod that requests `nvidia.com/gpu` sees
+the GPU fine, so the driver is present on the node and the DRA driver is looking
+somewhere it no longer lives. Worth confirming against a Modelplane-provisioned
+GKE cluster before filing, since this one is registered rather than provisioned.
+
+Neither touches the OCI path: the mount is composed correctly and a hand-written
+pod with the same volume served a model on this cluster.
 
 ### An engine served from the mount
 
