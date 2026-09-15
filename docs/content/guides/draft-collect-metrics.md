@@ -120,8 +120,8 @@ rolling update would otherwise leave a dead series behind for every pod it repla
 <!-- vale Google.Acronyms = YES -->
 
 Alongside the engines, Modelplane collects its routers and the stack it installs on each
-cluster, all under `modelplane_*`. Across the fleet it also reports totals for capacity,
-GPU allocation, and degraded deployments.
+cluster, all under `modelplane_*`. Across the fleet it also reports capacity, GPU
+allocation, GPU-hours, and how many replicas are ready against what you asked for.
 
 Your control plane's own health comes from wherever you run it. A self-hosted Crossplane
 serves `/metrics` on its core, provider, and function pods for your own cluster scrape to
