@@ -89,7 +89,17 @@ def _namespace(meta: metav1.ObjectMeta | None) -> str:
     return meta.namespace
 
 
-def _helm_release(chart: stacks.Chart, provider_config: str) -> helmv1beta1.Release:
+# The component whose values carry a registry credential. Named here rather than
+# in the stack data because the credential is per cluster, where the stack data
+# is the same everywhere.
+_MODEL_CSI_KEY = "model-csi-driver"
+
+
+def _helm_release(
+    chart: stacks.Chart,
+    provider_config: str,
+    values_from: list[helmv1beta1.ValuesFromItem] | None = None,
+) -> helmv1beta1.Release:
     """Build a Helm Release for a Chart entry, targeting the remote cluster."""
     release = helmv1beta1.Release(
         metadata=metav1.ObjectMeta(
@@ -108,6 +118,14 @@ def _helm_release(chart: stacks.Chart, provider_config: str) -> helmv1beta1.Rele
                     version=chart.version,
                 ),
                 namespace=chart.namespace,
+                # By reference, never by value: provider-helm reads the Secret
+                # itself, so the credential is not copied into this resource's
+                # desired state.
+                #
+                # Passed at construction and only when present. Assigning it
+                # afterwards loses the nested model's fields to exclude_unset,
+                # and passing None explicitly publishes a null.
+                **({"valuesFrom": values_from} if values_from else {}),
             ),
         ),
     )
@@ -355,7 +373,10 @@ class Composer:
             if isinstance(c, stacks.Chart):
                 if not (gate or c.key in self.req.observed.resources):
                     continue
-                resource.update(self.rsp.desired.resources[c.key], _helm_release(c, pc))
+                resource.update(
+                    self.rsp.desired.resources[c.key],
+                    _helm_release(c, pc, self._model_csi_values_from() if c.key == _MODEL_CSI_KEY else None),
+                )
                 rendered.append(c.key)
                 continue
             for key, doc in zip(stacks.components.doc_keys(c), c.manifests, strict=True):
@@ -372,6 +393,29 @@ class Composer:
                 )
                 rendered.append(key)
         return rendered
+
+    def _model_csi_values_from(self) -> list[helmv1beta1.ValuesFromItem] | None:
+        """The driver's registryAuths, as a values reference, or None.
+
+        A private model artifact needs this: the driver authenticates from its
+        own static configuration and cannot use the node's identity, unlike the
+        kubelet pulling an image volume. A cluster that serves only images, or
+        only public artifacts, sets nothing and the driver runs with no auth.
+        """
+        auth = self.xr.spec.modelRegistryAuthSecret
+        if not auth:
+            return None
+        # No namespace: a namespaced Release resolves a Secret in its own
+        # namespace, which is where the ServingStack is composed and where an
+        # InferenceCluster's other referenced Secrets already live.
+        return [
+            helmv1beta1.ValuesFromItem(
+                secretKeyRef=helmv1beta1.SecretKeyRef(
+                    name=auth.name,
+                    key=auth.key or "registryAuths.yaml",
+                ),
+            ),
+        ]
 
     def compose_component_usages(self, components: list[stacks.Component]) -> None:
         """Derive teardown-ordering Usages from the components' edges.

@@ -55,6 +55,34 @@ puts them at the root wants no `subPath` at all.
 A private reference is pulled with the cluster's own credential rather than one
 on the cache, so it is configured on the `InferenceCluster` by the platform team.
 
+How depends on the kind. An `Image` is pulled by the kubelet, which authenticates
+as the node, so IRSA on EKS or Workload Identity on GKE covers it with nothing to
+configure. A `ModelArtifact` is pulled by the CSI driver, which has no access to
+the node's identity and authenticates from its own configuration, so a private
+one needs a credential:
+
+```bash
+kubectl create secret generic ghcr-auth -n modelplane-system \
+  --from-file=registryAuths.yaml=./registryAuths.yaml
+```
+
+```yaml
+# registryAuths.yaml
+ghcr.io:
+  auth: <base64 of "username:token">
+  serverscheme: https
+```
+
+```yaml
+# on the InferenceCluster
+spec:
+  modelRegistryAuthSecret:
+    name: ghcr-auth
+```
+
+Modelplane passes it to the driver by reference, so the credential is never
+copied into a composed resource.
+
 Setting `source: Existing` selects `spec.existing` and uses a claim you populated
 yourself, on every cluster the cache matches. Modelplane stages nothing and
 provisions nothing; it reports whether the claim is bound on each cluster and
@@ -77,6 +105,12 @@ fleet carries on.
 Prefer a digest to a tag. A tag is re-resolved on every pod start, so moving it
 changes what the next pod serves; a digest never moves, and Modelplane pulls it
 `IfNotPresent` rather than re-checking the registry each time.
+
+Modelplane doesn't read your registry, so an `OCI` cache reports Ready once it has
+published how to mount the reference, not once the reference is known good. A
+typo, a missing tag or an unusable credential shows up when a pod starts, from
+the kubelet or the driver. An `Existing` cache is different: the claim is
+observed, so it stays Pending until it's Bound.
 
 The engine's args name the model the same way with or without a cache, and the
 mount is `/mnt/models` whichever source fills it. An `OCI` or `Existing` source

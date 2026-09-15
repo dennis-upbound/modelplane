@@ -415,6 +415,26 @@ they should. `IsLayerType` matches the media type's *name*, so a
 `vnd.cnai.model.weight.v1.tar` layer is not a layer however unpackable its bytes
 are, and the `--raw=false` artifact above mounted just as empty as the raw one.
 
+### What this does not catch
+
+An `OCI` cluster reports Ready once it has published how to mount the reference,
+not once the reference is known good. Modelplane never reads the registry, so a
+typo, a missing tag and an unusable credential all surface at pod start, from the
+kubelet or the driver, rather than on the `ModelCache`. That is the cost of not
+resolving, and it is worth stating next to the field that follows from the same
+decision.
+
+It is a smaller cost than it looks, because every one of those failures is loud.
+Measured on the same cluster: a wrong platform gives `no match for platform in
+manifest`, a missing tag gives `not found`, and a private reference without a
+credential gives a 403 on the pull. The engine never starts and the pod says why.
+The silent case is the one the field prevents.
+
+An `Existing` cluster is different, and does catch it: the claim is observed
+rather than assumed, so a cache whose claim is missing or unbound stays Pending
+and publishes no fragment. It can, because a claim is a Kubernetes object the
+control plane can already see; a registry is not.
+
 ### Why this is a field
 
 `spec.oci.artifact` is required, with no default, and that follows from the

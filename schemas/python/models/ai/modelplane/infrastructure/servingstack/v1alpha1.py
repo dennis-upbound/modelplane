@@ -67,6 +67,11 @@ class Gateway(BaseModel):
     """
 
 
+class ModelRegistryAuthSecret(BaseModel):
+    key: str | None = 'registryAuths.yaml'
+    name: constr(min_length=1, max_length=253)
+
+
 class Secret(BaseModel):
     key: constr(max_length=253)
     """
@@ -103,6 +108,10 @@ class Spec(BaseModel):
     gateway: Gateway | None = None
     """
     Configuration for the cluster's inference traffic gateway.
+    """
+    modelRegistryAuthSecret: ModelRegistryAuthSecret | None = None
+    """
+    Copied from InferenceCluster.spec.modelRegistryAuthSecret. Names a Secret in modelplane-system holding the model CSI driver's registryAuths mapping as YAML; the driver's Helm release reads it by reference.
     """
     secrets: list[Secret] = Field(..., max_length=8, min_length=1)
     """

@@ -310,6 +310,38 @@ spec:
                             default: default
                             minLength: 1
                             maxLength: 253
+              modelRegistryAuthSecret:
+                type: object
+                description: >-
+                  Optional Secret holding registry credentials for the
+                  CSI driver that reads model-spec artifacts
+                  (ModelCache source: OCI, artifact: ModelArtifact).
+
+                  The driver authenticates from its own static
+                  configuration and cannot use the node's identity, so
+                  IRSA and Workload Identity serve the image path alone:
+                  a private model artifact needs this, and a private
+                  container image does not.
+
+                  Names a Secret in modelplane-system whose key holds
+                  the driver's registryAuths mapping as YAML, e.g.
+
+                    ghcr.io:
+                      auth: <base64 of user:token>
+                      serverscheme: https
+
+                  Passed to the driver's Helm release by reference, so
+                  the credential is never copied into a composed
+                  resource.
+                required: [name]
+                properties:
+                  name:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
+                  key:
+                    type: string
+                    default: registryAuths.yaml
               stack:
                 type: string
                 default: Standard

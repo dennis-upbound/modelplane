@@ -261,6 +261,62 @@ _LABELS = {"modelplane.ai/modelcache": "qwen"}
 _TOKEN_B64 = "aGYtdG9rZW4tdmFsdWU="
 
 
+# The claim an Existing cache observes: the user's, by name, with Observe-only
+# management so Modelplane never creates, updates or deletes it.
+def _existing_pvc_object(pc: str, claim: str = "weights") -> dict:
+    return {
+        "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+        "kind": "Object",
+        "spec": {
+            "forProvider": {
+                "manifest": {
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {"name": claim, "namespace": "default"},
+                },
+            },
+            "managementPolicies": ["Observe"],
+            "providerConfigRef": {"kind": "ClusterProviderConfig", "name": pc},
+            "readiness": {"celQuery": 'object.status.phase == "Bound"', "policy": "DeriveFromCelQuery"},
+        },
+    }
+
+
+# An Existing cache's response. Unbound (or unobserved) it is Pending and the XR
+# is not ready; bound it publishes the fragment, like any other ready cluster.
+def _want_existing(volume: dict, volume_mount: dict, *, bound: bool) -> fnv1.RunFunctionResponse:
+    cluster: dict = {"name": "cluster-a", "phase": "Ready" if bound else "Pending"}
+    if bound:
+        cluster["mount"] = {"volumes": [volume], "volumeMounts": [volume_mount], "env": []}
+    composite = fnv1.Resource(
+        resource=resource.dict_to_struct(
+            {"status": {"summary": {"ready": f"{int(bound)}/1"}, "clusters": [cluster]}},
+        ),
+    )
+    if bound:
+        composite.ready = fnv1.READY_TRUE
+    obj = fnv1.Resource(resource=resource.dict_to_struct(_existing_pvc_object("cluster-a-pc")))
+    if bound:
+        obj.ready = fnv1.READY_TRUE
+    return fnv1.RunFunctionResponse(
+        meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+        desired=fnv1.State(composite=composite, resources={"pvc-cluster-a": obj}),
+        conditions=[
+            fnv1.Condition(type="ClustersMatched", status=fnv1.STATUS_CONDITION_TRUE, reason="Matched"),
+            fnv1.Condition(
+                type="ArtifactReady",
+                status=fnv1.STATUS_CONDITION_TRUE if bound else fnv1.STATUS_CONDITION_FALSE,
+                reason="Staged" if bound else "Hydrating",
+            ),
+        ],
+        results=(
+            [fnv1.Result(severity=fnv1.SEVERITY_NORMAL, message="Artifact staged on all 1 clusters")] if bound else []
+        ),
+        context=structpb.Struct(),
+        requirements=fnv1.Requirements(resources={"clusters": _CLUSTERS_SELECTOR}),
+    )
+
+
 def _pvc_object(pc: str, *, storage_class: str = "modelplane-rwx") -> dict:
     return {
         "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
@@ -1075,19 +1131,37 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
             Case(
-                name="Existing mounts the claim read-only and stages nothing",
+                # A claim that isn't bound (or isn't there) leaves the cluster
+                # Pending with no fragment. Reporting Ready here is what would
+                # fail an engine at pod start with nothing to read.
+                name="Existing without an observed claim stays Pending and publishes no mount",
                 req=_req(_existing_xr(), [_cluster_dict("cluster-a", "cluster-a-pc")]),
-                want=_want_oci(
+                want=_want_existing({}, {}, bound=False),
+            ),
+            Case(
+                name="Existing with a bound claim mounts it read-only",
+                req=_req(
+                    _existing_xr(),
+                    [_cluster_dict("cluster-a", "cluster-a-pc")],
+                    {"pvc-cluster-a": _observed_object({"phase": "Bound"}, ready=True)},
+                ),
+                want=_want_existing(
                     {"name": "model-cache", "persistentVolumeClaim": {"claimName": "weights", "readOnly": True}},
                     {"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True},
+                    bound=True,
                 ),
             ),
             Case(
                 name="Existing readOnly false mounts read-write, for a claim the user shares",
-                req=_req(_existing_xr(readOnly=False), [_cluster_dict("cluster-a", "cluster-a-pc")]),
-                want=_want_oci(
+                req=_req(
+                    _existing_xr(readOnly=False),
+                    [_cluster_dict("cluster-a", "cluster-a-pc")],
+                    {"pvc-cluster-a": _observed_object({"phase": "Bound"}, ready=True)},
+                ),
+                want=_want_existing(
                     {"name": "model-cache", "persistentVolumeClaim": {"claimName": "weights", "readOnly": False}},
                     {"name": "model-cache", "mountPath": "/mnt/models"},
+                    bound=True,
                 ),
             ),
         ]

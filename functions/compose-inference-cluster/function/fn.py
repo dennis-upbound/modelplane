@@ -617,6 +617,13 @@ class Composer:
             stack=self.xr.spec.stack,
             cloud=cloud,
         )
+        # The model CSI driver's registry credential, by reference. Copied down
+        # rather than resolved: the stack's Helm release reads the Secret itself,
+        # so the credential never passes through a function or lands in a
+        # composed resource.
+        auth = self.xr.spec.modelRegistryAuthSecret
+        if auth:
+            spec.modelRegistryAuthSecret = ssv1alpha1.ModelRegistryAuthSecret(name=auth.name, key=auth.key)
         resource.update(
             self.rsp.desired.resources[BACKEND_RESOURCE_KEY],
             ssv1alpha1.ServingStack(

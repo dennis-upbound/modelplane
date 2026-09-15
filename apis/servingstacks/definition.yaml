@@ -109,6 +109,22 @@ spec:
                         entries whose credential is the Secret the cloud
                         provider's ProviderConfig references.
                       maxLength: 253
+              modelRegistryAuthSecret:
+                type: object
+                description: >-
+                  Copied from InferenceCluster.spec.modelRegistryAuthSecret.
+                  Names a Secret in modelplane-system holding the model
+                  CSI driver's registryAuths mapping as YAML; the driver's
+                  Helm release reads it by reference.
+                required: [name]
+                properties:
+                  name:
+                    type: string
+                    minLength: 1
+                    maxLength: 253
+                  key:
+                    type: string
+                    default: registryAuths.yaml
               stack:
                 type: string
                 default: Standard

@@ -110,7 +110,7 @@ class Spec(BaseModel):
     """
     existing: Existing | None = None
     """
-    A claim you populated yourself, on every cluster this cache matches. Modelplane stages nothing and provisions nothing: it reports whether the claim is bound on each cluster and publishes how to mount it. For an air-gapped or regulated fleet whose weights are on disk before Modelplane sees them.
+    A claim you populated yourself, on every cluster this cache matches. Modelplane stages nothing and provisions nothing: it observes the claim, reports Ready only once it is Bound, and publishes how to mount it. For an air-gapped or regulated fleet whose weights are on disk before Modelplane sees them.
     """
     huggingFace: HuggingFace | None = None
     """
@@ -119,6 +119,7 @@ class Spec(BaseModel):
     oci: Oci | None = None
     """
     OCI source. Required when source is OCI. Nothing is staged onto a volume: the artifact is pulled per node by the cluster itself, so there is no sizeGiB and no hydration Job.
+    Modelplane does not read the registry, so it reports a cluster Ready once it has published how to mount the reference, not once the reference is known good. A typo, a missing tag or an unusable credential surfaces at pod start, from the kubelet or the driver, rather than on this resource.
     """
     source: Literal['HuggingFace', 'OCI', 'Existing']
     """

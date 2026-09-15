@@ -188,6 +188,11 @@ class Crossplane(BaseModel):
     resourceRefs: list[ResourceRef] | None = None
 
 
+class ModelRegistryAuthSecret(BaseModel):
+    key: str | None = 'registryAuths.yaml'
+    name: constr(min_length=1, max_length=253)
+
+
 class CapacityBlock(BaseModel):
     capacityReservationId: constr(
         pattern=r'^cr-[0-9a-f]+$', min_length=4, max_length=64
@@ -252,6 +257,18 @@ class Spec(BaseModel):
     crossplane: Crossplane | None = None
     """
     Configures how Crossplane will reconcile this composite resource
+    """
+    modelRegistryAuthSecret: ModelRegistryAuthSecret | None = None
+    """
+    Optional Secret holding registry credentials for the CSI driver that reads model-spec artifacts (ModelCache source: OCI, artifact: ModelArtifact).
+    The driver authenticates from its own static configuration and cannot use the node's identity, so IRSA and Workload Identity serve the image path alone: a private model artifact needs this, and a private container image does not.
+    Names a Secret in modelplane-system whose key holds the driver's registryAuths mapping as YAML, e.g.
+
+      ghcr.io:
+        auth: <base64 of user:token>
+        serverscheme: https
+
+    Passed to the driver's Helm release by reference, so the credential is never copied into a composed resource.
     """
     nodePools: list[NodePool] | None = Field(None, max_length=8, min_length=1)
     """

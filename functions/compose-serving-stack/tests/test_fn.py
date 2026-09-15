@@ -75,8 +75,15 @@ def _crds(filename: str) -> list[dict]:
     ]
 
 
-def _request(cloud: str, stack: str, observed: dict | None = None) -> fnv1.RunFunctionRequest:
-    """Build a RunFunctionRequest for a test-backend ServingStack."""
+def _request(
+    cloud: str, stack: str, observed: dict | None = None, *, registry_auth: str | None = None
+) -> fnv1.RunFunctionRequest:
+    """Build a RunFunctionRequest for a test-backend ServingStack.
+
+    registry_auth names the Secret holding the model CSI driver's registryAuths,
+    the way an InferenceCluster copies it down.
+    """
+    auth = v1alpha1.ModelRegistryAuthSecret(name=registry_auth) if registry_auth else None
     return fnv1.RunFunctionRequest(
         observed=fnv1.State(
             composite=fnv1.Resource(
@@ -92,6 +99,7 @@ def _request(cloud: str, stack: str, observed: dict | None = None) -> fnv1.RunFu
                                     type="GoogleApplicationCredentials", name="sa-secret", key="private_key"
                                 ),
                             ],
+                            modelRegistryAuthSecret=auth,
                         ),
                     ).model_dump(exclude_none=True, mode="json")
                 ),
@@ -231,6 +239,17 @@ def _provider_configs(*, ready: bool = True) -> dict[str, fnv1.Resource]:
     if ready:
         helm.ready = fnv1.READY_TRUE
     return {"provider-config-kubernetes": k8s, "provider-config-helm": helm}
+
+
+# The driver's quota, observed Ready. The driver depends_on it, so nothing
+# renders the Release until the quota reports ready.
+def _quota_ready() -> dict[str, fnv1.Resource]:
+    observed = _observed_pcs()
+    observed["model-csi-critical-pods-quota"] = fnv1.Resource(
+        resource=resource.dict_to_struct({"status": {"conditions": [{"type": "Ready", "status": "True"}]}}),
+        ready=fnv1.READY_TRUE,
+    )
+    return observed
 
 
 def _observed_pcs() -> dict[str, fnv1.Resource]:
@@ -929,6 +948,34 @@ class TestKeyInventory(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.runner = fn.FunctionRunner()
+
+    async def test_model_registry_auth_reaches_the_driver_by_reference(self) -> None:
+        """A private model artifact needs the driver's static credential.
+
+        The driver authenticates from its own configuration and cannot use the
+        node's identity, unlike the kubelet pulling an image volume. The Secret
+        reaches the release as a valuesFrom reference, so provider-helm reads it
+        and the credential never appears in the composed resource.
+        """
+        req = _request("GKE", "Standard", _quota_ready(), registry_auth="ghcr-auth")
+        rsp = await self.runner.RunFunction(req, None)
+        release = json_format.MessageToDict(rsp.desired.resources["model-csi-driver"].resource)
+        self.assertEqual(
+            release["spec"]["forProvider"]["valuesFrom"],
+            # No namespace: a namespaced Release resolves the Secret in its own
+            # namespace, which is the one the ServingStack is composed into.
+            [{"secretKeyRef": {"name": "ghcr-auth", "key": "registryAuths.yaml"}}],
+        )
+        # Nothing else carries it, and the values the function does set are its
+        # own (the chart's image, which ships without a registry).
+        self.assertNotIn("ghcr-auth", json_format.MessageToJson(rsp.desired.resources["envoy-gateway"].resource))
+
+    async def test_no_model_registry_auth_leaves_the_driver_unauthenticated(self) -> None:
+        # A cluster serving only images, or only public artifacts, sets nothing.
+        req = _request("GKE", "Standard", _quota_ready())
+        rsp = await self.runner.RunFunction(req, None)
+        release = json_format.MessageToDict(rsp.desired.resources["model-csi-driver"].resource)
+        self.assertNotIn("valuesFrom", release["spec"]["forProvider"])
 
     async def test_composed_resource_keys(self) -> None:
         for cloud, cloud_keys in _INVENTORY.items():

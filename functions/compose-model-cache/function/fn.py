@@ -100,6 +100,10 @@ _JOB_TTL_SECONDS = 180
 _ManagementPolicy = Literal["Observe", "Create", "Update", "Delete", "LateInitialize", "*"]
 _JOB_MANAGEMENT: list[_ManagementPolicy] = ["Observe", "Create", "Update", "LateInitialize"]
 
+# Observe-only: an Existing claim belongs to whoever populated it. Modelplane
+# reads whether it is bound and never creates, updates or deletes it.
+_OBSERVE_ONLY: list[_ManagementPolicy] = ["Observe"]
+
 
 SOURCE_HUGGINGFACE = "HuggingFace"
 SOURCE_OCI = "OCI"
@@ -431,12 +435,30 @@ class Composer:
         assert cluster.status and cluster.status.providerConfigRef and cluster.status.providerConfigRef.name
         pc = cluster.status.providerConfigRef.name
         name = _name(cluster.metadata)
-        if self._stages_nothing:
+        if self._is_existing:
+            # Observe the claim rather than trusting it. A cache that reported
+            # Ready for a claim that isn't there would fail at pod start, which
+            # is the silent failure this design exists to avoid.
+            existing = self.xr.spec.existing
+            assert existing
+            resource.update(
+                self.rsp.desired.resources[self._pvc_key(name)],
+                self._wrap_remote(
+                    pc,
+                    {
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolumeClaim",
+                        "metadata": {"name": str(existing.claimName), "namespace": REMOTE_NS},
+                    },
+                    _PVC_READY_CEL,
+                    management_policies=_OBSERVE_ONLY,
+                ),
+            )
+            return
+        if self._is_oci:
             # Nothing to compose. The artifact travels with the pod that mounts
             # it, so the cache's whole job here is publishing the fragment that
-            # says how. Resolution of what KIND of artifact it is belongs here
-            # too and isn't built yet: this composes the image-volume fragment,
-            # which covers a container image with the weights inside.
+            # says how.
             return
         resource.update(
             self.rsp.desired.resources[self._pvc_key(name)],
@@ -577,11 +599,21 @@ class Composer:
         }
 
     def derive_cluster_phase(self, cluster_name: str) -> _Phase:
-        if self._stages_nothing:
-            # Nothing stages, so there is no Pending or Hydrating to report. A
-            # reference that can't be served would be Failed here, once
-            # resolution lands.
+        if self._is_oci:
+            # Nothing stages and nothing is resolved, so there is no Pending or
+            # Hydrating to pass through. A reference Modelplane cannot serve is
+            # not detected here: the kubelet or the driver reports it at pod
+            # start. See "What this does not catch" in the design.
             return PHASE_READY
+        if self._is_existing:
+            # The claim is observed, so its phase is real. Not-bound stays
+            # Pending rather than Failed: a claim can be created after the cache
+            # and bind later, and Failed reads as terminal.
+            return (
+                PHASE_READY
+                if self._observed_status(self._pvc_key(cluster_name)).get("phase") == "Bound"
+                else PHASE_PENDING
+            )
         pvc_bound = self._observed_status(self._pvc_key(cluster_name)).get("phase") == "Bound"
         job_status = self._observed_status(self._job_key(cluster_name))
         if any(c.get("type") == "Failed" and c.get("status") == "True" for c in job_status.get("conditions", [])):
@@ -627,7 +659,7 @@ class Composer:
         onto the observed Object; the auth Secret uses default readiness (Ready
         once synced). Runs after compose_cluster_resources() so the desired
         entries exist."""
-        if self._stages_nothing:
+        if self._is_oci:
             return
         for name, phase in per_cluster_phase:
             # Mirror compose_cluster_resources: only mark the keys it composed.
@@ -635,7 +667,10 @@ class Composer:
             # and held back entirely while the token is missing. Marking a key we
             # didn't compose would create a phantom entry.
             keys = [self._pvc_key(name)]
-            if phase != PHASE_READY and not self._auth_missing():
+            # An Existing cache composes only the observed claim: there is no
+            # Job and no token, so appending their keys would mark entries this
+            # function never composed.
+            if not self._is_existing and phase != PHASE_READY and not self._auth_missing():
                 keys.append(self._job_key(name))
                 if self.auth_data:
                     keys.append(self._auth_key(name))
