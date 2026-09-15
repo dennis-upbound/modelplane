@@ -1,0 +1,26 @@
+# The driver path. Needs model-csi-driver installed on the cluster:
+#
+#   helm install model-csi-driver \
+#     oci://ghcr.io/modelpack/charts/model-csi-driver --namespace model-csi --create-namespace
+#
+# A private reference also needs config.registryAuths in those values, which is
+# the limitation the design states: the driver has no per-volume secret.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mount-csi-modelpack
+  labels: { app: oci-sources, shape: csi-modelpack }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ls
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '--- /mnt/models'; ls -la /mnt/models || true; echo '--- count'; find /mnt/models -type f | wc -l"]
+    volumeMounts:
+    - { name: model, mountPath: /mnt/models, readOnly: true }
+  volumes:
+  - name: model
+    csi:
+      driver: model.csi.modelpack.org
+      volumeAttributes:
+        model.csi.modelpack.org/reference: "$REGISTRY/fake-model:modelpack"

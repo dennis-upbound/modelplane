@@ -1,0 +1,99 @@
+# One pod per artifact shape, each mounting it as an image volume, each listing
+# what landed. The point is to distinguish three outcomes that look alike from
+# a distance: files present, mount empty with no error, and pod never starts.
+#
+# Substitute $REGISTRY before applying; verify.sh does it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mount-image
+  labels: { app: oci-sources, shape: image }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ls
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '--- /mnt/models'; ls -la /mnt/models || true; echo '--- count'; find /mnt/models -type f | wc -l"]
+    volumeMounts:
+    - { name: model, mountPath: /mnt/models, readOnly: true }
+  volumes:
+  - name: model
+    image: { reference: "$REGISTRY/fake-model:image", pullPolicy: Always }
+---
+# Claim 1. Custom layer media types, config carries modelfs.diffIds rather than
+# rootfs.diff_ids. The design says containerd compares zero layers against zero
+# diff IDs, agrees with itself, and mounts nothing without erroring.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mount-modelpack
+  labels: { app: oci-sources, shape: modelpack }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ls
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '--- /mnt/models'; ls -la /mnt/models || true; echo '--- count'; find /mnt/models -type f | wc -l"]
+    volumeMounts:
+    - { name: model, mountPath: /mnt/models, readOnly: true }
+  volumes:
+  - name: model
+    image: { reference: "$REGISTRY/fake-model:modelpack", pullPolicy: Always }
+---
+# Claim 6. Tar layers, so the media types are still custom but the blobs are
+# what containerd expects to unpack. Predicted to mount; never run.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mount-modelraw
+  labels: { app: oci-sources, shape: modelraw }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ls
+    image: busybox:1.36
+    command: ["sh", "-c", "echo '--- /mnt/models'; ls -la /mnt/models || true; echo '--- count'; find /mnt/models -type f | wc -l"]
+    volumeMounts:
+    - { name: model, mountPath: /mnt/models, readOnly: true }
+  volumes:
+  - name: model
+    image: { reference: "$REGISTRY/fake-model:modelraw", pullPolicy: Always }
+---
+# Claim 3. No image config at all. Expected to fail the pull rather than mount,
+# and the event is what a ModelCache would surface as its Failed reason.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mount-oras
+  labels: { app: oci-sources, shape: oras }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ls
+    image: busybox:1.36
+    command: ["sh", "-c", "ls -la /mnt/models || true"]
+    volumeMounts:
+    - { name: model, mountPath: /mnt/models, readOnly: true }
+  volumes:
+  - name: model
+    image: { reference: "$REGISTRY/fake-model:oras", pullPolicy: Always }
+---
+# Claim 2. Standard layer media types, config with no rootfs.diff_ids. Built by
+# publish-mismatched.sh. Expected to fail the pull with "mismatched image rootfs
+# and manifest layers", which is the loud half of the truth table.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mount-mismatched
+  labels: { app: oci-sources, shape: mismatched }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ls
+    image: busybox:1.36
+    command: ["sh", "-c", "ls -la /mnt/models || true"]
+    volumeMounts:
+    - { name: model, mountPath: /mnt/models, readOnly: true }
+  volumes:
+  - name: model
+    image: { reference: "$REGISTRY/fake-model:mismatched", pullPolicy: Always }
