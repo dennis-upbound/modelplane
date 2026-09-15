@@ -42,6 +42,35 @@ Run against GKE 1.36.4-gke.1082000, containerd 2.2.6.
 | 6 | **Refuted.** `--raw=false` mounts empty too, because `IsLayerType` matches the media type's name and tar bytes don't change it. |
 | 7 | Works, after three fixes the chart doesn't ship: the GKE critical-pods quota, an image reference with no registry, and a `k8s.gcr.io` registrar. |
 
+### The functions themselves, run live
+
+The claims above test the substrate with hand-written pods. Separately, the
+branch's own code was installed into a control plane (`nix run .#run`) and
+pointed at this GKE cluster registered with `source: Existing`:
+
+- the Configuration installed healthy with 14 XRDs established, `spec.oci`
+  among them;
+- a `ModelCache` with `source: OCI` reconciled and reported `NoClusters`
+  before a cluster existed, which is the right answer;
+- `InferenceCluster.spec.modelRegistryAuthSecret` reached `ServingStack` with
+  its defaulted key, and then the driver's Helm release as
+  `valuesFrom: [{secretKeyRef: {name: ar-auth, key: registryAuths.yaml}}]` —
+  by reference, so the credential is in no composed resource;
+- that release appeared only after its ResourceQuota went Ready, which is the
+  `depends_on` gating working in a live reconcile rather than in a unit test.
+
+Two things the unit tests could not have found:
+
+**A `gcloud`-generated kubeconfig does not work for `source: Existing` on GKE.**
+It authenticates through the `gke-gcloud-auth-plugin` exec credential, which does
+not exist inside the provider pods, so every Helm release fails with `kubernetes
+cluster unreachable: executable gke-gcloud-auth-plugin not found`. A kubeconfig
+carrying a static token works. This is the GKE twin of the EKS short-lived-token
+problem, and it is a gap in the bring-your-own-cluster path.
+
+**provider-helm caches the credential.** Replacing the Secret is not enough; the
+provider deployment has to be restarted before it re-reads it.
+
 ### An engine served from the mount
 
 Beyond the claim table, a real engine on real hardware: vLLM 0.11.0 on an NVIDIA
