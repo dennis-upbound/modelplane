@@ -113,6 +113,28 @@ old mount. The value has to be set on the Helm release, which is what the
 Neither finding touches the OCI path: the mount is composed correctly and a
 hand-written pod with the same volume served a model on this cluster.
 
+### A private model artifact, on GHCR
+
+The CSI path was proven on Artifact Registry first. Repeating it on GHCR, with
+the credential travelling Modelplane's own API rather than a hand-written Helm
+value:
+
+- `modctl` published a 1.4 GiB model-spec artifact (7 layers,
+  `application/vnd.cnai.model.*`) to a private repository;
+- a `ModelCache` with `artifact: ModelArtifact` composed the driver volume;
+- `InferenceCluster.spec.modelRegistryAuthSecret` carried `ghcr.io` credentials
+  to the driver's Helm release, whose stored values hold `config.registryAuths`
+  for both registries;
+- the driver pulled it and mounted 7 files flat at `/mnt/models`, including the
+  1.5 GB `model.safetensors`.
+
+Two things cost time and belong in the docs, which they now are. `modctl` keeps
+its own credential store, so a push to a registry it has not logged into exits 0
+and uploads nothing. And provider-helm reports a release `Synced` without
+noticing that a Secret it reads through `valuesFrom` changed, so adding a
+registry to that Secret does not reach the driver until the release is
+re-applied.
+
 ### An engine served from the mount
 
 Beyond the claim table, a real engine on real hardware: vLLM 0.11.0 on an NVIDIA

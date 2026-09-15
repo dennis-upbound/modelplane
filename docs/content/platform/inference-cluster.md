@@ -52,6 +52,45 @@ The `cluster.source` discriminator picks one of two models:
   `modelplane.ai/pool=<pool-name>` (see
   [how scheduling pins placement]({{< ref "/architecture/scheduling.md#pinning-placement-to-a-pool" >}})).
 
+### The kubeconfig an Existing cluster needs
+
+The `Secret` is read by Modelplane's provider pods, not by your shell, so a
+kubeconfig that works with `kubectl` may not work here.
+
+**A credential plugin doesn't work.** A kubeconfig produced by `gcloud container
+clusters get-credentials` or `aws eks update-kubeconfig` authenticates through an
+`exec` plugin (`gke-gcloud-auth-plugin`, `aws-iam-authenticator`). Those binaries
+aren't in the provider images, so every resource fails with `kubernetes cluster
+unreachable: executable ... not found` while the cluster itself looks healthy.
+
+**A cloud access token expires.** Embedding `gcloud auth print-access-token` or
+`aws eks get-token` output works for about an hour, then every resource fails
+with `the server has asked for the client to provide credentials`.
+
+Use a Kubernetes ServiceAccount token from the cluster itself, which doesn't
+expire on a wall clock and needs no plugin:
+
+```bash
+kubectl -n kube-system create serviceaccount modelplane
+kubectl create clusterrolebinding modelplane \
+  --clusterrole=cluster-admin --serviceaccount=kube-system:modelplane
+kubectl -n kube-system create token modelplane --duration=8760h
+```
+
+Put that token in the kubeconfig's `users[].user.token`, alongside the cluster's
+server URL and CA certificate, and reference the Secret from
+`spec.cluster.existing.secretRef`.
+
+{{< hint warning >}}
+**GPU scheduling on a registered GKE cluster.** The serving stack is selected by
+`spec.cluster.source`, so an `Existing` cluster gets the generic component list
+even when its nodes are GKE. That list leaves the NVIDIA DRA driver's
+`nvidiaDriverRoot` at the chart default, and on GKE the driver lives under
+`/home/kubernetes/bin/nvidia`. The driver then publishes no `ResourceSlice` and
+every GPU pod stays `Pending` with `cannot allocate all claims`, while the
+`ServingStack` reports healthy.
+{{< /hint >}}
+
 ## Serving stack
 
 `spec.stack` selects the serving layer the cluster runs: `Standard` (the default)

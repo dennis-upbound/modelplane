@@ -83,6 +83,12 @@ spec:
 Modelplane passes it to the driver by reference, so the credential is never
 copied into a composed resource.
 
+{{< hint warning >}}
+Changing the Secret's contents doesn't reach the driver on its own: the Helm
+release is already reconciled, and its provider doesn't watch the Secret it
+reads. Adding a registry or rotating a credential needs the release re-applied.
+{{< /hint >}}
+
 Setting `source: Existing` selects `spec.existing` and uses a claim you populated
 yourself, on every cluster the cache matches. Modelplane stages nothing and
 provisions nothing; it reports whether the claim is bound on each cluster and
@@ -105,6 +111,30 @@ fleet carries on.
 Prefer a digest to a tag. A tag is re-resolved on every pod start, so moving it
 changes what the next pod serves; a digest never moves, and Modelplane pulls it
 `IfNotPresent` rather than re-checking the registry each time.
+
+### Publishing a model artifact
+
+`modctl` builds one from a `Modelfile` that names the config and weight files:
+
+```
+NAME qwen3-0.6b
+FORMAT safetensors
+CONFIG config.json
+CONFIG tokenizer.json
+MODEL model.safetensors
+```
+
+```bash
+modctl login ghcr.io -u <user> -p <token>
+modctl build -t ghcr.io/acme/qwen3:v1 .
+modctl push ghcr.io/acme/qwen3:v1
+```
+
+{{< hint warning >}}
+`modctl` keeps its own credential store. A prior `docker login` is not enough: a
+push to a registry `modctl` hasn't logged into **exits 0 and uploads nothing**,
+leaving no manifest behind. Run `modctl login` for each registry you push to.
+{{< /hint >}}
 
 Modelplane doesn't read your registry, so an `OCI` cache reports Ready once it has
 published how to mount the reference, not once the reference is known good. A

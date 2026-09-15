@@ -484,9 +484,32 @@ carried the same fragment on `spec.mount`, which became the engine pod's
 copied this cluster's entry, and the replica mounted what it was handed without
 deriving anything.
 
-Before that, the cache reported `NoClusters` while none matched, and
+Before that, the cache reported `NoClusters` while none matched.
+
+The other two sources were run the same way. `artifact: ModelArtifact` against a
+GHCR reference composed the driver volume rather than an image volume, which is
+the branch the required field exists to choose:
+
+```yaml
+volumes: [{name: model-cache, csi: {driver: model.csi.modelpack.org,
+           volumeAttributes: {model.csi.modelpack.org/reference: ghcr.io/…/qwen3-06b-artifact:v1}}}]
+```
+
+`source: Existing` was run against a claim created after the cache. It reported
+`Pending` with no fragment while the claim was absent, and `Ready` with the
+claim's fragment once it bound, which is the behaviour the Observe-only Object
+exists to produce.
+
 `InferenceCluster.spec.modelRegistryAuthSecret` reached the CSI driver's Helm
-release as a `valuesFrom` reference rather than a value.
+release as a `valuesFrom` reference rather than a value: the release's own stored
+values carry `config.registryAuths`, resolved by provider-helm from the Secret,
+and no composed resource holds the credential.
+
+One operational note falls out of that. provider-helm reports the release
+`Synced` without noticing that a referenced Secret's *contents* changed, so
+adding or rotating a registry credential does not reach the driver until
+something else forces an upgrade. Worth saying next to the field rather than
+discovering during an incident.
 
 ### Fan-out
 
