@@ -91,16 +91,27 @@ container then reports `nvidia-smi: not found` under `/`, publishes no
 claims`. `clouds/generated/aicr/gke.py` sets `/home/kubernetes/bin/nvidia` for a
 provisioned GKE cluster; nothing carries that to a registered one.
 
-That pin may also be stale. On GKE 1.36.4 with COS,
-`/home/kubernetes/bin/nvidia` holds only `nvidia-drivers-580.173.02.tgz` and an
-installer log, and pointing the driver at either that path or `/var/lib/nvidia`
-still reported the libraries missing. A pod that requests `nvidia.com/gpu` sees
-the GPU fine, so the driver is present on the node and the DRA driver is looking
-somewhere it no longer lives. Worth confirming against a Modelplane-provisioned
-GKE cluster before filing, since this one is registered rather than provisioned.
+The pin itself is correct, which was worth checking before blaming it. On the
+GKE 1.36.4 COS node, `/home/kubernetes/bin/nvidia` holds `bin/`, `lib64/` and
+`drivers/`, with `lib64/libnvidia-ml.so.1` present. So
+`clouds/generated/aicr/gke.py` names the right path and the bug is only that the
+`Existing` list does not use it.
 
-Neither touches the OCI path: the mount is composed correctly and a hand-written
-pod with the same volume served a model on this cluster.
+Setting `NVIDIA_DRIVER_ROOT` on the DaemonSet is not a workaround, which is how
+the pin briefly looked wrong. The chart derives a hostPath volume from
+`nvidiaDriverRoot` as well as the env var, and that volume stays at `/`:
+
+```
+driver-root-parent -> /
+driver-root        -> /
+```
+
+so the init container reports the new path in its message while still reading the
+old mount. The value has to be set on the Helm release, which is what the
+`Existing` component list needs to do.
+
+Neither finding touches the OCI path: the mount is composed correctly and a
+hand-written pod with the same volume served a model on this cluster.
 
 ### An engine served from the mount
 
