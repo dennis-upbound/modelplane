@@ -256,6 +256,9 @@ _EXISTING_DYNAMO_USAGES = {
     "usage-cert-manager-by-envoy-gateway": _usage(_RELEASE_REF, "cert-manager", _RELEASE_REF, "envoy-gateway"),
     "usage-ai-gateway-crds-by-ai-gateway": _usage(_RELEASE_REF, "ai-gateway-crds", _RELEASE_REF, "ai-gateway"),
     "usage-gateway-namespace-by-gateway-proxy": _usage(_OBJECT_REF, "gateway-namespace", _OBJECT_REF, "gateway-proxy"),
+    "usage-model-csi-critical-pods-quota-by-model-csi-driver": _usage(
+        _OBJECT_REF, "model-csi-critical-pods-quota", _RELEASE_REF, "model-csi-driver"
+    ),
     "usage-kai-scheduler-by-kai-queue-root": _usage(_RELEASE_REF, "kai-scheduler", _OBJECT_REF, "kai-queue-root"),
     "usage-kai-scheduler-by-kai-queue": _usage(_RELEASE_REF, "kai-scheduler", _OBJECT_REF, "kai-queue"),
     "usage-modelexpress-crds-modelmetadatas.modelexpress.nvidia.com-by-modelexpress-server": _usage(
@@ -441,6 +444,35 @@ def _existing_dynamo_stack() -> dict[str, fnv1.Resource]:
                 "provider": {
                     "type": "Kubernetes",
                     "kubernetes": {"envoyService": {"externalTrafficPolicy": "Cluster"}},
+                },
+            },
+        },
+    )
+    out["model-csi-driver"] = _release(
+        "model-csi-driver",
+        "mp-model-csi-driver",
+        "model-csi",
+        "model-csi-driver",
+        "oci://ghcr.io/modelpack/charts",
+        "0.1.2",
+        {"image": {"repository": "ghcr.io/modelpack/model-csi-driver", "tag": "latest"}},
+    )
+    out["model-csi-critical-pods-quota"] = _object(
+        "model-csi-critical-pods-quota",
+        {
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "allow-critical-pods", "namespace": "model-csi"},
+            "spec": {
+                "hard": {"pods": "1000"},
+                "scopeSelector": {
+                    "matchExpressions": [
+                        {
+                            "operator": "In",
+                            "scopeName": "PriorityClass",
+                            "values": ["system-node-critical", "system-cluster-critical"],
+                        },
+                    ],
                 },
             },
         },
@@ -661,6 +693,7 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
             "kai-queue-root",  # -> kai-scheduler
             "kai-queue",  # -> kai-scheduler
             "modelexpress-server",  # -> modelexpress-crds
+            "model-csi-driver",  # -> model-csi-critical-pods-quota
         }
         first_wave = {k: v for k, v in full.items() if k not in dep_gated}
 
@@ -781,6 +814,9 @@ _COMMON = frozenset(
         "ai-gateway-crds",
         "dra-driver-critical-pods-quota",
         "envoy-gateway",
+        "model-csi-critical-pods-quota",
+        "model-csi-driver",
+        "usage-model-csi-critical-pods-quota-by-model-csi-driver",
         "gaie-crds-inferenceobjectives.inference.networking.x-k8s.io",
         "gaie-crds-inferencepools.inference.networking.k8s.io",
         "gaie-crds-inferencepools.inference.networking.x-k8s.io",

@@ -45,6 +45,21 @@ class Crossplane(BaseModel):
     resourceRefs: list[ResourceRef] | None = None
 
 
+class Existing(BaseModel):
+    claimName: constr(min_length=1)
+    """
+    Name of a PersistentVolumeClaim in the default namespace of every matched cluster. The same name on each: a cache names one artifact, and a claim that is missing on a cluster leaves that cluster Failed rather than the whole cache.
+    """
+    readOnly: bool | None = True
+    """
+    Whether to mount the claim read-only. Defaults to true, since Modelplane did not populate it and an engine writing into someone else's volume is rarely intended.
+    """
+    subPath: str | None = None
+    """
+    Directory within the volume holding the weights. Defaults to its root.
+    """
+
+
 class AuthSecret(BaseModel):
     key: str | None = 'HF_TOKEN'
     name: constr(min_length=1)
@@ -93,6 +108,10 @@ class Spec(BaseModel):
     """
     Configures how Crossplane will reconcile this composite resource
     """
+    existing: Existing | None = None
+    """
+    A claim you populated yourself, on every cluster this cache matches. Modelplane stages nothing and provisions nothing: it reports whether the claim is bound on each cluster and publishes how to mount it. For an air-gapped or regulated fleet whose weights are on disk before Modelplane sees them.
+    """
     huggingFace: HuggingFace | None = None
     """
     HuggingFace source. Required when source is HuggingFace.
@@ -101,7 +120,7 @@ class Spec(BaseModel):
     """
     OCI source. Required when source is OCI. Nothing is staged onto a volume: the artifact is pulled per node by the cluster itself, so there is no sizeGiB and no hydration Job.
     """
-    source: Literal['HuggingFace', 'OCI']
+    source: Literal['HuggingFace', 'OCI', 'Existing']
     """
     Which kind of artifact source to stage from. The matching source object (e.g. spec.huggingFace) must be set.
     """

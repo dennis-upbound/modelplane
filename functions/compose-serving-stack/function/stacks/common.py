@@ -48,6 +48,22 @@ _AI_GATEWAY_VERSION = "v0.7.0"
 # where the kubelet plugin runs.
 _DRA_DRIVER_NAMESPACE = "nvidia-dra-driver"
 
+# ModelPack's CSI driver, which reads a model-spec artifact and presents
+# it as a directory. A ModelCache with source: OCI and artifact:
+# ModelArtifact composes a volume against this driver's name; a cluster
+# without it leaves such a pod unable to mount. Installed on every
+# cluster because the function sees one cluster rather than the fleet's
+# caches, and cannot tell in advance which artifacts land here. A cluster
+# whose fleet publishes images only pays an idle DaemonSet.
+#
+# The chart's defaults do not work as published: image.repository is
+# "model-csi-driver" with no registry, which resolves to Docker Hub and
+# does not exist, so the registry is pinned here.
+_MODEL_CSI_NAMESPACE = "model-csi"
+_MODEL_CSI_REPO = "oci://ghcr.io/modelpack/charts"
+_MODEL_CSI_VERSION = "0.1.2"
+_MODEL_CSI_IMAGE = "ghcr.io/modelpack/model-csi-driver"
+
 _CRDS_DIR = pathlib.Path(__file__).parent / "crds"
 
 
@@ -172,6 +188,53 @@ COMPONENTS: list[Component] = [
                         "kubernetes": {
                             "envoyService": {"externalTrafficPolicy": "Cluster"},
                         },
+                    },
+                },
+            },
+        ],
+    ),
+    Chart(
+        key="model-csi-driver",
+        release="mp-model-csi-driver",
+        namespace=_MODEL_CSI_NAMESPACE,
+        chart="model-csi-driver",
+        repository=_MODEL_CSI_REPO,
+        version=_MODEL_CSI_VERSION,
+        # The quota has to exist before the DaemonSet, or its pods are
+        # rejected on GKE and the release still reports Ready.
+        depends_on=["model-csi-critical-pods-quota"],
+        values={
+            "image": {"repository": _MODEL_CSI_IMAGE, "tag": "latest"},
+        },
+    ),
+    # Same GKE restriction as the DRA driver below, and the same remedy.
+    # The driver's DaemonSet runs at system-node-critical, and without a
+    # quota permitting that priority class its pods are rejected with
+    # FailedCreate while the Helm release still reports Ready - so the
+    # cluster looks healthy and no model artifact can mount.
+    Manifests(
+        key="model-csi-critical-pods-quota",
+        manifests=[
+            {
+                "apiVersion": "v1",
+                "kind": "ResourceQuota",
+                "metadata": {
+                    "name": "allow-critical-pods",
+                    "namespace": _MODEL_CSI_NAMESPACE,
+                },
+                "spec": {
+                    "hard": {"pods": "1000"},
+                    "scopeSelector": {
+                        "matchExpressions": [
+                            {
+                                "operator": "In",
+                                "scopeName": "PriorityClass",
+                                "values": [
+                                    "system-node-critical",
+                                    "system-cluster-critical",
+                                ],
+                            },
+                        ],
                     },
                 },
             },

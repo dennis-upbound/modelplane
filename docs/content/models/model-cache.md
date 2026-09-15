@@ -55,6 +55,25 @@ puts them at the root wants no `subPath` at all.
 A private reference is pulled with the cluster's own credential rather than one
 on the cache, so it is configured on the `InferenceCluster` by the platform team.
 
+Setting `source: Existing` selects `spec.existing` and uses a claim you populated
+yourself, on every cluster the cache matches. Modelplane stages nothing and
+provisions nothing; it reports whether the claim is bound on each cluster and
+publishes how to mount it. For an air-gapped or regulated fleet whose weights are
+on disk before Modelplane sees them.
+
+```yaml
+spec:
+  source: Existing
+  existing:
+    claimName: model-weights   # in the default namespace of every matched cluster
+    subPath: qwen3-8b          # optional, the directory holding the weights
+    readOnly: true             # the default
+```
+
+The claim needs the same name on each cluster, since a cache names one artifact.
+A cluster where it is missing reports `Failed` on its own, and the rest of the
+fleet carries on.
+
 Prefer a digest to a tag. A tag is re-resolved on every pod start, so moving it
 changes what the next pod serves; a digest never moves, and Modelplane pulls it
 `IfNotPresent` rather than re-checking the registry each time.

@@ -103,6 +103,7 @@ _JOB_MANAGEMENT: list[_ManagementPolicy] = ["Observe", "Create", "Update", "Late
 
 SOURCE_HUGGINGFACE = "HuggingFace"
 SOURCE_OCI = "OCI"
+SOURCE_EXISTING = "Existing"
 
 # What an OCI reference names, which decides the mechanism that mounts it.
 ARTIFACT_IMAGE = "Image"
@@ -216,6 +217,20 @@ class Composer:
     def _is_oci(self) -> bool:
         return self.xr.spec.source == SOURCE_OCI
 
+    @property
+    def _is_existing(self) -> bool:
+        return self.xr.spec.source == SOURCE_EXISTING
+
+    @property
+    def _stages_nothing(self) -> bool:
+        """Whether this source puts bytes on a volume Modelplane provisions.
+
+        Only HuggingFace does. An OCI artifact is pulled per node by the cluster,
+        and an Existing claim was populated before Modelplane saw it, so neither
+        composes a PVC, a hydration Job or a token Secret.
+        """
+        return self._is_oci or self._is_existing
+
     def _mount_fragment(self) -> v1alpha1.Mount:
         """What a consumer adds to a pod to read this cache.
 
@@ -249,6 +264,28 @@ class Composer:
                 pull_policy = "IfNotPresent" if "@" in ref else "Always"
                 volume = {"name": _CACHE_VOLUME, "image": {"reference": ref, "pullPolicy": pull_policy}}
             return v1alpha1.Mount(volumes=[volume], volumeMounts=[mount], env=[])
+        if self._is_existing:
+            existing = self.xr.spec.existing
+            assert existing  # XRD CEL guarantees spec.existing when source is Existing
+            mount = {"name": _CACHE_VOLUME, "mountPath": CACHE_MOUNT_PATH}
+            read_only = existing.readOnly is not False
+            if read_only:
+                mount["readOnly"] = True
+            if existing.subPath:
+                mount["subPath"] = str(existing.subPath)
+            return v1alpha1.Mount(
+                volumes=[
+                    {
+                        "name": _CACHE_VOLUME,
+                        "persistentVolumeClaim": {
+                            "claimName": str(existing.claimName),
+                            "readOnly": read_only,
+                        },
+                    }
+                ],
+                volumeMounts=[mount],
+                env=[],
+            )
         return v1alpha1.Mount(
             volumes=[{"name": _CACHE_VOLUME, "persistentVolumeClaim": {"claimName": self._pvc_name()}}],
             # Read-write, not readOnly: engines write tokenizer, compile and lock
@@ -264,7 +301,7 @@ class Composer:
         resolved. compose() only runs past resolve_inputs() once the auth
         requirement (if any) is resolved, so an empty auth_data here means the
         Secret was found-but-empty or absent, not merely unresolved."""
-        if self._is_oci:
+        if self._stages_nothing:
             # An OCI artifact's credential sits on the InferenceCluster, with
             # the team that owns what it opens, so there is nothing to wait for.
             return False
@@ -316,7 +353,7 @@ class Composer:
         # XR's own namespace on the control plane. Its token is propagated to
         # each workload cluster (compose_cluster_resources) so the hydration Job
         # finds it; without resolving it first we can't materialize it remotely.
-        auth = self.xr.spec.huggingFace.authSecret if not self._is_oci else None  # ty: ignore[unresolved-attribute]  # huggingFace is set when the source isn't OCI
+        auth = self.xr.spec.huggingFace.authSecret if not self._stages_nothing else None  # ty: ignore[unresolved-attribute]  # huggingFace is set when the source isn't OCI
         if auth:
             response.require_resources(
                 self.rsp,
@@ -377,7 +414,7 @@ class Composer:
             and c.status.providerConfigRef.name
             # An OCI artifact is pulled per node by the cluster itself, so it
             # needs no RWX class and nothing gates on one.
-            and (self._is_oci or _storage_class(c))
+            and (self._stages_nothing or _storage_class(c))
         ]
 
     def compose_cluster_resources(self, cluster: icv1alpha1.InferenceCluster, phase: _Phase) -> None:
@@ -394,7 +431,7 @@ class Composer:
         assert cluster.status and cluster.status.providerConfigRef and cluster.status.providerConfigRef.name
         pc = cluster.status.providerConfigRef.name
         name = _name(cluster.metadata)
-        if self._is_oci:
+        if self._stages_nothing:
             # Nothing to compose. The artifact travels with the pod that mounts
             # it, so the cache's whole job here is publishing the fragment that
             # says how. Resolution of what KIND of artifact it is belongs here
@@ -540,7 +577,7 @@ class Composer:
         }
 
     def derive_cluster_phase(self, cluster_name: str) -> _Phase:
-        if self._is_oci:
+        if self._stages_nothing:
             # Nothing stages, so there is no Pending or Hydrating to report. A
             # reference that can't be served would be Failed here, once
             # resolution lands.
@@ -590,7 +627,7 @@ class Composer:
         onto the observed Object; the auth Secret uses default readiness (Ready
         once synced). Runs after compose_cluster_resources() so the desired
         entries exist."""
-        if self._is_oci:
+        if self._stages_nothing:
             return
         for name, phase in per_cluster_phase:
             # Mirror compose_cluster_resources: only mark the keys it composed.
@@ -707,7 +744,7 @@ class Composer:
         now_ready = bool(matched) and all(p == PHASE_READY for _, p in per_cluster_phase)
         observed_keys = self.req.observed.resources.keys()
         first_compose = matched and all(self._pvc_key(_name(c.metadata)) not in observed_keys for c in matched)
-        if first_compose and not self._is_oci:
+        if first_compose and not self._stages_nothing:
             names = ", ".join(_name(c.metadata) for c in matched)
             response.normal(
                 self.rsp,

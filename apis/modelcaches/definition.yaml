@@ -34,10 +34,12 @@ spec:
               message: spec.huggingFace is required when spec.source is HuggingFace.
             - rule: "self.source != 'OCI' || has(self.oci)"
               message: spec.oci is required when spec.source is OCI.
+            - rule: "self.source != 'Existing' || has(self.existing)"
+              message: spec.existing is required when spec.source is Existing.
             properties:
               source:
                 type: string
-                enum: [HuggingFace, OCI]
+                enum: [HuggingFace, OCI, Existing]
                 description: >-
                   Which kind of artifact source to stage from. The
                   matching source object (e.g. spec.huggingFace) must
@@ -120,6 +122,39 @@ spec:
                     description: >-
                       Directory within the artifact holding the
                       weights. Defaults to its root.
+              existing:
+                type: object
+                description: >-
+                  A claim you populated yourself, on every cluster this
+                  cache matches. Modelplane stages nothing and provisions
+                  nothing: it reports whether the claim is bound on each
+                  cluster and publishes how to mount it. For an
+                  air-gapped or regulated fleet whose weights are on disk
+                  before Modelplane sees them.
+                required: [claimName]
+                properties:
+                  claimName:
+                    type: string
+                    description: >-
+                      Name of a PersistentVolumeClaim in the default
+                      namespace of every matched cluster. The same name
+                      on each: a cache names one artifact, and a claim
+                      that is missing on a cluster leaves that cluster
+                      Failed rather than the whole cache.
+                    minLength: 1
+                  subPath:
+                    type: string
+                    description: >-
+                      Directory within the volume holding the weights.
+                      Defaults to its root.
+                  readOnly:
+                    type: boolean
+                    default: true
+                    description: >-
+                      Whether to mount the claim read-only. Defaults to
+                      true, since Modelplane did not populate it and an
+                      engine writing into someone else's volume is
+                      rarely intended.
               clusterSelector:
                 type: object
                 description: >-

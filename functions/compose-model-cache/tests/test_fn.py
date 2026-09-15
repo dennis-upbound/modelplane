@@ -45,6 +45,15 @@ def setUpModule() -> None:
     logging.configure(level=logging.Level.DISABLED)
 
 
+# An Existing ModelCache: a claim the user populated on each matched cluster.
+# Like OCI it stages nothing, so it composes nothing and is Ready once matched.
+def _existing_xr(**extra: Any) -> v1alpha1.ModelCache:
+    return v1alpha1.ModelCache(
+        metadata=metav1.ObjectMeta(name="qwen", namespace="ml-team"),
+        spec=v1alpha1.Spec(source="Existing", existing=v1alpha1.Existing(claimName="weights", **extra)),
+    )
+
+
 # An OCI ModelCache. Nothing stages onto a volume, so the cache composes no PVC,
 # no hydration Job and no token Secret; its whole output is the fragment that
 # says how to mount the artifact.
@@ -1063,6 +1072,22 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                         },
                     },
                     {"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True, "subPath": "weights"},
+                ),
+            ),
+            Case(
+                name="Existing mounts the claim read-only and stages nothing",
+                req=_req(_existing_xr(), [_cluster_dict("cluster-a", "cluster-a-pc")]),
+                want=_want_oci(
+                    {"name": "model-cache", "persistentVolumeClaim": {"claimName": "weights", "readOnly": True}},
+                    {"name": "model-cache", "mountPath": "/mnt/models", "readOnly": True},
+                ),
+            ),
+            Case(
+                name="Existing readOnly false mounts read-write, for a claim the user shares",
+                req=_req(_existing_xr(readOnly=False), [_cluster_dict("cluster-a", "cluster-a-pc")]),
+                want=_want_oci(
+                    {"name": "model-cache", "persistentVolumeClaim": {"claimName": "weights", "readOnly": False}},
+                    {"name": "model-cache", "mountPath": "/mnt/models"},
                 ),
             ),
         ]
