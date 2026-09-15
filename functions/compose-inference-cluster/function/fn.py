@@ -44,6 +44,9 @@ from models.ai.modelplane.infrastructure.gkecluster import v1alpha1 as gkev1alph
 from models.ai.modelplane.infrastructure.nebiuscluster import v1alpha1 as nebiusv1alpha1
 from models.ai.modelplane.infrastructure.servingstack import v1alpha1 as ssv1alpha1
 from models.ai.modelplane.infrastructure.vultrcluster import v1alpha1 as vultrv1alpha1
+from models.io.crossplane.apiextensions.managedresourceactivationpolicy import (
+    v1alpha1 as mrapv1alpha1,
+)
 from models.io.crossplane.m.kubernetes.clusterproviderconfig import (
     v1alpha1 as k8scpcv1alpha1,
 )
@@ -100,6 +103,68 @@ _IDENTITY_TYPE_GCP = "GoogleApplicationCredentials"
 
 # Identity type for Nebius service account credentials.
 _IDENTITY_TYPE_NEBIUS = "NebiusServiceAccountCredentials"
+
+# The managed resource kinds each cloud's cluster XR composes, and so the
+# ManagedResourceDefinitions its activation policy activates. Only this
+# cluster-scoped XR can compose the (cluster-scoped) policy; the namespaced
+# cluster XRs it composes cannot. Keep each list in sync with the resources
+# compose-<cloud>-cluster composes - a kind composed but missing here never
+# gets a CRD, and composing it fails the whole reconcile. provider-helm and
+# provider-kubernetes are omitted: the Configuration's own policy keeps those
+# active for every control plane.
+_ACTIVATE_AWS = (
+    "eips.ec2.aws.m.upbound.io",
+    "internetgateways.ec2.aws.m.upbound.io",
+    "launchtemplates.ec2.aws.m.upbound.io",
+    "natgateways.ec2.aws.m.upbound.io",
+    "routes.ec2.aws.m.upbound.io",
+    "routetables.ec2.aws.m.upbound.io",
+    "routetableassociations.ec2.aws.m.upbound.io",
+    "securitygroups.ec2.aws.m.upbound.io",
+    "securitygroupegressrules.ec2.aws.m.upbound.io",
+    "securitygroupingressrules.ec2.aws.m.upbound.io",
+    "subnets.ec2.aws.m.upbound.io",
+    "vpcs.ec2.aws.m.upbound.io",
+    "filesystems.efs.aws.m.upbound.io",
+    "mounttargets.efs.aws.m.upbound.io",
+    "addons.eks.aws.m.upbound.io",
+    "clusters.eks.aws.m.upbound.io",
+    "clusterauths.eks.aws.m.upbound.io",
+    "nodegroups.eks.aws.m.upbound.io",
+    "podidentityassociations.eks.aws.m.upbound.io",
+    "policies.iam.aws.m.upbound.io",
+    "roles.iam.aws.m.upbound.io",
+    "rolepolicyattachments.iam.aws.m.upbound.io",
+)
+_ACTIVATE_GCP = (
+    "projectiammembers.cloudplatform.gcp.m.upbound.io",
+    "projectservices.cloudplatform.gcp.m.upbound.io",
+    "serviceaccounts.cloudplatform.gcp.m.upbound.io",
+    "serviceaccountkeys.cloudplatform.gcp.m.upbound.io",
+    "networks.compute.gcp.m.upbound.io",
+    "subnetworks.compute.gcp.m.upbound.io",
+    "clusters.container.gcp.m.upbound.io",
+    "nodepools.container.gcp.m.upbound.io",
+)
+_ACTIVATE_AZURE = (
+    "kubernetesclusters.containerservice.azure.m.upbound.io",
+    "kubernetesclusternodepools.containerservice.azure.m.upbound.io",
+    "subnets.network.azure.m.upbound.io",
+    "virtualnetworks.network.azure.m.upbound.io",
+    "resourcegroups.azure.m.upbound.io",
+)
+_ACTIVATE_NEBIUS = (
+    "filesystems.compute.nebius.m.upbound.io",
+    "gpuclusters.compute.nebius.m.upbound.io",
+    "clusters.mk8s.nebius.m.upbound.io",
+    "nodegroups.mk8s.nebius.m.upbound.io",
+    "networks.vpc.nebius.m.upbound.io",
+    "subnets.vpc.nebius.m.upbound.io",
+)
+_ACTIVATE_VULTR = (
+    "kubernetes.vke.vultr.m.upbound.io",
+    "kubernetesnodepools.vke.vultr.m.upbound.io",
+)
 
 
 def _name(meta: metav1.ObjectMeta | None) -> str:
@@ -170,6 +235,44 @@ class Composer:
             self.compose_existing(cluster.existing)
         else:
             response.warning(self.rsp, f"unsupported cluster source: {source}")
+
+    def compose_activation(self, kinds: tuple[str, ...]) -> None:
+        """Activate the cloud managed resource kinds the cluster XR composes.
+
+        The policy is cluster scoped, so only this cluster-scoped XR can compose
+        it; the namespaced cluster XR it composes cannot. _activation_ready then
+        gates the cluster XR on the policy taking effect, so its managed
+        resources aren't composed before the API server knows their kinds.
+        """
+        resource.update(
+            self.rsp.desired.resources["activation"],
+            mrapv1alpha1.ManagedResourceActivationPolicy(
+                spec=mrapv1alpha1.Spec(activate=list(kinds)),
+            ),
+        )
+
+    def _activation_ready(self, kinds: tuple[str, ...]) -> bool:
+        """Whether the policy this function composed has activated every kind.
+
+        Read from the policy's own status.activated (the definitions it has set
+        Active), so no ManagedResourceDefinition (each of which carries a full
+        CRD schema) has to be pulled into the request. The policy reports
+        Healthy even when it matched no definitions, e.g. while a provider is
+        still installing, so this checks the kinds are present rather than
+        trusting Healthy.
+
+        TODO(negz): gate on an Established condition instead once the policy
+        reports one (crossplane/crossplane#7822). status.activated means the
+        policy set these definitions Active, not that their CRDs exist, so a
+        managed resource composed in the window before a CRD is served can
+        still fail its apply until the next reconcile.
+        """
+        activation = self.req.observed.resources.get("activation")
+        if activation is None:
+            return False
+        status = resource.struct_to_dict(activation.resource).get("status") or {}
+        activated = status.get("activated") or []
+        return all(kind in activated for kind in kinds)
 
     def compose_replica_guard(self) -> None:
         """Block deletion of the InferenceCluster while ModelReplicas use it.
@@ -268,7 +371,10 @@ class Composer:
             response.warning(self.rsp, "GKE configuration is required when source is GKE")
             return
 
-        self.compose_gke_cluster(gke)
+        self.compose_activation(_ACTIVATE_GCP)
+        if self._activation_ready(_ACTIVATE_GCP) or "gke-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_gke_cluster(gke)
 
         gke_ready = resource.get_condition(self.req.observed.resources.get("gke-cluster"), "Ready").status == "True"
         kubeconfig_secret = self.observed_gke_secret(_SECRET_TYPE_KUBECONFIG)
@@ -312,7 +418,10 @@ class Composer:
             response.warning(self.rsp, "EKS configuration is required when source is EKS")
             return
 
-        self.compose_eks_cluster(eks)
+        self.compose_activation(_ACTIVATE_AWS)
+        if self._activation_ready(_ACTIVATE_AWS) or "eks-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_eks_cluster(eks)
 
         eks_ready = resource.get_condition(self.req.observed.resources.get("eks-cluster"), "Ready").status == "True"
         kubeconfig = self.observed_eks_secret(_SECRET_TYPE_KUBECONFIG)
@@ -348,7 +457,10 @@ class Composer:
             response.warning(self.rsp, "AKS configuration is required when source is AKS")
             return
 
-        self.compose_aks_cluster(aks)
+        self.compose_activation(_ACTIVATE_AZURE)
+        if self._activation_ready(_ACTIVATE_AZURE) or "aks-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_aks_cluster(aks)
 
         aks_ready = resource.get_condition(self.req.observed.resources.get("aks-cluster"), "Ready").status == "True"
         kubeconfig = self.observed_aks_secret(_SECRET_TYPE_KUBECONFIG)
@@ -386,7 +498,10 @@ class Composer:
             response.warning(self.rsp, "Nebius configuration is required when source is Nebius")
             return
 
-        self.compose_nebius_cluster(nebius)
+        self.compose_activation(_ACTIVATE_NEBIUS)
+        if self._activation_ready(_ACTIVATE_NEBIUS) or "nebius-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_nebius_cluster(nebius)
 
         nebius_ready = (
             resource.get_condition(self.req.observed.resources.get("nebius-cluster"), "Ready").status == "True"
@@ -430,7 +545,10 @@ class Composer:
             response.warning(self.rsp, "Vultr configuration is required when source is Vultr")
             return
 
-        self.compose_vultr_cluster(vultr)
+        self.compose_activation(_ACTIVATE_VULTR)
+        if self._activation_ready(_ACTIVATE_VULTR) or "vultr-cluster" in self.req.observed.resources:
+            self.rsp.desired.resources["activation"].ready = fnv1.READY_TRUE
+            self.compose_vultr_cluster(vultr)
 
         vultr_ready = resource.get_condition(self.req.observed.resources.get("vultr-cluster"), "Ready").status == "True"
         kubeconfig = self.observed_vultr_secret(_SECRET_TYPE_KUBECONFIG)

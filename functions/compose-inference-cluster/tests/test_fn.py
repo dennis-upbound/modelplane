@@ -14,6 +14,7 @@
 
 """Tests for the compose-inference-cluster function."""
 
+import copy
 import dataclasses
 import unittest
 
@@ -38,6 +39,41 @@ class Case:
 
 def setUpModule() -> None:
     logging.configure(level=logging.Level.DISABLED)
+
+
+_ACTIVATION_API_VERSION = "apiextensions.crossplane.io/v1alpha1"
+
+
+def _observe_activated(req: fnv1.RunFunctionRequest, kinds: tuple[str, ...]) -> None:
+    """Observe the composed activation policy with the kinds in status.activated,
+    so the function composes the cluster XR rather than waiting for activation."""
+    req.observed.resources["activation"].CopyFrom(
+        fnv1.Resource(
+            resource=resource.dict_to_struct(
+                {
+                    "apiVersion": _ACTIVATION_API_VERSION,
+                    "kind": "ManagedResourceActivationPolicy",
+                    "status": {"activated": list(kinds)},
+                },
+            ),
+        ),
+    )
+
+
+def _want_activation(want: fnv1.RunFunctionResponse, kinds: tuple[str, ...]) -> None:
+    """Add the activation policy the function composes for a cloud cluster."""
+    want.desired.resources["activation"].CopyFrom(
+        fnv1.Resource(
+            resource=resource.dict_to_struct(
+                {
+                    "apiVersion": _ACTIVATION_API_VERSION,
+                    "kind": "ManagedResourceActivationPolicy",
+                    "spec": {"activate": list(kinds)},
+                },
+            ),
+            ready=fnv1.READY_TRUE,
+        ),
+    )
 
 
 def _eks_ready_extras(want: fnv1.RunFunctionResponse, storage_class: str) -> None:
@@ -2681,6 +2717,47 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
         want_creds.requirements.resources["class-gpu-l4"].CopyFrom(class_selector)
         want_creds.requirements.resources["model-replicas"].CopyFrom(_replicas_selector("test-cluster"))
 
+        # Every cloud cluster composes an activation policy; with the policy
+        # observed Healthy the cluster XR is composed.
+        for req, want, kinds in [
+            (req2, want2, fn._ACTIVATE_GCP),
+            (req_creds, want_creds, fn._ACTIVATE_GCP),
+            (req4, want4, fn._ACTIVATE_AWS),
+            (req5, want5, fn._ACTIVATE_AWS),
+            (req6, want6, fn._ACTIVATE_GCP),
+            (req7, want7, fn._ACTIVATE_AWS),
+            (req8, want8, fn._ACTIVATE_AWS),
+            (req9, want9, fn._ACTIVATE_AWS),
+            (req10, want10, fn._ACTIVATE_NEBIUS),
+            (req11, want11, fn._ACTIVATE_NEBIUS),
+            (req12, want12, fn._ACTIVATE_AZURE),
+            (req13, want13, fn._ACTIVATE_AZURE),
+            (req14, want14, fn._ACTIVATE_VULTR),
+            (req_creds_vultr, want_creds_vultr, fn._ACTIVATE_VULTR),
+            (req15, want15, fn._ACTIVATE_VULTR),
+        ]:
+            _observe_activated(req, kinds)
+            _want_activation(want, kinds)
+
+        # While the policy is missing even one of the kinds from status.activated
+        # (e.g. a provider still installing), and with no cluster observed, the
+        # function composes only the activation policy (not marked ready, so the
+        # composite doesn't report ready), not the cluster XR. Observing the
+        # policy with a kind missing exercises the all-kinds check rather than
+        # the policy-absent branch.
+        req_unactivated = copy.deepcopy(req2)
+        _observe_activated(req_unactivated, fn._ACTIVATE_GCP[:-1])
+        want_unactivated = copy.deepcopy(want2)
+        del want_unactivated.desired.resources["gke-cluster"]
+        want_unactivated.desired.resources["activation"].ClearField("ready")
+
+        # Once the cluster is observed, the function keeps composing it even
+        # when the policy momentarily stops reporting the kinds active, so an
+        # activation blip never drops a provisioned cluster from desired state.
+        req_blip = copy.deepcopy(req6)
+        del req_blip.observed.resources["activation"]
+        want_blip = copy.deepcopy(want6)
+
         cases = [
             Case(name="existing cluster with secrets composes backend and CPC", req=req1, want=want1),
             Case(name="existing cluster with a non-GCP identity threads the identity type", req=req1b, want=want1b),
@@ -2713,6 +2790,10 @@ class TestFunctionRunner(unittest.IsolatedAsyncioTestCase):
                 req=req13,
                 want=want13,
             ),
+            Case(
+                name="cloud cluster not activated composes only the policy", req=req_unactivated, want=want_unactivated
+            ),
+            Case(name="observed cluster keeps composing through an activation blip", req=req_blip, want=want_blip),
             Case(name="Vultr cluster first pass composes VultrCluster XR only", req=req14, want=want14),
             Case(
                 name="Vultr credentials pass through to VultrCluster spec",
