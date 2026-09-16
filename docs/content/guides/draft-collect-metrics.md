@@ -56,10 +56,22 @@ kubectl create secret generic otlp-token \
   --from-literal=token=<token>
 ```
 
-Every cluster sends to the destination itself, so each one needs egress to that endpoint
-and nothing needs to reach into the cluster. Point the destination at a backend your
-clusters can already reach, which for most fleets is the observability stack you run
-today. A cluster with no route to it collects nothing.
+Every cluster sends to the destination itself, so each one needs egress to that endpoint and
+nothing needs to reach into the cluster. Point the destination at a backend your clusters
+can already reach, which for most fleets is the observability stack you run today. A cluster
+with no route to it collects nothing.
+
+A backend inside your own network usually needs two more things. If its certificate is
+signed by your own CA, name a Secret holding the bundle, and if your clusters egress through
+a proxy, say so. Both go on the destination, so every cluster gets them:
+
+```yaml
+spec:
+  tls:
+    caSecretRef:
+      name: otlp-ca                    # in modelplane-system
+  proxyURL: http://proxy.example.internal:3128
+```
 
 ## Naming your engine
 
