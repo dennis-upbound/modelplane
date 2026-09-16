@@ -111,21 +111,36 @@ section a question with an answer rather than a survey.
 |---|---|---|
 | `modelplane_replicas_desired` | gauge | replicas |
 | `modelplane_replicas_ready` | gauge | replicas |
+| `modelplane_replicas_unschedulable` | gauge | replicas |
 | `modelplane_gpus_allocatable` | gauge | GPUs |
 | `modelplane_gpus_allocated` | gauge | GPUs |
 | `modelplane_gpu_hours_total` | counter | GPU-hours |
 | `modelplane_stack_component_up` | gauge | 0 or 1 |
 
-Each carries `cluster`, and a series about a deployment also carries `deployment`,
-`namespace`, `model` and `engine`. Labels naming a pod are dropped before anything leaves
+Each carries `cluster`, and a series about a deployment also carries `deployment`, `namespace`,
+`model` and `engine`. Under disaggregated serving a `role` of `prefill` or `decode` goes with
+them, because the two do different work at different efficiency and a figure that averages them
+describes neither. Labels naming a pod are dropped before anything leaves
 the cluster, because a billing backend counts a series as active for fifteen to thirty
 minutes after it stops and every rolling update would mint a fresh set. `caller` is never
 added: a caller is unbounded by construction.
 
-Two decisions are visible in that list. Hit rate is two counters rather than a ratio,
-because a ratio cannot be re-aggregated and two counters can. And GPU-hours is a counter
-rather than a gauge and an instruction, because integrating an allocation over time is
-work this design does rather than work it leaves.
+Three decisions are visible in that list.
+
+Hit rate is two counters and not a ratio, because a ratio cannot be re-aggregated and two
+counters can. GPU-hours is a counter and not a gauge with an instruction attached, because
+integrating an allocation over time is work this design does rather than work it leaves.
+
+And `modelplane_replicas_unschedulable` is here because the gap between desired and ready is
+the failure a fleet hides best. A GPU pool that cannot satisfy a claim leaves every replica
+Pending while the cluster reports healthy, and nothing an engine publishes says so, because no
+engine started.
+
+One metric is deliberately absent. GPU utilisation as the accelerator reports it says the card
+was not idle, which for inference is nearly always true and nearly always uninformative: the
+work is memory-bandwidth bound, so a busy-looking GPU and an efficient one are different
+things. Tokens per allocated GPU-second is the honest efficiency figure, and the fleet computes
+it from two series that are already here.
 
 ### Where each one comes from
 
@@ -145,7 +160,10 @@ LeaderWorkerSet or Grove controller, cert-manager and the DRA driver each report
 which `kube-state-metrics` turns into `modelplane_stack_component_up` per component.
 
 **The cluster and the GPUs** answer capacity. `kube-state-metrics` reports allocatable and
-requested `nvidia.com/gpu` and a deployment's desired and ready replicas. DCGM reports the
+requested `nvidia.com/gpu` and a deployment's desired and ready replicas, and the count of its
+pods that are Pending with an unsatisfiable resource claim is where
+`modelplane_replicas_unschedulable` comes from. That one has no engine behind it by definition,
+which is the point of collecting it. DCGM reports the
 hardware underneath, and `InferenceCluster.spec.gpuTelemetry` names the exporter where a
 cluster runs something other than the default.
 
@@ -248,8 +266,17 @@ exporter. Its recording rules apply the mappings and produce `modelplane_*`. Ret
 short, because this tier transforms rather than stores, and it remote-writes only the
 `modelplane_*` series onward, dropping pod labels on the way out.
 
-**On the control plane**, a Prometheus receives those writes and is the fleet. Its recording
-rules compute what only it can:
+**On the control plane**, a Prometheus receives those writes and is the fleet. Four questions
+only it can answer, each a rule over series every cluster now agrees on:
+
+| Fleet question | Computed as | From |
+|---|---|---|
+| Are we meeting the latency target? | ratio of requests under it | the TTFT histogram |
+| What is it costing? | GPU-hours and tokens | allocated GPUs, token counters |
+| Is capacity being used? | allocated over allocatable | the two GPU gauges |
+| Is it running efficiently? | tokens per allocated GPU-second | token counters, allocated GPUs |
+
+Each needs a window, a series that persists, or both:
 
 ```yaml
 - record: modelplane_gpu_hours_total
@@ -259,10 +286,23 @@ rules compute what only it can:
   expr: |
     sum by (model) (rate(modelplane_time_to_first_token_seconds_bucket{le="1.0"}[5m]))
       / sum by (model) (rate(modelplane_time_to_first_token_seconds_count[5m]))
+
+- record: modelplane_gpu_allocation_ratio
+  expr: sum by (cluster) (modelplane_gpus_allocated)
+          / sum by (cluster) (modelplane_gpus_allocatable)
+
+- record: modelplane_tokens_per_gpu_second
+  expr: sum by (model) (rate(modelplane_tokens_total{kind="output"}[5m]))
+          / sum by (model) (modelplane_gpus_allocated)
 ```
 
-Both need a window and a series that persists, which is what this tier is for and what a
-stateless pipeline cannot do.
+None of these is a rename. Each needs a rate over a window, a division across two series, or an
+integral, and the series they read come from clusters that do not know about each other. That
+is what this tier is for, and a pipeline that transforms each sample as it passes can produce
+none of them.
+
+The attainment rule is the one an operator alerts on, and it is evaluated over a long window
+and a short one so a page means sustained and current degradation rather than either alone.
 
 `remote_write` is a push, so a workload cluster needs egress and nothing inbound. The
 control plane accepts those writes on one endpoint, and a cluster authenticates to it with a
