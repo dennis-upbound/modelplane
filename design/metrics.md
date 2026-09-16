@@ -162,7 +162,23 @@ measured. `modelplane_requests_waiting` is requests admitted to an engine and no
 decoded, on any engine, under any stack. A mapping's job is to find the series that already
 means that. Renaming is what it usually takes, and it is not what makes the vocabulary true.
 
-Three things happen when a source does not already match the definition.
+The work of making that true happens in one of three places.
+
+Modelplane's pipeline holds everything that makes a metric mean the same thing on every engine.
+The reader's query holds `rate()` and `histogram_quantile()`, which is how anyone uses a
+counter or a histogram in any project. Nothing holds the case where two engines cannot be
+reconciled at all, and the document says which those are instead of hiding them.
+
+The test is what a reader has to know. Writing `sum by (cluster)` over
+`modelplane_kv_cache_usage` is using a metrics system. Knowing that the number means a fraction
+on vLLM and a token count on SGLang is not, so we settle that before it leaves the cluster.
+
+That also separates two things both called aggregation. Reconciling engines is semantic, and it
+is ours: an operator should never learn which engines differ or how. Summing across clusters
+for a fleet view is dimensional, and it is a `sum()` over metrics that already agree, which
+every Prometheus-compatible store does and none of which is knowledge we are handing over.
+
+Three things follow when a source does not already match a definition.
 
 **Modelplane reconciles it before export** where the difference is mechanical, and a mapping
 says how. Prefix-cache hit rate is the case that shows why renaming alone does not carry a
