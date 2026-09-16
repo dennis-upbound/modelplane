@@ -85,13 +85,13 @@ So the collector is composed per cluster rather than per serving stack, and a ga
 cluster gets one with the gateway's Envoy and the substrate as its sources and no engine
 scrape at all. A cluster's collector reports what that cluster has.
 
-**A gateway also produces usage records, and they are logs.** The [AI gateway
-design](https://github.com/upbound/inference/pull/3) has Envoy write a structured access
-log line per request, carrying the caller, the service, the endpoint, the served model and
-the token counts. They travel the collector this document composes and land at the same
-`TelemetryDestination`, which is what that name is for: the destination is signal-agnostic,
-and usage records are the first signal through it that isn't a metric. Their shape is that
-design's to specify, and carrying them is this one's.
+**A gateway also produces usage records, and they are logs.** An `InferenceGateway` fronts
+requests with Envoy, which can write a structured access log line per request carrying the
+caller, the service, the endpoint, the served model and the token counts. Those travel the
+collector this document composes and land at the same `TelemetryDestination`, which is what
+that name is for: the destination is signal-agnostic, and usage records are the first
+signal through it that isn't a metric. Their shape belongs to the gateway's own design;
+carrying them belongs to this one.
 
 The pieces are already there.
 
