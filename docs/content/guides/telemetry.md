@@ -14,7 +14,7 @@ by `draft: true`. It replaces [Collecting engine metrics]({{< ref
 "guides/collecting-engine-metrics.md" >}}) when the per-cluster Prometheus stack is
 removed, and takes that page's URL with it.
 
-The API line below is plain text rather than a `ref`, because the reference page is
+The API line below is plain text, not a `ref`, because the reference page is
 generated from a CRD that doesn't exist yet and Hugo fails a `ref` it can't resolve.
 
 [design]: https://github.com/modelplaneai/modelplane/pull/363
@@ -27,8 +27,8 @@ for the whole fleet. Each engine's names are rewritten to one Modelplane vocabul
 way, so a dashboard doesn't care which engine produced a number. There's no `PodMonitor` to
 write and no per-cluster Prometheus to reach into.
 
-Metrics are what it collects today. The destination is named for telemetry rather than
-metrics because the same pipeline carries logs, which follow once the per-node collector
+Metrics are what it collects today. The destination is named for telemetry, not
+metrics, because the same pipeline carries logs, which follow once the per-node collector
 they need is running.
 
 Two things to set up: where the metrics go, and what engine each deployment runs.
@@ -71,8 +71,8 @@ can already reach, which for most fleets is the observability stack you run toda
 If some cluster can't reach it, give that cluster a destination it can reach. A destination
 with no `clusterSelector` covers every cluster; add one and it covers the clusters it
 matches, so an isolated region or a neocloud with no route to your network sends somewhere
-else rather than collecting nothing. Your fleet query then covers what shares a backend,
-which is the trade that split buys.
+else instead of collecting nothing. Your fleet query then covers what shares a backend,
+which is what the split costs you.
 
 A backend inside your own network usually needs two more things. If its certificate is
 signed by your own CA, name a Secret holding the bundle, and if your clusters egress through
@@ -104,7 +104,7 @@ spec:
 
 Modelplane provides rules for `vllm`, `sglang`, and `trtllm`. Leave `type` off and the
 engine's metrics still arrive, under their own names, and Modelplane reports that no
-mapping matched rather than guessing one.
+mapping matched instead of guessing one.
 
 ## Adding an engine Modelplane doesn't cover
 
@@ -159,7 +159,7 @@ Nothing here changes by serving shape. Modelplane scrapes engine pods by the
 workers, and a prefill/decode pair are all found the same way. Only the leader of a
 leader/worker gang carries the serving label, which is right: the workers serve no API and
 publish nothing. A decode engine listening on 8001 behind its routing sidecar is found by
-name rather than by number, which is what the old `targetPort` had to special-case.
+name and not by number, which the old `targetPort` had to special-case.
 
 One engine still needs a flag. SGLang publishes `/metrics` only when it runs with
 `--enable-metrics`, so add it to the engine args; vLLM needs nothing.

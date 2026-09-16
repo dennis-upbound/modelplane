@@ -50,9 +50,9 @@ kube-prometheus-stack on every workload cluster with `PodMonitor` discovery open
 namespaces, and everything after that is the operator's: write a `PodMonitor` that matches the
 serving shape, keep it in sync as that shape changes, and delete it on teardown. The published
 [collecting-engine-metrics]({{< ref "guides/collecting-engine-metrics.md" >}}) guide is that
-workflow written down, which is the evidence it is manual rather than a gap in the docs.
+workflow written down, which is the evidence it is manual, not a documentation gap.
 
-Three things are wrong with it, and they are what the proposal answers one for one.
+Three things are wrong with it, and the proposal answers each one.
 
 **Nothing is collected until someone wires it.** A deployment that nobody wrote a `PodMonitor`
 for publishes metrics that reach no one, and a deployment whose shape changed under one scrapes
@@ -65,8 +65,8 @@ per-cluster recording rules nobody owns.
 
 **Each cluster is an island.** The Prometheus is in-cluster and reachable by `port-forward`, so
 a fleet question has no single place to ask it. Answering "how is this model doing everywhere"
-means visiting N stores and merging the results by hand, which is the work the fleet exists to
-avoid.
+means visiting N stores and merging the results by hand, which is the work a fleet exists to
+save.
 
 ## Architecture
 
@@ -136,7 +136,7 @@ Two audiences read the result and only one of them operates it. A platform team 
 substrate, the roll-up and the control plane, and that is the destination they already run. A
 `ModelDeployment`'s author wants the first category for their own model, which the same series
 answer: every one carries `deployment`, `model`, `cluster` and `engine`, so their view is a
-filter on a dashboard rather than a separate pipeline. Modelplane runs no second, author-facing
+filter on a dashboard, not a separate pipeline. Modelplane runs no second, author-facing
 store, and the shipped dashboard is written to filter that way.
 
 Access to it is the platform team's to grant, which is also why an author gets no collection
@@ -184,7 +184,7 @@ Envoy proxies today through the Prometheus chart's `additionalScrapeConfigs`, wh
 receiver takes, so the Envoy target moves across verbatim rather than being rewritten.
 
 A cluster-wide selector on `modelplane.ai/serving` covers every engine of every
-deployment, so collection is a cluster property rather than something composed per
+deployment, so collection is a cluster property, not something composed per
 replica. A second selector covers the endpoint pickers, and a third the substrate
 `compose-serving-stack` installs, which is now stack-dependent: the LeaderWorkerSet
 controller on a `Standard` cluster, or Grove, the KAI Scheduler and the ModelExpress
@@ -195,9 +195,9 @@ through `k8s_cluster`, which is what the substrate question needs from it.
 Scrape the engine port by name and not by number, which needs a change first:
 `native.py`, `llmd.py`, and `grove.py` all compose `{"containerPort": 8000}` with no
 `name`, so the `__meta_kubernetes_pod_container_port_name` relabel has nothing to match.
-Naming it is a prerequisite of this design rather than something it can assume.
+Naming it is a prerequisite of this design, not something it can assume.
 
-Name it `http` and not `metrics`, since it is the one serving port rather than a dedicated
+Name it `http` and not `metrics`, since it is the one serving port, not a dedicated
 metrics one. Going by name at all is for prefill/decode: the decode engine serves on
 `_DECODE_ENGINE_PORT` (8001) because the pd-sidecar takes 8000, so matching 8000 by number
 scrapes the sidecar. By name, the scrape follows the engine on every pod, on every
@@ -209,7 +209,7 @@ optional metrics the collector turns on. A cache that fails to stage shows up wi
 component, and its convergence stays on the API as `Ready` and `Synced`. How full the
 volume is comes from `kubeletstats` and arrives with the DaemonSet tier, which matters
 less than it sounds: a cache volume is written once and read after, so an undersized one
-fails at hydration rather than climbing into trouble later.
+fails at hydration instead of climbing into trouble later.
 
 **GPU allocation comes from `k8s_cluster`, and the GPU itself comes from DCGM.**
 `k8s_cluster` reports allocatable and requested `nvidia.com/gpu`, which is what the
@@ -236,7 +236,7 @@ exporter is there.
 
 The collector renames each engine's series to a `modelplane_*` surface with a consistent
 label set (`engine`, `cluster`, `deployment`, `model`), so a dashboard reads one
-vocabulary. Latency matters most. Measure it on P50/P90/P99 rather than the mean. The
+vocabulary. Latency matters most. Measure it on P50/P90/P99, not the mean. The
 distribution is right-skewed, so the mean hides the tail. Keep inference-only separate
 from end-to-end.
 
@@ -261,7 +261,7 @@ from end-to-end.
 
 vLLM and SGLang map cleanly. Their names already nearly match, and both align to the
 OpenTelemetry set, so those two ship built in. Triton and TensorRT-LLM expose batch-manager
-stats rather than native TTFT and ITL histograms, so that column is derived or waiting on
+stats instead of native TTFT and ITL histograms, so that column is derived or waiting on
 newer TensorRT-LLM metrics. Shipping it as a third built-in would hand the first Triton
 user a mapping that doesn't map, so the docs carry it as a `MetricMapping` to write, with
 the gaps named. It is the extension point's first real use.
@@ -275,7 +275,7 @@ the convention needs no mapping at all.
 
 The standard stops at latency and tokens. Everything that answers "why is it slow" sits
 outside it: queue depth and queue time, the running and waiting split, KV-cache occupancy,
-and prefix-cache hit rate. That is what the normalized surface is for, rather than a
+and prefix-cache hit rate. That is what the normalized surface is for, not a
 preference for our own names, and where the convention already covers a series we do not
 rename it.
 
@@ -283,13 +283,13 @@ Inter-token latency and time per output token stay separate for the same reason.
 is in the standard; ITL is the per-token gap a streaming user feels, where TPOT is the
 amortized decode rate, so we carry both.
 
-Saturation is where the table earns its keep. Latency says a deployment is unhealthy and
+The saturation rows are the ones that explain a slow deployment. Latency says it is unhealthy;
 these say why. KV-cache occupancy approaching full forces the scheduler to preempt and
-recompute, which arrives as a latency cliff rather than a slope, and queue time separates
+recompute, which arrives as a latency cliff, not a slope, and queue time separates
 "the request waited" from "the model is slow". Prefix-cache hits need `prefix_cache_queries`
-as a denominator, which is why both are collected rather than the hit counter alone. vLLM
+as a denominator, so both are collected, not the hit counter alone. vLLM
 v1 exposes no preemption counter, so the cliff is inferred from occupancy and queue time
-rather than read directly. That is a gap in the engine, not one this design can close.
+and not read directly. That is a gap in the engine, not one this design can close.
 
 Under disaggregation the two roles show different health. A prefill worker is watched on
 `modelplane_time_to_first_token` and prefill-queue depth. A decode worker is watched on
@@ -327,7 +327,7 @@ inbound.
 
 Credentials are already solved. `ModelCache` propagates an `authSecret` from the control
 plane to every matched cluster so hydration can read a HuggingFace token. The destination's
-credential travels the same way, so this adds a Secret to propagate rather than a way to
+credential travels the same way, so this adds a Secret to propagate, not a way to
 propagate Secrets.
 
 **Nothing routes through the control plane, because nothing can run there.** A collector at
@@ -335,7 +335,7 @@ the control plane reads naturally, since the control plane is the thing that kno
 every cluster, and it is the shape to rule out first. A control plane hosts Crossplane and
 the API it serves, not workloads, and a hosted one schedules no pods at all, so there is
 nowhere to put a collector, a listener or the certificate it would need. It would be the
-wrong size anyway: Crossplane reconciles resources rather than carrying a stream that grows
+wrong size anyway: Crossplane reconciles resources, it does not carry a stream that grows
 with every engine pod.
 
 **The gateway doesn't rescue it either,** and it is the obvious next thought, since an
@@ -344,7 +344,7 @@ so routing OTLP through it means teaching Envoy a protocol it has no reason to k
 reach a collector that still has nowhere to run. It also couples telemetry to a component a
 fleet might deploy several of, or none of.
 
-**The destination is the operator's, which is the point.** It sits where their observability
+**The destination is the operator's.** It sits where their observability
 already is, inside their network as often as not, so a cluster that can reach their backend
 needs no path anywhere else. Exporting direct also removes a hop that can fail and leaves a
 cluster's telemetry working while the control plane is upgrading.
@@ -360,7 +360,7 @@ reconcile state stays on the API regardless, as `Ready` and `Synced` on every XR
 turns those conditions into series for an operator who wants to alert on them. It is a
 Deployment, so it runs where Crossplane does and inherits the same constraint.
 
-That is also why the roll-up counts replicas ready against desired rather than degraded
+That is also why the roll-up counts replicas ready against desired instead of degraded
 deployments. Replica state comes from `k8s_cluster` on the workload clusters, where a
 deployment's degraded-ness is a condition on an XR the control plane holds. The gap between
 them is a deployment the fleet scheduler never placed, which shows on the API and not in
@@ -375,22 +375,22 @@ answer than a mode field on the API.
 ### What aggregates, and where
 
 With no collector in the middle, the destination aggregates. That is a change of owner
-rather than of capability: `sum` across clusters and a histogram merge are what every
+and not of capability: `sum` across clusters and a histogram merge are what every
 Prometheus-compatible backend does, and Modelplane's job is to make them answerable by
 naming the series the same way everywhere and stamping the same dimensions on them.
 
-So the `modelplane_*` roll-up is a set of queries Modelplane ships rather than a collector
+So the `modelplane_*` roll-up is a set of queries Modelplane ships, not a collector
 it runs. Capacity, GPU allocation, GPU-hours and replicas ready against desired are sums
 over the fleet. Metering is split, and Modelplane publishes only its half: GPU-hours per
 `ModelDeployment`, because it owns the pools, and tokens per request, because the gateway
-reads them. It prices neither, which is why cost is absent from this roll-up. SLO
+reads them. It prices neither, so cost is absent from this roll-up. SLO
 attainment, the fraction of requests under a TTFT target, is a ratio of buckets in the
 merged histogram, which works because Modelplane owns the histogram boundaries and puts one
 on the target. Modelplane runs no store and now hosts no pipeline either.
 
 Those queries ship as documentation, with a Grafana dashboard built on them, since a
 Prometheus-compatible store is the common destination. An operator points it at their
-backend rather than writing the fleet math themselves. The one requirement that puts on a
+backend instead of writing the fleet math themselves. The one requirement that puts on a
 destination is that it sums across clusters and merges histogram buckets, which every OTLP
 backend and every Prometheus-compatible store does, so it is the population the two
 exporters below already reach.
@@ -401,7 +401,7 @@ The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, taken by any
 OpenTelemetry-compatible backend. `prometheusremotewrite` covers an operator who wants the
 series in a Prometheus-compatible store instead. Vendor-specific exporters are out of
 scope: an operator who wants one puts a collector of their own in front of it, which is one
-configuration for the fleet rather than one per cluster, and keeps that dependency out of
+configuration for the fleet instead of one per cluster, and keeps that dependency out of
 every GPU cluster.
 
 A Modelplane user does not write collector YAML. The destination is fleet-level
@@ -409,11 +409,11 @@ configuration, one endpoint to match one view, propagated to each cluster's `Ser
 and rendered into the collector's config there.
 
 **That configuration is a cluster-scoped `TelemetryDestination`,** and its shape is
-borrowed rather than invented. Grafana's Kubernetes monitoring chart calls the same thing a
+borrowed, not invented. Grafana's Kubernetes monitoring chart calls the same thing a
 [destination](https://github.com/grafana/k8s-monitoring-helm/blob/main/charts/k8s-monitoring/docs/destinations/README.md)
 and gives it a type, an endpoint and an auth block backed by a Secret, and Crossplane's
 `StoreConfig` and every `ProviderConfig` are cluster-scoped with a `credentials.secretRef`.
-A kind rather than a field, because nothing fleet-level holds the field: `InferenceCluster`
+A kind, not a field, because nothing fleet-level holds one: `InferenceCluster`
 and `InferenceClass` are each a piece of the fleet, so a field on either stores one fleet
 fact N times. Grafana puts destinations in Helm values because it ships a chart, and a
 config XRD is how a Crossplane package expresses the same thing. So:
@@ -435,7 +435,7 @@ spec:
 ```
 
 `type` discriminates with a CEL rule the way `ModelCache.spec.source` does:
-`self.type != 'OTLP' || has(self.otlp)`. The variant object earns its place on its first
+`self.type != 'OTLP' || has(self.otlp)`. The variant object pays for itself on its first
 field, since OTLP is gRPC or HTTP and remote write is neither. `auth.type` starts with the
 three that cover most backends, where Grafana's chart also carries `oauth2` and `sigv4`.
 The Secret resolves in `modelplane-system`, the way `InferenceCluster` resolves a kubeconfig.
@@ -445,7 +445,7 @@ from each cluster's collector to `endpoint`, gRPC on 4317 or HTTP on 4318 by con
 nothing on the cluster listens. Two things break that in exactly the networks this shape exists
 for. A backend inside an operator's own network is often signed by a private CA the collector
 has no reason to trust, and a cluster that egresses through a corporate proxy reaches nothing
-until it is told so. Both belong on the destination rather than in a collector config an
+until it is told so. Both belong on the destination, not in a collector config an
 operator patches by hand:
 
 ```yaml
@@ -456,7 +456,7 @@ spec:
   proxyURL: http://proxy.acme.example:3128
 ```
 
-`proxyURL` renders to the standard proxy variables on the collector rather than into one
+`proxyURL` renders to the standard proxy variables on the collector, not into one
 exporter's settings, so it covers every exporter in the pipeline at once. There is deliberately
 no `insecure` flag to skip verification: it is the kind of thing that gets set to reach a
 backend during a bring-up and is still set two years later, and naming a CA is the same amount
@@ -488,15 +488,15 @@ with a selector covers the isolated clusters, and a cluster matched by several e
 one exporter per destination in the same pipeline, which is also how an operator moves between
 backends without a gap.
 
-The cost is honest and worth stating: a fleet whose clusters export to different backends has
+The cost: a fleet whose clusters export to different backends has
 no single place the fleet query runs. That is not something this design can fix, because it is
-a property of the network the operator has rather than of the pipeline. What it can do is make
-the split deliberate and visible, in a selector someone wrote, rather than a cluster quietly
+a property of the operator's network, not of the pipeline. What it can do is make
+the split deliberate and visible, in a selector someone wrote, instead of a cluster quietly
 collecting nothing. Where the split is unwanted, the answer is a collector the isolated cluster
-can reach that forwards to the main backend, which is the operator's hop to run and needs
+can reach that forwards to the main backend. That hop is the operator's to run and needs
 nothing here.
 
-The name is telemetry rather than metrics. An OTLP endpoint carries metrics, logs and
+The name is telemetry, not metrics. An OTLP endpoint carries metrics, logs and
 traces on the same wire, so the destination is signal-agnostic and `MetricsDestination`
 would describe it narrower than it is. Creating one is the first thing a user does, since
 nothing is collected until a destination exists, so it is also the first thing the docs
@@ -504,7 +504,7 @@ describe.
 
 ### Logs
 
-A `TelemetryDestination` names a destination rather than a metrics endpoint because the same
+A `TelemetryDestination` names a destination, not a metrics endpoint because the same
 pipeline carries the other signals. Logs are the one with a decision attached, so the shape is
 recorded here even though metrics land first.
 
@@ -512,7 +512,7 @@ Two kinds travel under the name and they are not alike. Component logs are what 
 gateway and the controllers write to stderr. They earn their place the way they always do: a
 metric says a deployment is failing, and the log says the engine could not find the weights.
 Reading them is the `filelog` receiver, which is node-scoped, so they arrive with the DaemonSet
-tier rather than the first cut. That tier is what node CPU, memory and disk wait for too, and
+tier, not the first cut. That tier is what node CPU, memory and disk wait for too, and
 logs are what make it worth running.
 
 GenAI events are the other kind. The conventions define
@@ -525,7 +525,7 @@ completion are orders of magnitude bigger than a metric sample, and they are use
 which makes them a consent and retention question before a volume one. So it is off by default
 and stays off until an operator turns it on, and this design records the questions rather than
 answering them: what consent it needs, how long it may be kept, and whether sampling a share of
-requests is enough. Emitting metrics about a request needs none of that, which is why metrics
+requests is enough. Emitting metrics about a request needs none of that, so metrics
 do not wait on it.
 
 The cardinality cost that shapes the metric labels does not carry over. A label added to a
@@ -899,7 +899,7 @@ exporters:
 ```
 
 An unmapped engine matches the scrape config and no `transform` block, so it arrives under
-its own names. That is the degradation above, and the structure gives it rather than a
+its own names. That is the degradation above, and the structure gives it instead of a
 rule having to.
 
 All of this was built and run in
@@ -942,5 +942,5 @@ one still forming.
 
 A scheduler's mapping is a `MetricMapping` like an engine's, and the degradation rule
 carries over, punctuation caveat included. A fleet that brought Volcano writes one mapping,
-which is the mechanism working rather than a new problem.
+which is the mechanism working, not a new problem.
 
