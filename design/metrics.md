@@ -32,7 +32,7 @@ spec:
 ```
 
 From there `modelplane_time_to_first_token_seconds` means one thing on every cluster, and
-`sum(modelplane_gpu_hours_total)` answers for the fleet at one endpoint.
+`modelplane:gpu_hours:1h` answers for the fleet at one endpoint.
 
 This document is about metrics. Logs and traces travel their own path and are out of scope.
 
@@ -114,7 +114,6 @@ section a question with an answer rather than a survey.
 | `modelplane_replicas_unschedulable` | gauge | replicas |
 | `modelplane_gpus_allocatable` | gauge | GPUs |
 | `modelplane_gpus_allocated` | gauge | GPUs |
-| `modelplane_gpu_hours_total` | counter | GPU-hours |
 | `modelplane_stack_component_up` | gauge | 0 or 1 |
 
 Each carries `cluster`, and a series about a deployment also carries `deployment`, `namespace`,
@@ -128,8 +127,8 @@ added: a caller is unbounded by construction.
 Three decisions are visible in that list.
 
 Hit rate is two counters and not a ratio, because a ratio cannot be re-aggregated and two
-counters can. GPU-hours is a counter and not a gauge with an instruction attached, because
-integrating an allocation over time is work this design does rather than work it leaves.
+counters can. GPU-hours is not in the table at all: it is an allocation integrated over time,
+so it is a recorded series rather than a collected one, and the tier below produces it.
 
 And `modelplane_replicas_unschedulable` is here because the gap between desired and ready is
 the failure a fleet hides best. A GPU pool that cannot satisfy a claim leaves every replica
@@ -279,22 +278,32 @@ only it can answer, each a rule over series every cluster now agrees on:
 Each needs a window, a series that persists, or both:
 
 ```yaml
-- record: modelplane_gpu_hours_total
-  expr: sum by (cluster, deployment) (modelplane_gpus_allocated) / 3600
-
-- record: modelplane_slo_attainment_ratio
+- record: modelplane:slo_attainment:ratio5m
   expr: |
     sum by (model) (rate(modelplane_time_to_first_token_seconds_bucket{le="1.0"}[5m]))
       / sum by (model) (rate(modelplane_time_to_first_token_seconds_count[5m]))
 
-- record: modelplane_gpu_allocation_ratio
+- record: modelplane:gpu_allocation:ratio
   expr: sum by (cluster) (modelplane_gpus_allocated)
           / sum by (cluster) (modelplane_gpus_allocatable)
 
-- record: modelplane_tokens_per_gpu_second
+- record: modelplane:tokens_per_gpu:rate5m
   expr: sum by (model) (rate(modelplane_tokens_total{kind="output"}[5m]))
           / sum by (model) (modelplane_gpus_allocated)
+
+- record: modelplane:gpu_hours:1h
+  expr: avg_over_time(sum by (cluster, deployment) (modelplane_gpus_allocated)[1h:])
 ```
+
+A recorded series is named `modelplane:thing:operation`, the convention Prometheus uses for
+one, so nothing a rule produced can be mistaken for something a cluster collected.
+
+GPU-hours is the awkward one and the naming says why. Average allocation over an hour is
+GPU-hours for that hour, which is what the rule computes, and it is a windowed figure rather
+than a counter that only goes up. A monotonic total would need something incrementing it on
+every evaluation, which is a component this design does not add. A backend that wants a
+lifetime total sums the hourly series, which is the same arithmetic in the place that already
+stores them.
 
 None of these is a rename. Each needs a rate over a window, a division across two series, or an
 integral, and the series they read come from clusters that do not know about each other. That
