@@ -1,14 +1,18 @@
 ---
-title: Collect metrics
-weight: 25
+title: Telemetry
+weight: 20
 draft: true
-description: Collect engine, router, and cluster metrics across the fleet and send them to one destination.
+aliases:
+- /guides/collecting-engine-metrics/
+description: Collect engine, router, and cluster telemetry across the fleet and send it to one destination.
 ---
 <!-- vale write-good.Passive = NO -->
 {{< hint warning >}}
-**Draft.** This page documents [the metrics design][design], which isn't built yet.
-It's here to check the API reads well before it's implemented, and it's excluded from
-the site by `draft: true`. Remove this page before merging the design.
+**Draft.** This page documents [the metrics design][design], which isn't built yet. It's
+here to check the API reads well before it's implemented, and it's excluded from the site
+by `draft: true`. It replaces [Collecting engine metrics]({{< ref
+"guides/collecting-engine-metrics.md" >}}) when the per-cluster Prometheus stack is
+removed, and takes that page's URL with it.
 
 The API line below is plain text rather than a `ref`, because the reference page is
 generated from a CRD that doesn't exist yet and Hugo fails a `ref` it can't resolve.
@@ -139,10 +143,23 @@ Your control plane's own health comes from wherever you run it. A self-hosted Cr
 serves `/metrics` on its core, provider, and function pods for your own cluster scrape to
 pick up. A hosted control plane reports its health through whoever hosts it.
 
+## Other engine shapes
+
+Nothing here changes by serving shape. Modelplane scrapes engine pods by the
+`modelplane.ai/serving` label it stamps and by port name, so a single pod, a leader and its
+workers, and a prefill/decode pair are all found the same way. Only the leader of a
+leader/worker gang carries the serving label, which is right: the workers serve no API and
+publish nothing. A decode engine listening on 8001 behind its routing sidecar is found by
+name rather than by number, which is what the old `targetPort` had to special-case.
+
+One engine still needs a flag. SGLang publishes `/metrics` only when it runs with
+`--enable-metrics`, so add it to the engine args; vLLM needs nothing.
+
 ## Migrating from a hand-written `PodMonitor`
 
-Earlier versions had you write a `PodMonitor` and reach into the in-cluster Prometheus.
-Both are gone. Delete the `PodMonitor`: with the Prometheus operator no longer installed
+[Collecting engine metrics]({{< ref "guides/collecting-engine-metrics.md" >}}) had you write
+a `PodMonitor` and reach into the in-cluster Prometheus over a `port-forward`. Both are
+gone, and this page replaces that one. Delete the `PodMonitor`: with the Prometheus operator no longer installed
 it stops working, and it stops working quietly. Queries you used to run against that
 Prometheus move to whatever consumes your destination.
 <!-- vale write-good.Passive = YES -->

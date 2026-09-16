@@ -870,7 +870,9 @@ The [#264](https://github.com/modelplaneai/modelplane/issues/264) example docume
 manual path, and it is the published `collecting-engine-metrics` guide. Both halves of that
 workflow go: the hand-written `PodMonitor`, because discovery moves into the collector's
 scrape config, and the port-forward to the in-cluster Prometheus, because there is no
-longer one. Rewriting that guide is part of the removal rather than a follow-up.
+longer one. The replacement is written already, as the draft `telemetry` guide in this
+change, which takes that page's URL when the removal lands. Its rewrite is part of the
+removal rather than a follow-up.
 
 A hand-written `PodMonitor` left in place is inert once the Prometheus Operator is gone, so
 it stops working rather than double-scraping, which is quieter and worse. An operator
