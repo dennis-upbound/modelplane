@@ -151,44 +151,58 @@ Derived is the path; declared is the escape.
 An engine with no matching mapping is still collected, under its own names, and the cluster
 reports that nothing matched.
 
-### Reconcile engines in the pipeline, not in the reader's queries
+### Make a metric a definition, not a rename
 
-Renaming is not always enough. Two engines can measure the same thing and report it in
-shapes that do not line up, and where that happens Modelplane reconciles it before export.
-Otherwise the operator inherits the problem the vocabulary was supposed to solve.
+A `modelplane_*` metric is a definition: what is measured, and where in the stack it is
+measured. `modelplane_requests_waiting` is requests admitted to an engine and not yet being
+decoded, on any engine, under any stack. A mapping's job is to find the series that already
+means that. Renaming is what it usually takes, and it is not what makes the vocabulary true.
 
-What that takes, and where it happens:
+Three things happen when a source does not already match the definition.
 
-| Needed | Where |
-|---|---|
-| Rename a series | pipeline, `transform` |
-| Drop a label and merge the series that collide | pipeline, `metricstransform` |
-| Convert a unit, scale a value | pipeline, `transform` |
-| Derive a metric from two others, such as a hit rate from hits and queries | pipeline, `metricsgeneration` |
-| Sum or combine several series into one | pipeline, `metricstransform` |
-| Convert a counter between cumulative and delta | pipeline, `cumulativetodelta` |
-| `rate()` over a window | query |
-| `histogram_quantile()` | query |
+**Modelplane reconciles it before export** where the difference is mechanical. An engine
+reporting a KV cache as used and total tokens instead of a fraction, a counter where another
+engine has a gauge, seconds where another has milliseconds: each is arithmetic on what arrived,
+and it belongs in the pipeline.
 
-The line falls where a reader would not expect to do the work themselves. `rate()` on a
-counter and `histogram_quantile()` on a histogram are how anyone uses those instrument
-types, in any project. Joining two of our metrics to recover a number we could have
-published is not, so Modelplane publishes it.
+| Needed | Where | |---|---| | Rename a series | pipeline, `transform` | | Drop a label and
+merge the series that collide | pipeline, `metricstransform` | | Convert a unit, scale a value
+| pipeline, `transform` | | Derive one metric from two, a hit rate from hits and queries |
+pipeline, `metricsgeneration` | | Sum or combine several series into one | pipeline,
+`metricstransform` | | Convert a counter between cumulative and delta | pipeline,
+`cumulativetodelta` | | `rate()` over a window | query | | `histogram_quantile()` | query |
 
-The collector does more than rename because of the second and fourth rows. Dropping `pod`
-requires merging the series that then collide, or the result is undefined points instead of
-a sum. And `metricsgeneration` applies an arithmetic operation across two metrics, which is
-what makes `modelplane_prefix_cache_hit_rate` a metric Modelplane publishes rather than a
-division an operator writes.
+The line falls where a reader would not expect to do the work. `rate()` on a counter and
+`histogram_quantile()` on a histogram are how anyone uses those instrument types in any
+project. Joining two of our metrics to recover a number we could have published is not, so we
+publish it.
 
-One case resists both the pipeline and the query. A histogram can only be merged across
-engines when its bucket boundaries match, and a quantile over misaligned buckets is wrong
-rather than approximate. vLLM's time-to-first-token buckets are the boundaries the
-OpenTelemetry GenAI conventions define. SGLang's are the same up to 0.1 seconds and diverge
-above it. Where an engine's buckets match the convention, its histograms merge with any
-other engine's; where they do not, `modelplane_time_to_first_token` is sound per engine and
-unsound across them. Modelplane reports which, and the fix is the engine adopting the
-convention.
+**A different measurement gets a different metric.** This is what keeps the vocabulary honest
+across layers, where it is easiest to get wrong. Both stacks Modelplane composes queue requests
+in more than one place: an llm-d cluster has a queue at the engine and a view of pending work
+in the endpoint picker, and a Dynamo cluster has a queue at the engine and another in its
+router. Sourcing `modelplane_requests_waiting` from the engine on one stack and the router on
+the other would give one name two meanings, and a fleet query over both would return a number
+that is not anything.
+
+So the definition pins the layer. Engine queueing is `modelplane_requests_waiting` whatever
+runs in front of it. Router queueing, where a router queues, is
+`modelplane_router_queue_depth`. An operator comparing a Dynamo cluster to an llm-d one
+compares like with like, and a stack that has no router publishes no router metric, which is
+the honest answer rather than a zero.
+
+**Where neither works, the metric is absent and the status says so.** Triton and TensorRT-LLM
+publish batch-manager statistics and no time-to-first-token histogram, and nothing in a
+pipeline reconstructs a distribution from aggregates. `modelplane_time_to_first_token` is
+missing on that engine. A dashboard with a gap tells an operator something true; one backfilled
+from a number that means something else does not.
+
+Histograms carry that limit even between engines that both publish one. Buckets merge only when
+their boundaries match, and a quantile over misaligned buckets is wrong rather than
+approximate. vLLM's time-to-first-token boundaries are the ones the OpenTelemetry GenAI
+conventions define. SGLang's match to 0.1 seconds and diverge above. So the metric is sound per
+engine and unsound across a fleet mixing the two, Modelplane reports which engines agree with
+the convention, and the fix is upstream adoption rather than anything this design can do.
 
 ### Export to one destination
 
