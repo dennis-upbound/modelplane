@@ -22,10 +22,14 @@ generated from a CRD that doesn't exist yet and Hugo fails a `ref` it can't reso
 
 **API:** `modelplane.ai/v1alpha1` · TelemetryDestination, MetricMapping
 
-Modelplane collects metrics from everything it runs and sends them to a single
-destination for the whole fleet. Each engine's names are rewritten to one Modelplane
-vocabulary on the way, so a dashboard doesn't care which engine produced a number.
-There's no `PodMonitor` to write and no per-cluster Prometheus to reach into.
+Modelplane collects metrics from everything it runs and sends them to a single destination
+for the whole fleet. Each engine's names are rewritten to one Modelplane vocabulary on the
+way, so a dashboard doesn't care which engine produced a number. There's no `PodMonitor` to
+write and no per-cluster Prometheus to reach into.
+
+Metrics are what it collects today. The destination is named for telemetry rather than
+metrics because the same pipeline carries logs, which follow once the per-node collector
+they need is running.
 
 Two things to set up: where the metrics go, and what engine each deployment runs.
 
