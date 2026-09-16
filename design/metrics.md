@@ -31,8 +31,8 @@ spec:
       name: telemetry-destination
 ```
 
-From there `modelplane_time_to_first_token` means the same thing on every cluster, for
-every engine, and one query answers across the fleet.
+From there `modelplane_time_to_first_token` means one thing wherever it appears, and one
+query answers across the fleet.
 
 ## Background
 
@@ -167,16 +167,15 @@ When a source already means what a definition says, the mapping renames it. When
 one of three things happens: Modelplane reconciles it in the pipeline, or the source gets a
 metric of its own, or the metric is absent on that engine and the status says so.
 
-Nothing is left for the reader except `rate()` and `histogram_quantile()`, which is how anyone
-uses a counter or a histogram in any project. The test is what a reader has to know. Writing
-`sum by (cluster)` over `modelplane_kv_cache_usage` is using a metrics system; knowing that the
-number is a fraction on one engine and a token count on another is not, so that is settled
-before it leaves the cluster.
+Nothing is left for the reader except `rate()` and `histogram_quantile()`. The test is what a
+reader has to know: averaging `modelplane_kv_cache_usage` across clusters is using a metrics
+system, and knowing that one engine counts its cache hit rate since startup while another
+counts it right now is not. That is settled before the data leaves the cluster.
 
-That separates two things both called aggregation. Reconciling engines is semantic and it is
-ours, and an operator should never learn which engines differ or how. Summing across clusters
-is dimensional. Counters and gauges sum across the fleet unconditionally. Histograms
-carry a condition, below, and the roll-up is built to respect it.
+It separates two things both called aggregation. Reconciling engines is semantic and it is
+ours, and an operator should never learn which engines differ or how. Combining across clusters
+is dimensional, and it follows the instrument: a counter or an absolute gauge sums, a fraction
+like `modelplane_kv_cache_usage` averages, and a histogram carries the further condition below.
 
 **Modelplane reconciles it in the pipeline** where the difference is mechanical.
 `modelplane_prefix_cache_hit_rate` is defined as the share of lookups served from cache over an
@@ -221,10 +220,8 @@ scales, `metricstransform` merges the series that collide when a label is droppe
 counter's shape. None of it holds history, which is why `rate()` and `histogram_quantile()`
 stay with the reader.
 
-The line falls where a reader would not expect to do the work. `rate()` on a counter and
-`histogram_quantile()` on a histogram are how anyone uses those instrument types in any
-project. Joining two of our metrics to recover a number we could have published is not, so we
-publish it.
+Joining two of our metrics to recover a number we could have published is work a reader should
+not be doing, so we publish it.
 
 **A different measurement gets a different metric.** This is what keeps the vocabulary honest
 across layers, where it is easiest to get wrong. Both stacks Modelplane composes queue requests
@@ -308,13 +305,16 @@ modelplane_time_to_first_token_bucket{engine="vllm", cluster="prod-us-east",
   deployment="qwen3-8b", model="Qwen/Qwen3-8B", namespace="ml-team", le="0.25"} 1841
 ```
 
-So the fleet's p99 is one query, grouped by engine for the reason the previous section gives,
-and dropping `cluster` from the grouping narrows it without changing anything else:
+So a model's p99 across the fleet is one query, grouped by engine for the reason the previous
+section gives:
 
 ```promql
-histogram_quantile(0.99, sum by (le, engine, cluster) (
+histogram_quantile(0.99, sum by (le, engine) (
   rate(modelplane_time_to_first_token_bucket{model="Qwen/Qwen3-8B"}[5m])))
 ```
+
+A `cluster="prod-us-east"` matcher narrows it to one cluster, and adding `cluster` to the
+grouping breaks it out per cluster. Neither changes the shape.
 
 Modelplane ships the
 fleet queries and a Grafana dashboard built on them: capacity, GPU allocation, GPU-hours,
