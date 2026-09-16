@@ -99,10 +99,11 @@ requested `nvidia.com/gpu`.
 
 Collection is always on because it is cheap against what it watches. A vLLM 0.23.0 pod
 publishes 359 metric lines, counted from a live scrape. Fifty engine pods with their pickers,
-gateway, substrate and GPU exporters come to roughly 40,000 series, which a managed Prometheus
-bills at about $6.50 per thousand series a month, so near $640. Fifty A100s cost between
-$40,000 and $125,000 a month depending on where they run. Telemetry is about one percent of the
-GPUs it watches.
+gateway, substrate and GPU exporters reach under 40,000 series before the pod labels below are
+dropped, and far fewer after, since fifty replicas of one deployment collapse into one series
+set. At about $6.50 per thousand active series a month that is an upper bound near $260,
+against fifty A100s at between $40,000 and $125,000 a month. Telemetry costs well under one
+percent of the GPUs it watches.
 
 Cardinality holds at that ratio because of one decision. `pod`, `pod_uid` and `container_id`
 are dropped before export, since a billing backend counts a series as active for fifteen to
@@ -205,8 +206,7 @@ metadata:
   name: sglang
 spec:
   prefix: "sglang:"
-  rename:
-    sglang:time_to_first_token_seconds: modelplane_time_to_first_token
+  rename:                                 # no TTFT: buckets diverge above 0.1s
     sglang:time_per_output_token_seconds: modelplane_time_per_output_token
     sglang:e2e_request_latency_seconds: modelplane_e2e_request_latency
     sglang:num_queue_reqs: modelplane_requests_waiting
@@ -255,19 +255,19 @@ from a number that means something else does not.
 
 Histograms carry that limit even between engines that both publish one. Buckets merge only when
 their boundaries match, and a quantile over misaligned buckets is wrong rather than
-approximate. Modelplane's boundaries are the ones the OpenTelemetry GenAI conventions define.
-vLLM's are those boundaries already. SGLang's match to 0.1 seconds and diverge above.
+approximate. Modelplane's boundaries are the ones the OpenTelemetry GenAI conventions define,
+and vLLM's are already those.
 
-So a quantile is sound across every engine that follows the convention and unsound across a
-fleet mixing one that does with one that does not. The roll-up takes that as a constraint
-rather than a caveat: every quantile Modelplane ships groups by `engine`, which is correct
-whatever the fleet runs and collapses to one line where one engine runs everywhere. A fleet of
-conforming engines can drop the grouping and get a single fleet-wide number.
+So bucket alignment is a condition of the metric, not a caveat on reading it. A histogram whose
+boundaries match the convention maps to `modelplane_time_to_first_token`. One whose boundaries
+do not is absent on that engine, which is the third outcome above and the same answer Triton
+gets. SGLang's match to 0.1 seconds and diverge above, so SGLang publishes no
+`modelplane_time_to_first_token` until it adopts the convention, and `status` says so.
 
-`status` names the engines whose buckets match the convention, so an operator can tell which of
-the two they have. Making a non-conforming engine match is upstream work, and it is the only
-thing that turns a mixed fleet's quantile into one number.
-
+That is a real cost and it is the right one. An operator running SGLang loses a panel and knows
+it. The alternative, publishing the histogram and telling every reader to group by engine and
+check which engines conform, moves the problem into every query anyone writes and puts the
+engine-specific knowledge back in the reader's head.
 ### Export to one destination
 
 Every cluster's collector exports straight to the destination. Modelplane holds one
@@ -418,7 +418,8 @@ is exactly the knowledge the vocabulary exists to hold.
 **A per-deployment collection toggle.** An `enabled` field on a `ModelDeployment` lets a team
 decline collection they do not want, which is how most of Modelplane's API works: the team that
 owns a resource configures it. Telemetry does not divide that way. Its cost, its destination
-and its retention belong to the platform team, and at about one percent of GPU spend the saving
+and its retention belong to the platform team, and at well under one percent of GPU spend the
+saving
 is a fraction of a fraction. A toggle would also cover only the data plane, leaving the
 substrate and the roll-up collected anyway, so a fleet view would have holes no one could
 predict from the resources.
