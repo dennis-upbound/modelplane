@@ -63,7 +63,7 @@ Nothing leaves the cluster. The store is in-cluster and reachable by `port-forwa
 fleet question has no single place to ask it. Answering "how is this model doing
 everywhere" means visiting each cluster and merging by hand.
 
-The published [collecting-engine-metrics]({{< ref "guides/collecting-engine-metrics.md" >}})
+The published [collecting-engine-metrics](../docs/content/guides/collecting-engine-metrics.md)
 guide is that workflow written down.
 
 ## Goals
@@ -97,11 +97,12 @@ GPU Operator's on some, and `InferenceCluster.spec.gpuTelemetry` names one where
 runs something else. Allocation comes from `k8s_cluster`, which reports allocatable and
 requested `nvidia.com/gpu`.
 
-Collection is always on because it is cheap against what it watches. One vLLM pod publishes
-359 metric lines. Fifty engine pods with their pickers, gateway, substrate and GPU
-exporters come to roughly 40,000 series, about $640 a month on a managed Prometheus. Fifty
-A100s cost between $40,000 and $125,000 a month. Telemetry is about one percent of the GPUs
-it watches, and a per-deployment opt-out saves a fraction of that one percent.
+Collection is always on because it is cheap against what it watches. A vLLM 0.23.0 pod
+publishes 359 metric lines, counted from a live scrape. Fifty engine pods with their pickers,
+gateway, substrate and GPU exporters come to roughly 40,000 series, which a managed Prometheus
+bills at about $6.50 per thousand series a month, so near $640. Fifty A100s cost between
+$40,000 and $125,000 a month depending on where they run. Telemetry is about one percent of the
+GPUs it watches, and a per-deployment opt-out saves a fraction of that one percent.
 
 Cardinality holds at that ratio because of one decision. `pod`, `pod_uid` and `container_id`
 are dropped before export, since a billing backend counts a series as active for fifteen to
@@ -162,28 +163,31 @@ measured. `modelplane_requests_waiting` is requests admitted to an engine and no
 decoded, on any engine, under any stack. A mapping's job is to find the series that already
 means that. Renaming is what it usually takes, and it is not what makes the vocabulary true.
 
-The work of making that true happens in one of three places.
+When a source already means what a definition says, the mapping renames it. When it does not,
+one of three things happens: Modelplane reconciles it in the pipeline, or the source gets a
+metric of its own, or the metric is absent on that engine and the status says so.
 
-Modelplane's pipeline holds everything that makes a metric mean the same thing on every engine.
-The reader's query holds `rate()` and `histogram_quantile()`, which is how anyone uses a
-counter or a histogram in any project. Nothing holds the case where two engines cannot be
-reconciled at all, and the document says which those are instead of hiding them.
+Nothing is left for the reader except `rate()` and `histogram_quantile()`, which is how anyone
+uses a counter or a histogram in any project. The test is what a reader has to know. Writing
+`sum by (cluster)` over `modelplane_kv_cache_usage` is using a metrics system; knowing that the
+number is a fraction on one engine and a token count on another is not, so that is settled
+before it leaves the cluster.
 
-The test is what a reader has to know. Writing `sum by (cluster)` over
-`modelplane_kv_cache_usage` is using a metrics system. Knowing that the number means a fraction
-on vLLM and a token count on SGLang is not, so we settle that before it leaves the cluster.
+That separates two things both called aggregation. Reconciling engines is semantic and it is
+ours, and an operator should never learn which engines differ or how. Summing across clusters
+is dimensional, a `sum()` over metrics that already agree, which every Prometheus-compatible
+store does.
 
-That also separates two things both called aggregation. Reconciling engines is semantic, and it
-is ours: an operator should never learn which engines differ or how. Summing across clusters
-for a fleet view is dimensional, and it is a `sum()` over metrics that already agree, which
-every Prometheus-compatible store does and none of which is knowledge we are handing over.
+**Modelplane reconciles it in the pipeline** where the difference is mechanical.
+`modelplane_prefix_cache_hit_rate` is defined as the share of lookups served from cache over an
+engine's lifetime, and vLLM publishes the two counters it comes from, so the vLLM mapping above
+divides them. That is what `derive` is for, and no rename reaches it.
 
-Three things follow when a source does not already match a definition.
-
-**Modelplane reconciles it before export** where the difference is mechanical, and a mapping
-says how. Prefix-cache hit rate is the case that shows why renaming alone does not carry a
-vocabulary. The vLLM mapping above divides two counters to reach
-`modelplane_prefix_cache_hit_rate`. SGLang publishes the rate itself, so its mapping renames:
+**A source that measures something else gets its own metric.** SGLang publishes
+`sglang:cache_hit_rate`, which reads as the same thing and is not: it is a gauge of the rate
+right now, where the vLLM figure is a ratio since the engine started. Renaming it into
+`modelplane_prefix_cache_hit_rate` would put two measurements under one name, and a fleet query
+over both would average a lifetime against an instant. So SGLang's mapping leaves it alone.
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -199,11 +203,11 @@ spec:
     sglang:num_queue_reqs: modelplane_requests_waiting
     sglang:num_running_reqs: modelplane_requests_running
     sglang:token_usage: modelplane_kv_cache_usage
-    sglang:cache_hit_rate: modelplane_prefix_cache_hit_rate
 ```
 
-One metric, two engines, and only one of them a rename. That asymmetry is the rule and not
-the exception, which is why a mapping carries more than a rename table.
+Two engines, one apparent metric, and the right answer is a derivation on one and silence on
+the other. A mapping carries more than a rename table because of the first case, and a
+vocabulary stays true because of the second.
 
 `derive` takes the arithmetic the OpenTelemetry `metricsgeneration` processor supports, an
 operation over two operand metrics, and `scale` multiplies one series by a constant for an
@@ -211,16 +215,11 @@ engine reporting milliseconds where another reports seconds. Between them they c
 mechanical differences, and an operator writing a mapping for an engine Modelplane has never
 seen reaches the same two fields we do.
 
-| Needed | Where |
-|---|---|
-| Rename a series | pipeline, `transform` |
-| Drop a label and merge the series that collide | pipeline, `metricstransform` |
-| Convert a unit, scale a value | pipeline, `transform` |
-| Derive one metric from two | pipeline, `metricsgeneration` |
-| Sum or combine several series into one | pipeline, `metricstransform` |
-| Convert a counter between cumulative and delta | pipeline, `cumulativetodelta` |
-| `rate()` over a window | query |
-| `histogram_quantile()` | query |
+The collector does the pipeline half with processors it already ships: `transform` renames and
+scales, `metricstransform` merges the series that collide when a label is dropped,
+`metricsgeneration` applies an operation across two metrics, and `cumulativetodelta` converts a
+counter's shape. None of it holds history, which is why `rate()` and `histogram_quantile()`
+stay with the reader.
 
 The line falls where a reader would not expect to do the work. `rate()` on a counter and
 `histogram_quantile()` on a histogram are how anyone uses those instrument types in any
@@ -294,8 +293,22 @@ deliberate beats a cluster quietly collecting nothing.
 
 ### What an operator reads
 
-Every series carries `engine`, `cluster`, `model`, `deployment` and `namespace`, so one
-query spans the fleet and the same query narrows to one deployment. Modelplane ships the
+Every series carries `engine`, `cluster`, `model`, `deployment` and `namespace`:
+
+```
+modelplane_time_to_first_token_bucket{engine="vllm", cluster="prod-us-east",
+  deployment="qwen3-8b", model="Qwen/Qwen3-8B", namespace="ml-team", le="0.25"} 1841
+```
+
+So the fleet's p99 is one query, and dropping `by (cluster)` from it narrows to one deployment
+without changing anything else:
+
+```promql
+histogram_quantile(0.99, sum by (le, cluster) (
+  rate(modelplane_time_to_first_token_bucket{model="Qwen/Qwen3-8B"}[5m])))
+```
+
+ Modelplane ships the
 fleet queries and a Grafana dashboard built on them: capacity, GPU allocation, GPU-hours,
 replicas ready against desired, and the fraction of requests under a time-to-first-token
 target.
