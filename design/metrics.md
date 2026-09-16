@@ -128,7 +128,7 @@ what a caller was served is a usage record rather than a metric.
 ### Publish one vocabulary
 
 A `MetricMapping` says what an engine calls its metrics and what Modelplane calls them.
-Modelplane ships one per engine it supports, and an operator writes one only for an engine
+Modelplane provides one per engine it supports, and an operator writes one only for an engine
 Modelplane has never seen.
 
 ```yaml
@@ -348,7 +348,7 @@ histogram_quantile(0.99, sum by (le) (
 A `cluster="prod-us-east"` matcher narrows it to one cluster, and adding `cluster` to the
 grouping breaks it out per cluster. Neither changes the shape.
 
-Modelplane ships the
+Modelplane provides the
 fleet queries and dashboards built on them, exported for Grafana and for the other backends
 a `TelemetryDestination` commonly points at, so a fleet gets a view by importing one file
 rather than by writing the fleet maths: capacity, GPU allocation, GPU-hours,
@@ -356,7 +356,7 @@ replicas ready against desired, and the fraction of requests under a time-to-fir
 target.
 
 A platform team reads all of it. A `ModelDeployment`'s author reads their own model, which
-is a filter on the same dashboard. There is no second, author-facing store, and no
+is a filter on the same dashboard. No second, author-facing store exists, and there is no
 collection toggle, for the reason Alternatives gives: its author owns neither the destination,
 its cost,
 nor its retention.
@@ -375,7 +375,7 @@ the Deployment, the service account and the config reload. Everything the Promet
 has a receiver that does it, and the Envoy scrape config Modelplane already composes transfers
 unchanged.
 
-Removing that stack is the one breaking change, so it ships separately: the collector and the
+Removing that stack is the one breaking change, so it lands separately: the collector and the
 destination arrive alongside it, where an operator can compare them, and the removal follows.
 Approving a new collector and approving the deletion of a store people query today are
 different decisions. A hand-written `PodMonitor` goes inert rather than double-scraping, so the
@@ -398,7 +398,7 @@ collector to the same destination.
 
 ## Alternatives considered
 
-**Don't reconcile at all.** Publish each engine's names unchanged and ship a dashboard per
+**Don't reconcile at all.** Publish each engine's names unchanged and provide a dashboard per
 engine. Nothing to map, nothing to maintain as engines move, no user surprised that `vllm:`
 metrics went missing, and an operator running one engine loses nothing. It answers a question
 about one engine and never one about a fleet: a deployment spread over two engines has no

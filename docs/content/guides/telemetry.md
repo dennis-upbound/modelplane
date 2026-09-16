@@ -88,13 +88,13 @@ spec:
 
 ## Naming your engine
 
-There is nothing to set. `vllm:num_requests_waiting` and SGLang's queue depth counter are
-the same number, and Modelplane renames both to `modelplane_requests_waiting` by matching
-the prefix each engine puts on its own metric names. Rules ship for `vllm:`, `sglang:` and
-TensorRT-LLM's `nv_`.
+You set nothing. `vllm:num_requests_waiting` and SGLang's queue depth counter are the same
+number, and Modelplane renames both to `modelplane_requests_waiting` by matching the prefix
+each engine puts on its own metric names. Modelplane provides rules for `vllm:`, `sglang:`
+and TensorRT-LLM's `nv_`.
 
-An engine whose metric names don't say what it is, an OpenAI-compatible server publishing a
-bare `http_requests_total`, has nothing to match on. Name the mapping for it with `type`:
+An engine whose metric names carry no engine, an OpenAI-compatible server publishing a bare
+`http_requests_total`, has nothing to match on. Name the mapping for it with `type`:
 
 ```yaml {nocopy=true}
 spec:
