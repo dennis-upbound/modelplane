@@ -369,7 +369,6 @@ spec:
     gke:
       region: us-east1
   telemetry:
-    fleetEndpoint: true                   # the default
     gpuExporter:
       namespace: gpu-operator
       selector:
@@ -378,10 +377,10 @@ spec:
 ```
 
 `gpuExporter` names the DCGM exporter to scrape where a cluster runs something other than
-the one Modelplane installs. A control plane that schedules no workloads has nowhere to put
-the fleet tier, and `fleetEndpoint: false` skips it: those clusters remote-write straight to
-the destination and keep every per-cluster series. What they give up is the one query that
-answers for the fleet.
+the one Modelplane installs, and it is per-cluster because the answer genuinely differs per
+cluster. Every cluster runs the fleet tier; there is no field to turn it off. A control
+plane is a Kubernetes cluster and can host a Prometheus, and a fleet where some clusters
+answer the fleet's questions and others do not is worse than either.
 
 ### What an operator reads
 
@@ -405,6 +404,15 @@ histogram_quantile(0.99, sum by (le) (
 Modelplane provides those queries and dashboards built on them, exported for Grafana and
 for the other backends a destination commonly points at. A `TelemetryDestination` sends the
 fleet's series onward to whatever an operator already runs.
+
+That is a kind for one URL and a Secret, which is a low bar to clear, and it clears it on
+where the field would otherwise go. Modelplane composes the fleet Prometheus, so an
+operator who edits its `remoteWrite` is editing a composed resource and loses the edit on
+the next reconcile. Nothing else in the API is installation-scoped: `InferenceClass`
+describes node pools and `InferenceCluster` describes one cluster, and forwarding is a
+property of neither. `TelemetryDestination` is that property, singular by construction and
+named `default` because there is one fleet. If Modelplane grows an object for the
+installation itself, this is a field on it.
 
 A platform team reads all of it. A `ModelDeployment`'s author reads their own model, which
 is a filter on the same dashboard. No second, author-facing store exists, and no collection
@@ -474,8 +482,7 @@ engines differ and how, which is the knowledge the vocabulary exists to hold.
 run and one fewer thing to reach, and a fleet whose metrics land in a backend anyway gains
 nothing from a stop on the way. It gives up the endpoint that makes this feel like one
 project's metrics, and GPU-hours and SLO attainment with it, since both need a window over
-series from every cluster. It stays available as a field for a control plane that cannot
-host the tier.
+series from every cluster.
 
 **Pull from each cluster.** A LoadBalancer or Ingress per cluster inverts the connection
 Modelplane can rely on and needs inbound exposure on every GPU cluster. A cluster with no
@@ -487,6 +494,16 @@ decline collection, which is how most of Modelplane's API works, since the team 
 resource configures it. Telemetry does not divide that way. Its cost, destination and
 retention belong to the platform team, and a toggle would cover only the data plane, leaving
 the substrate and the roll-up collected anyway.
+
+**No destination kind.** Prometheus already models forwarding, in `remoteWrite` on the
+`Prometheus` object, with auth, TLS, queue tuning and write relabeling that a narrower
+Modelplane field will never match. The fleet store is one object on one cluster, so unlike
+the engine rules there is no per-cluster repetition to remove, and the kind is a thin
+wrapper over a well-documented upstream field. It stays because Modelplane composes that
+`Prometheus`, which makes it Crossplane's to own: an operator's edit to `remoteWrite` is
+reverted, and the alternative to a Modelplane field is asking them to hand-edit a resource
+we reconcile. An operator who wants what the upstream field offers and this one does not
+still gets it, by pointing a destination at their own Prometheus and configuring that.
 
 **A `MetricMapping` kind.** A cluster-scoped kind on the control plane naming what an engine
 calls each metric, rendered into every cluster running that engine and into the next one to
