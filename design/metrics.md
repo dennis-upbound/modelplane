@@ -90,7 +90,10 @@ section a question with an answer rather than a survey.
 |---|---|---|
 | `modelplane_time_to_first_token_seconds` | histogram | seconds |
 | `modelplane_inter_token_latency_seconds` | histogram | seconds |
+| `modelplane_inference_duration_seconds` | histogram | seconds |
 | `modelplane_request_duration_seconds` | histogram | seconds |
+| `modelplane_input_tokens` | histogram | tokens |
+| `modelplane_output_tokens` | histogram | tokens |
 | `modelplane_requests_total{outcome}` | counter | requests |
 | `modelplane_tokens_total{kind}` | counter | tokens |
 
@@ -124,10 +127,28 @@ the cluster, because a billing backend counts a series as active for fifteen to 
 minutes after it stops and every rolling update would mint a fresh set. `caller` is never
 added: a caller is unbounded by construction.
 
-Three decisions are visible in that list.
+Four decisions are visible in that list.
+
+Two durations are here because the gap between them is the diagnosis.
+`modelplane_inference_duration_seconds` is what the engine spent;
+`modelplane_request_duration_seconds` is what the caller waited, measured at the gateway. When
+inference is fast and the request is slow, the problem is routing, queueing or the network
+rather than the model, and an operator who has only one of the two cannot tell those apart.
+Modelplane scrapes the engine and owns the gateway, so it is in a position to publish both.
+
+Sequence lengths are here for the same reason. Latency rising because there are more requests
+and latency rising because the requests got longer look identical in a latency graph and want
+opposite responses, and time to first token grows faster than linearly in input length.
+`outcome` on the request counter is the response class, so a rise in 5xx separates from a rise
+in 4xx.
+
+
 
 Hit rate is two counters and not a ratio, because a ratio cannot be re-aggregated and two
-counters can. GPU-hours is not in the table at all: it is an allocation integrated over time,
+counters can. Tokens per second is deliberately not a metric: it means the rate one user sees
+to some readers and the service's total throughput to others, so this publishes the counter and
+the inter-token latency and lets a query say which it wants. GPU-hours is not in the table at
+all: it is an allocation integrated over time,
 so it is a recorded series rather than a collected one, and the tier below produces it.
 
 And `modelplane_replicas_unschedulable` is here because the gap between desired and ready is
@@ -145,14 +166,19 @@ it from two series that are already here.
 
 Four sources, and the gaps are named rather than hidden.
 
-**The engine** answers the serving and saturation questions. vLLM publishes every one of
-them. SGLang publishes all but prefix-cache lookups, which it reports only as a rate.
+**The engine** answers the serving and saturation questions, and its own view of duration. vLLM
+publishes every one of them, including prompt and generation length as histograms. SGLang
+publishes all but prefix-cache lookups, which it reports only as a rate.
 Triton and TensorRT-LLM publish batch-manager statistics and no latency histograms at all.
 
 **The endpoint picker** publishes `llm_d_epp_*`, which is where queue depth comes from when
 a router queues in front of the engine. That is a different measurement from the engine's
 own queue, so it is a different metric: `modelplane_router_queue_depth`, present only where
 a router queues.
+
+**The gateway** answers what the caller experienced. Envoy fronts every request, so it measures
+the duration and the response class a client actually saw, which is the half of the latency
+pair no engine can report.
 
 **The substrate** answers whether the machinery works. The gateway's Envoy, the
 LeaderWorkerSet or Grove controller, cert-manager and the DRA driver each report readiness,
