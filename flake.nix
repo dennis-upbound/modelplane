@@ -122,8 +122,6 @@
         }
       );
 
-      # Build the docs site with nix build .#docs.
-      #
       # Function runtime images are Linux images, but they're assembled purely
       # from data (a cached interpreter, prebuilt wheels, and our source), so
       # they build on any host - including macOS - with no cross-compilation or
@@ -132,7 +130,6 @@
       packages = forAllSystems (
         { pkgs, ... }:
         let
-          docs = import ./nix/docs.nix { inherit pkgs self; };
           functions = import ./nix/functions.nix {
             inherit
               pkgs
@@ -144,10 +141,7 @@
               ;
           };
         in
-        {
-          docs = docs.site;
-        }
-        // functions.images
+        functions.images
         // {
           functions = functions.all;
         }
@@ -178,8 +172,6 @@
           stop = apps.stop { inherit crossplane; };
           e2e = apps.e2e { inherit crossplane functionsPkg; };
           stacks = apps.stacks { inherit (pkgs) aicr; };
-          docs-serve = apps.docsServe { };
-          docs-generate = apps.docsGenerate { };
         }
       );
 
@@ -204,8 +196,6 @@
               pkgs.unstable.ruff
               pkgs.unstable.ty
               pkgs.nixfmt
-              pkgs.hugo
-              pkgs.nodejs
             ];
 
             shellHook = ''
@@ -222,7 +212,6 @@
               echo "  nix flake check               nix run .#fix"
               echo "  nix run .#build               nix run .#push"
               echo "  nix run .#run                 nix run .#stop"
-              echo "  nix run .#docs-serve          nix run .#docs-generate"
               echo "  nix run .#stacks"
               echo ""
             '';
