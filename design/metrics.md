@@ -175,8 +175,8 @@ before it leaves the cluster.
 
 That separates two things both called aggregation. Reconciling engines is semantic and it is
 ours, and an operator should never learn which engines differ or how. Summing across clusters
-is dimensional, a `sum()` over metrics that already agree, which every Prometheus-compatible
-store does.
+is dimensional. Counters and gauges sum across the fleet unconditionally. Histograms
+carry a condition, below, and the roll-up is built to respect it.
 
 **Modelplane reconciles it in the pipeline** where the difference is mechanical.
 `modelplane_prefix_cache_hit_rate` is defined as the share of lookups served from cache over an
@@ -248,10 +248,18 @@ from a number that means something else does not.
 
 Histograms carry that limit even between engines that both publish one. Buckets merge only when
 their boundaries match, and a quantile over misaligned buckets is wrong rather than
-approximate. vLLM's time-to-first-token boundaries are the ones the OpenTelemetry GenAI
-conventions define. SGLang's match to 0.1 seconds and diverge above. So the metric is sound per
-engine and unsound across a fleet mixing the two, Modelplane reports which engines agree with
-the convention, and the fix is upstream adoption rather than anything this design can do.
+approximate. Modelplane's boundaries are the ones the OpenTelemetry GenAI conventions define.
+vLLM's are those boundaries already. SGLang's match to 0.1 seconds and diverge above.
+
+So a quantile is sound across every engine that follows the convention and unsound across a
+fleet mixing one that does with one that does not. The roll-up takes that as a constraint
+rather than a caveat: every quantile Modelplane ships groups by `engine`, which is correct
+whatever the fleet runs and collapses to one line where one engine runs everywhere. A fleet of
+conforming engines can drop the grouping and get a single fleet-wide number.
+
+`status` names the engines whose buckets match the convention, so an operator can tell which of
+the two they have. Making a non-conforming engine match is upstream work, and it is the only
+thing that turns a mixed fleet's quantile into one number.
 
 ### Export to one destination
 
@@ -300,15 +308,15 @@ modelplane_time_to_first_token_bucket{engine="vllm", cluster="prod-us-east",
   deployment="qwen3-8b", model="Qwen/Qwen3-8B", namespace="ml-team", le="0.25"} 1841
 ```
 
-So the fleet's p99 is one query, and dropping `by (cluster)` from it narrows to one deployment
-without changing anything else:
+So the fleet's p99 is one query, grouped by engine for the reason the previous section gives,
+and dropping `cluster` from the grouping narrows it without changing anything else:
 
 ```promql
-histogram_quantile(0.99, sum by (le, cluster) (
+histogram_quantile(0.99, sum by (le, engine, cluster) (
   rate(modelplane_time_to_first_token_bucket{model="Qwen/Qwen3-8B"}[5m])))
 ```
 
- Modelplane ships the
+Modelplane ships the
 fleet queries and a Grafana dashboard built on them: capacity, GPU allocation, GPU-hours,
 replicas ready against desired, and the fraction of requests under a time-to-first-token
 target.
