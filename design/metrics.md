@@ -11,9 +11,10 @@ to the operator: write a `PodMonitor` that matches the serving shape, keep it in
 reach the store by `port-forward`. Each engine names its metrics its own way, and each
 cluster answers only for itself.
 
-This proposes that Modelplane collect from every source it runs, publish one set of
-`modelplane_*` metrics whatever engine produced them, and export to one destination the
-operator names. A fleet configures where telemetry goes and nothing else:
+This proposes that Modelplane collect from every source it runs, publish a `modelplane_*`
+metric wherever an engine can produce one that means the same thing, and export to one
+destination the operator names. Configuring where telemetry goes is the whole of the common
+case:
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -144,28 +145,60 @@ Nothing declares which engine a deployment runs, because the engine already says
 engine Modelplane maps prefixes its metrics with its own name: `vllm:`, `sglang:`,
 `nv_trt_llm_`. A mapping claims a prefix, and a series arriving under it is renamed.
 
-A fork gets this right without trying. A vLLM fork that kept the metric names keeps the
-mapping, and one that renamed them writes a mapping against its own prefix, which it needed
-either way.
-
 The prefix runs out on an engine whose names carry no engine in them. An OpenAI-compatible
 server publishing a bare `http_requests_total` is indistinguishable from anything else
-publishing the same. For that case the deployment names the mapping:
+publishing the same. For that case the deployment names the mapping, and the mapping selects on
+the label Modelplane stamps from it:
 
 ```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelDeployment
+metadata:
+  name: qwen3-8b
+  namespace: ml-team
 spec:
+  replicas: 2
   template:
     spec:
       engines:
       - name: qwen3-8b
-        type: my-engine        # only when the metric names don't say
+        type: my-engine                   # only when the metric names don't say
+        members:
+        - role: Standalone
+          template:
+            spec:
+              containers:
+              - name: engine
+                image: ghcr.io/acme/my-engine:v1
+                args: [--model=Qwen/Qwen3-8B]
+---
+apiVersion: modelplane.ai/v1alpha1
+kind: MetricMapping
+metadata:
+  name: my-engine
+spec:
+  engineType: my-engine                   # instead of a prefix
+  rename:
+    http_request_duration_seconds: modelplane_e2e_request_latency
+  scale:
+    my_engine_ttft_milliseconds: 0.001    # to seconds
+  merge:
+    modelplane_e2e_request_latency: histogram
+status:
+  matchedEngines: ["my-engine"]
+  absent: ["modelplane_time_to_first_token"]   # buckets don't match the convention
 ```
 
-Modelplane stamps that onto the pod as `modelplane.ai/engine`, and a mapping selects on the
-label instead of a prefix. Derived is the path; declared is the escape.
+Derived is the path; declared is the escape. `merge` says how a metric combines when the pod
+labels are dropped, `scale` converts a unit, and `status` reports what a mapping matched and
+which metrics it cannot produce, which is the same place an operator reads that Triton has no
+time to first token.
 
-An engine with no matching mapping is still collected, under its own names, and the cluster
-reports that nothing matched.
+A mapping adds rather than replaces. `vllm:time_to_first_token_seconds` still arrives under its
+own name, so an operator who came for vLLM's metrics still has them and their existing
+dashboards keep working. `modelplane_time_to_first_token` arrives beside it, and the fleet view
+reads that one. The cost is a handful of extra series per engine pod, which the arithmetic
+above makes immaterial.
 
 ### Make a metric a definition, not a rename
 
@@ -224,11 +257,12 @@ engine reporting milliseconds where another reports seconds. Between them they c
 mechanical differences, and an operator writing a mapping for an engine Modelplane has never
 seen reaches the same two fields we do.
 
-The collector does the pipeline half with processors it already ships: `transform` renames and
-scales, `metricstransform` merges the series that collide when a label is dropped,
-`metricsgeneration` applies an operation across two metrics, and `cumulativetodelta` converts a
-counter's shape. None of it holds history, which is why `rate()` and `histogram_quantile()`
-stay with the reader.
+The collector's own processors do the rename, the scale and the derivation, and merge the
+series that collide when a label is dropped. A mapping declares how each metric merges, summing
+a counter and averaging a fraction, because a summing merge over fifty replicas would take a
+cache-occupancy fraction to 50. Derivation runs before the merge, so a ratio is taken on one
+pod's counters and never on a sum of two pods'. Everything leaves as a cumulative counter, a
+gauge or a histogram, so `rate()` and `histogram_quantile()` mean what a reader expects.
 
 Joining two of our metrics to recover a number we could have published is work a reader should
 not be doing, so we publish it.
@@ -305,9 +339,6 @@ spec:
       modelplane.ai/region: eu
 ```
 
-There is no flag to skip certificate verification. It gets set to finish a bring-up and is
-still set two years later, and naming a CA is the same amount of typing.
-
 Omitting `clusterSelector` means every cluster, which is the summary's destination and the
 common case. With one, a region whose telemetry may not leave it, or a cluster another team
 operates, exports somewhere it can reach. The cost is that a fleet split across backends has no
@@ -324,11 +355,11 @@ modelplane_time_to_first_token_bucket{engine="vllm", cluster="prod-us-east",
   deployment="qwen3-8b", model="Qwen/Qwen3-8B", namespace="ml-team", le="0.25"} 1841
 ```
 
-So a model's p99 across the fleet is one query, grouped by engine for the reason the previous
-section gives:
+So a model's p99 across the fleet is one query, and it needs no engine grouping because every
+series under that name has the same buckets:
 
 ```promql
-histogram_quantile(0.99, sum by (le, engine) (
+histogram_quantile(0.99, sum by (le) (
   rate(modelplane_time_to_first_token_bucket{model="Qwen/Qwen3-8B"}[5m])))
 ```
 
@@ -336,7 +367,9 @@ A `cluster="prod-us-east"` matcher narrows it to one cluster, and adding `cluste
 grouping breaks it out per cluster. Neither changes the shape.
 
 Modelplane ships the
-fleet queries and a Grafana dashboard built on them: capacity, GPU allocation, GPU-hours,
+fleet queries and dashboards built on them, exported for Grafana and for the other backends
+a `TelemetryDestination` commonly points at, so a fleet gets a view by importing one file
+rather than by writing the fleet maths: capacity, GPU allocation, GPU-hours,
 replicas ready against desired, and the fraction of requests under a time-to-first-token
 target.
 
@@ -346,9 +379,9 @@ collection toggle, for the reason Alternatives gives: its author owns neither th
 its cost,
 nor its retention.
 
-Control-plane health stays with whoever runs the control plane. A control plane hosts
-Crossplane and the API it serves, not workloads, and a hosted one schedules no pods at all,
-so Modelplane cannot deploy a collector beside its own Crossplane. Crossplane serves
+Control-plane health stays with whoever runs the control plane. Modelplane cannot deploy a
+collector beside its own Crossplane, for the reason
+Alternatives gives. Crossplane serves
 `/metrics` on its core, provider and function pods for an operator's existing scrape, and
 every XR carries `Ready` and `Synced` on the API.
 
@@ -358,10 +391,8 @@ An OpenTelemetry collector replaces the kube-prometheus-stack, run by the OpenTe
 Operator, so Modelplane composes one `OpenTelemetryCollector` per cluster and the operator
 owns the Deployment, the service account and the config reload.
 
-Everything the Prometheus stack does has a receiver that does it: `prometheus` for the
-engine, picker and Envoy scrapes, `k8s_cluster` for kube-state-metrics, `kubeletstats` and
-`hostmetrics` for cAdvisor and node-exporter. The existing Envoy scrape config is a
-`kubernetes_sd_configs` block, which the `prometheus` receiver takes unchanged.
+Everything the Prometheus stack does has a receiver that does it, and the Envoy scrape config
+Modelplane already composes is a `kubernetes_sd_configs` block the collector takes unchanged.
 
 Removing the Prometheus stack is the one breaking change. The collector and the destination
 arrive alongside the existing stack, where an operator can compare them; the removal is a
@@ -423,6 +454,29 @@ saving
 is a fraction of a fraction. A toggle would also cover only the data plane, leaving the
 substrate and the roll-up collected anyway, so a fleet view would have holes no one could
 predict from the resources.
+
+**A dashboard per engine, and no vocabulary.** Ship a vLLM dashboard and an SGLang dashboard
+and let each read its engine's own names. Nothing to map, nothing to maintain as engines move,
+and no user surprised that `vllm:` metrics went missing. It answers a question about one engine
+and not a question about a fleet: a deployment spread over both engines has no dashboard, and
+every panel Modelplane adds costs one dashboard per engine thereafter. Mapping a metric once is
+less work than maintaining a dashboard per engine per panel.
+
+**Recording rules instead of a pipeline.** Prometheus recording rules could reconcile names at
+the destination. They are a query optimisation rather than a transform mechanism, they exist
+only where the destination is Prometheus, and they put the reconciliation back in the place
+this design is trying to take it out of. A destination that wants recording rules for its own
+queries can still have them; nothing here prevents it.
+
+**Publish every engine's histogram and let readers filter.** Mapping a histogram whatever its
+buckets keeps a metric present on every engine, and a reader who groups by `engine` gets a
+correct answer per engine. It moves the problem into every query anyone writes: a reader has to
+know which engines conform, and one who forgets gets a quantile over misaligned buckets that is
+wrong rather than approximate. An absent metric with a reason is the smaller surprise.
+
+**Allow skipping certificate verification.** An `insecure` flag reaches a backend with a
+self-signed certificate in one line, and every OTLP client offers one. It gets set to finish a
+bring-up and is still set two years later, and naming a CA is the same amount of typing.
 
 **Declare the engine type.** A required `type` on the engine selects the mapping without
 depending on metric names. It asks every user to state something the metrics already say,
