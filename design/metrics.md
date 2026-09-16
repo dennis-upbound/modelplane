@@ -202,35 +202,28 @@ above makes immaterial.
 
 ### Make a metric a definition, not a rename
 
-A `modelplane_*` metric is a definition: what is measured, and where in the stack it is
-measured. `modelplane_requests_waiting` is requests admitted to an engine and not yet being
-decoded, on any engine, under any stack. A mapping's job is to find the series that already
-means that. Renaming is what it usually takes, and it is not what makes the vocabulary true.
+A `modelplane_*` metric is a definition: what is measured, where in the stack, in what unit and
+over what range. `modelplane_requests_waiting` is requests an engine has accepted and is not
+currently decoding, including work it preempted, on any engine under any stack.
+`modelplane_kv_cache_usage` is the occupied share of an engine's KV cache, 0 to 1. A mapping
+finds the series that already means that, and renaming is what it usually takes rather than
+what makes the vocabulary true.
 
-When a source already means what a definition says, the mapping renames it. When it does not,
-one of three things happens: Modelplane reconciles it in the pipeline, or the source gets a
-metric of its own, or the metric is absent on that engine and the status says so.
-
-Nothing is left for the reader except `rate()` and `histogram_quantile()`. The test is what a
-reader has to know: averaging `modelplane_kv_cache_usage` across clusters is using a metrics
-system, and knowing that one engine counts its cache hit rate since startup while another
-counts it right now is not. That is settled before the data leaves the cluster.
-
-It separates two things both called aggregation. Reconciling engines is semantic and it is
-ours, and an operator should never learn which engines differ or how. Combining across clusters
-is dimensional, and it follows the instrument: a counter or an absolute gauge sums, a fraction
-like `modelplane_kv_cache_usage` averages, and a histogram carries the further condition below.
+When a source does not already mean it, one of three things happens.
 
 **Modelplane reconciles it in the pipeline** where the difference is mechanical.
-`modelplane_prefix_cache_hit_rate` is defined as the share of lookups served from cache over an
-engine's lifetime, and vLLM publishes the two counters it comes from, so the vLLM mapping above
-divides them. That is what `derive` is for, and no rename reaches it.
+`modelplane_prefix_cache_hit_rate` is the share of lookups served from cache, and vLLM
+publishes the two counters it comes from, so the vLLM mapping above divides them. A mapping
+also declares how each metric merges when the pod labels are dropped, since a summing merge
+over fifty replicas would take a fraction to 50, and derivation runs after that merge so a rate
+divides summed hits by summed queries. What leaves is a cumulative counter, a gauge or a
+histogram, so `rate()` and `histogram_quantile()` mean what a reader expects and nothing
+downstream has to join two of our metrics to recover a third.
 
 **A source that measures something else gets its own metric.** SGLang publishes
-`sglang:cache_hit_rate`, which reads as the same thing and is not: it is a gauge of the rate
-right now, where the vLLM figure is a ratio since the engine started. Renaming it into
-`modelplane_prefix_cache_hit_rate` would put two measurements under one name, and a fleet query
-over both would average a lifetime against an instant. So SGLang's mapping leaves it alone.
+`sglang:cache_hit_rate`, which reads as the same thing and is a gauge of the rate right now
+where vLLM's is a ratio since startup. Renaming it in would have a fleet query average a
+lifetime against an instant, so SGLang's mapping leaves it alone:
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -239,69 +232,44 @@ metadata:
   name: sglang
 spec:
   prefix: "sglang:"
-  rename:                                 # no TTFT: buckets diverge above 0.1s
-    sglang:time_per_output_token_seconds: modelplane_time_per_output_token
+  rename:                                 # histograms map only where buckets match
     sglang:e2e_request_latency_seconds: modelplane_e2e_request_latency
     sglang:num_queue_reqs: modelplane_requests_waiting
     sglang:num_running_reqs: modelplane_requests_running
     sglang:token_usage: modelplane_kv_cache_usage
+  merge:
+    modelplane_requests_waiting: sum
+    modelplane_kv_cache_usage: average
+status:
+  matched: true
+  absent:
+  - metric: modelplane_time_to_first_token
+    reason: histogram buckets do not match the convention
 ```
 
-Two engines, one apparent metric, and the right answer is a derivation on one and silence on
-the other. A mapping carries more than a rename table because of the first case, and a
-vocabulary stays true because of the second.
+That is the discipline across layers too, where it is easiest to lose. Both stacks queue in
+more than one place: an llm-d cluster queues at the engine and holds pending work in the
+endpoint picker, and a Dynamo cluster queues at the engine and again in its router. Sourcing
+`modelplane_requests_waiting` from the engine on one and the router on the other would give one
+name two meanings. So the definition pins the layer, engine queueing is
+`modelplane_requests_waiting` whatever runs in front of it, router queueing is
+`modelplane_router_queue_depth`, and a stack with no router publishes none.
 
-`derive` takes the arithmetic the OpenTelemetry `metricsgeneration` processor supports, an
-operation over two operand metrics, and `scale` multiplies one series by a constant for an
-engine reporting milliseconds where another reports seconds. Between them they cover the
-mechanical differences, and an operator writing a mapping for an engine Modelplane has never
-seen reaches the same two fields we do.
+**Where neither works the metric is absent, and `status` says so.** Triton and TensorRT-LLM
+publish batch-manager statistics and no time-to-first-token histogram, and nothing reconstructs
+a distribution from aggregates.
 
-The collector's own processors do the rename, the scale and the derivation, and merge the
-series that collide when a label is dropped. A mapping declares how each metric merges, summing
-a counter and averaging a fraction, because a summing merge over fifty replicas would take a
-cache-occupancy fraction to 50. Derivation runs before the merge, so a ratio is taken on one
-pod's counters and never on a sum of two pods'. Everything leaves as a cumulative counter, a
-gauge or a histogram, so `rate()` and `histogram_quantile()` mean what a reader expects.
+Histograms carry a further condition. Buckets merge only when their boundaries match, and a
+quantile over misaligned buckets is wrong rather than approximate. Modelplane's boundaries are
+the ones the OpenTelemetry GenAI conventions define, and vLLM's are already those. So alignment
+is a condition of the metric rather than a caveat on reading it: a conforming histogram maps,
+and one that diverges is absent on that engine the way Triton's is. SGLang's
+time-to-first-token buckets match to 0.1 seconds and diverge above, so SGLang publishes none
+until it adopts the convention.
 
-Joining two of our metrics to recover a number we could have published is work a reader should
-not be doing, so we publish it.
+That is a real cost and the right one. An operator running SGLang loses two panels and knows
+it, against a fleet quantile that quietly averaged two bucket layouts.
 
-**A different measurement gets a different metric.** This is what keeps the vocabulary honest
-across layers, where it is easiest to get wrong. Both stacks Modelplane composes queue requests
-in more than one place: an llm-d cluster has a queue at the engine and a view of pending work
-in the endpoint picker, and a Dynamo cluster has a queue at the engine and another in its
-router. Sourcing `modelplane_requests_waiting` from the engine on one stack and the router on
-the other would give one name two meanings, and a fleet query over both would return a number
-that is not anything.
-
-So the definition pins the layer. Engine queueing is `modelplane_requests_waiting` whatever
-runs in front of it. Router queueing, where a router queues, is
-`modelplane_router_queue_depth`. An operator comparing a Dynamo cluster to an llm-d one
-compares like with like, and a stack that has no router publishes no router metric, which is
-the honest answer rather than a zero.
-
-**Where neither works, the metric is absent and the status says so.** Triton and TensorRT-LLM
-publish batch-manager statistics and no time-to-first-token histogram, and nothing in a
-pipeline reconstructs a distribution from aggregates. `modelplane_time_to_first_token` is
-missing on that engine. A dashboard with a gap tells an operator something true; one backfilled
-from a number that means something else does not.
-
-Histograms carry that limit even between engines that both publish one. Buckets merge only when
-their boundaries match, and a quantile over misaligned buckets is wrong rather than
-approximate. Modelplane's boundaries are the ones the OpenTelemetry GenAI conventions define,
-and vLLM's are already those.
-
-So bucket alignment is a condition of the metric, not a caveat on reading it. A histogram whose
-boundaries match the convention maps to `modelplane_time_to_first_token`. One whose boundaries
-do not is absent on that engine, which is the third outcome above and the same answer Triton
-gets. SGLang's match to 0.1 seconds and diverge above, so SGLang publishes no
-`modelplane_time_to_first_token` until it adopts the convention, and `status` says so.
-
-That is a real cost and it is the right one. An operator running SGLang loses a panel and knows
-it. The alternative, publishing the histogram and telling every reader to group by engine and
-check which engines conform, moves the problem into every query anyone writes and puts the
-engine-specific knowledge back in the reader's head.
 ### Export to one destination
 
 Every cluster's collector exports straight to the destination. Modelplane holds one
@@ -388,18 +356,16 @@ every XR carries `Ready` and `Synced` on the API.
 ### The collector
 
 An OpenTelemetry collector replaces the kube-prometheus-stack, run by the OpenTelemetry
-Operator, so Modelplane composes one `OpenTelemetryCollector` per cluster and the operator
-owns the Deployment, the service account and the config reload.
+Operator so Modelplane composes one `OpenTelemetryCollector` per cluster and the operator owns
+the Deployment, the service account and the config reload. Everything the Prometheus stack does
+has a receiver that does it, and the Envoy scrape config Modelplane already composes transfers
+unchanged.
 
-Everything the Prometheus stack does has a receiver that does it, and the Envoy scrape config
-Modelplane already composes is a `kubernetes_sd_configs` block the collector takes unchanged.
-
-Removing the Prometheus stack is the one breaking change. The collector and the destination
-arrive alongside the existing stack, where an operator can compare them; the removal is a
-separate change, because approving a new collector and approving the deletion of a store
-people query today are different decisions. A hand-written `PodMonitor` goes inert rather
-than double-scraping, which is quieter and worse, so the release note says the store is
-going and where the series go instead.
+Removing that stack is the one breaking change, so it ships separately: the collector and the
+destination arrive alongside it, where an operator can compare them, and the removal follows.
+Approving a new collector and approving the deletion of a store people query today are
+different decisions. A hand-written `PodMonitor` goes inert rather than double-scraping, so the
+release note says the store is going and where the series go instead.
 
 ## Future improvements
 
@@ -418,55 +384,44 @@ collector to the same destination.
 
 ## Alternatives considered
 
-**Keep the Prometheus stack per cluster.** It is the incumbent, PromQL is standard, and it
-leaves a local store an operator can query. The collector wins because the rename happens in
-the pipeline rather than in recording rules on every cluster, because one pipeline carries
-metrics, logs and traces, and because it runs no store per cluster. An operator who wants a
-store still gets one: the export reaches a Prometheus-compatible backend, once, at the
-centre.
+**Don't reconcile at all.** Publish each engine's names unchanged and ship a dashboard per
+engine. Nothing to map, nothing to maintain as engines move, no user surprised that `vllm:`
+metrics went missing, and an operator running one engine loses nothing. It answers a question
+about one engine and never one about a fleet: a deployment spread over two engines has no
+dashboard, and every panel added afterwards costs one per engine. Mapping a metric once is less
+work than maintaining a dashboard per engine per panel, and the mapping adds rather than
+replaces, so the engine's own names survive either way.
+
+**Reconcile somewhere else.** The destination could do it, with recording rules where it is
+Prometheus or its own transforms where it is not. It is less for Modelplane to build and every
+store can sum and merge. Recording rules are a query optimisation rather than a transform
+mechanism, they exist only on some destinations, and either way an OSS user would have to know
+which engines differ and how, which is the knowledge the vocabulary exists to hold. A
+destination that wants recording rules for its own queries can still have them.
 
 **Collect at the control plane.** A collector where Modelplane already knows about every
 cluster reads naturally, and it is the first shape to rule out. A control plane schedules no
-workloads, so there is nowhere to put a collector, a listener, or the certificate it needs.
-It would also be the wrong size: Crossplane reconciles resources, it does not carry a stream
-that grows with every engine pod.
+workloads, so there is nowhere to put a collector, a listener, or the certificate it needs. It
+would also be the wrong size: Crossplane reconciles resources, it does not carry a stream that
+grows with every engine pod.
 
-**Route telemetry through the gateway.** An `InferenceGateway` is already a surface a
-cluster can reach. It speaks the inference APIs, so carrying OTLP means teaching Envoy a
-protocol it has no reason to know, to reach a collector that still has nowhere to run. It
-also couples telemetry to a component a fleet may run several of, or none of.
+**Route telemetry through the gateway.** An `InferenceGateway` is already a surface a cluster
+can reach. It speaks the inference APIs, so carrying OTLP means teaching Envoy a protocol it
+has no reason to know, to reach a collector that still has nowhere to run. It also couples
+telemetry to a component a fleet may run several of, or none of.
 
 **Pull from each cluster.** A LoadBalancer or Ingress per cluster inverts the connection
 Modelplane can rely on and needs inbound exposure on every GPU cluster. A cluster with no
-egress at all is out of scope; a collector on a neighbouring cluster it can reach is a
-smaller answer than a mode field on the API.
-
-**Aggregate at the destination.** Leaving the reconciliation to whatever the operator runs
-is less for Modelplane to build, and every Prometheus-compatible store can sum and merge.
-It fails the third goal: an OSS user would have to know which engines differ and how, which
-is exactly the knowledge the vocabulary exists to hold.
+egress at all is out of scope; a collector on a neighbouring cluster it can reach is a smaller
+answer than a mode field on the API.
 
 **A per-deployment collection toggle.** An `enabled` field on a `ModelDeployment` lets a team
 decline collection they do not want, which is how most of Modelplane's API works: the team that
-owns a resource configures it. Telemetry does not divide that way. Its cost, its destination
-and its retention belong to the platform team, and at well under one percent of GPU spend the
-saving
-is a fraction of a fraction. A toggle would also cover only the data plane, leaving the
-substrate and the roll-up collected anyway, so a fleet view would have holes no one could
-predict from the resources.
-
-**A dashboard per engine, and no vocabulary.** Ship a vLLM dashboard and an SGLang dashboard
-and let each read its engine's own names. Nothing to map, nothing to maintain as engines move,
-and no user surprised that `vllm:` metrics went missing. It answers a question about one engine
-and not a question about a fleet: a deployment spread over both engines has no dashboard, and
-every panel Modelplane adds costs one dashboard per engine thereafter. Mapping a metric once is
-less work than maintaining a dashboard per engine per panel.
-
-**Recording rules instead of a pipeline.** Prometheus recording rules could reconcile names at
-the destination. They are a query optimisation rather than a transform mechanism, they exist
-only where the destination is Prometheus, and they put the reconciliation back in the place
-this design is trying to take it out of. A destination that wants recording rules for its own
-queries can still have them; nothing here prevents it.
+owns a resource configures it. Telemetry does not divide that way. Its cost, destination and
+retention belong to the platform team, and at well under one percent of GPU spend the saving is
+a fraction of a fraction. A toggle would also cover only the data plane, leaving the substrate
+and the roll-up collected anyway, so a fleet view would have holes nobody could predict from
+the resources.
 
 **Publish every engine's histogram and let readers filter.** Mapping a histogram whatever its
 buckets keeps a metric present on every engine, and a reader who groups by `engine` gets a
@@ -479,15 +434,10 @@ self-signed certificate in one line, and every OTLP client offers one. It gets s
 bring-up and is still set two years later, and naming a CA is the same amount of typing.
 
 **Declare the engine type.** A required `type` on the engine selects the mapping without
-depending on metric names. It asks every user to state something the metrics already say,
-and an enum of known engines locks out a fork. It survives as the optional escape for an
-engine whose names carry no prefix.
+depending on metric names. It asks every user to state something the metrics already say, and
+an enum of known engines locks out a fork. It survives as the optional escape for an engine
+whose names carry no prefix.
 
-**Publish each engine's names unchanged.** No mapping to maintain and no vocabulary to
-learn, and an operator who runs one engine loses nothing. An operator who runs two writes
-every dashboard twice, which is the problem this document opens with.
-
-**A `PodMonitor` per replica.** Composing discovery per replica from
-`compose-model-replica` matches the resource that knows the serving shape. It composes N
-objects where one cluster-wide selector does the same job, and it assumes the CRD that goes
-with the Prometheus stack.
+**A `PodMonitor` per replica.** Composing discovery per replica from `compose-model-replica`
+matches the resource that knows the serving shape. It composes N objects where one cluster-wide
+selector does the same job, and it assumes the CRD that goes with the Prometheus stack.
