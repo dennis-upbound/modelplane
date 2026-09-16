@@ -4,44 +4,11 @@
 **Date:** August 2026
 **Author:** Dennis Ramdass
 
-This document proposes collecting metrics on every cluster, normalizing them to a
-`modelplane_*` namespace, and exporting them to one destination where the fleet is a single
-view. It builds on [design.md](./design.md) and addresses
+Modelplane installs a Prometheus on every workload cluster and leaves everything after
+that to the operator. This proposes collecting on every cluster, naming what is collected
+the same way everywhere, and exporting it to one destination. It builds on
+[design.md](./design.md) and addresses
 [#269](https://github.com/modelplaneai/modelplane/issues/269).
-
-## Summary
-
-**Collect on every cluster.** Modelplane collects from every source it owns, the engines,
-the endpoint pickers, and the substrate, with no per-deployment toggle. A fleet with no
-destination configured collects nothing. Always-on is affordable: the section on cost and
-cardinality works a fleet's telemetry out at about one percent of the GPUs it watches.
-
-**Normalize to `modelplane_*`.** Each engine names its metrics its own way (`vllm:*`,
-`sglang:*`). The collector renames them to one Modelplane vocabulary, picked by an
-engine-type label, so a dashboard reads Modelplane's names and not each engine's. That
-label is Modelplane's to stamp, from a new `engines[].type` on the `ModelDeployment`.
-
-**Aggregate to one view.** Every cluster exports straight to one destination, under one
-vocabulary and the same dimensions, so a query there answers across the fleet rather than
-per cluster. Modelplane runs no store and routes nothing through the control plane, which
-it could not deploy a collector into anyway.
-
-**Collect with OpenTelemetry.** An OpenTelemetry collector replaces the
-kube-prometheus-stack `compose-serving-stack` installs today. The OpenTelemetry Operator
-runs it, so Modelplane composes one `OpenTelemetryCollector` per cluster. The section below
-gives the reasons and what covers each thing that stack did.
-
-Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
-`engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
-where telemetry goes, for the fleet or for the clusters its selector matches. Two smaller ones
-go with them: naming the engine port, in
-`compose-model-replica` rather than in an API, and an optional `gpuTelemetry` on
-`InferenceCluster`.
-
-Approving this means agreeing that normalization and aggregation are Modelplane's job
-rather than the platform team's, that collection is on for every source once a destination
-exists, that the collector is OpenTelemetry in place of the Prometheus stack we install
-today, and that control-plane health stays with whoever runs the control plane.
 
 ## Background
 
@@ -67,6 +34,37 @@ per-cluster recording rules nobody owns.
 a fleet question has no single place to ask it. Answering "how is this model doing everywhere"
 means visiting N stores and merging the results by hand, which is the work a fleet exists to
 save.
+
+## Summary
+
+**Collect on every cluster.** Modelplane collects from every source it owns: the engines,
+the endpoint pickers, and the substrate. There is no per-deployment toggle. A fleet with no
+destination configured collects nothing, and always-on is affordable because a fleet's
+telemetry runs about one percent of the GPUs it watches.
+
+**Normalize to `modelplane_*`.** The collector renames each engine's series to one
+vocabulary, picked by an engine-type label Modelplane stamps from a new `engines[].type` on
+the `ModelDeployment`. A dashboard reads Modelplane's names, not each engine's.
+
+**Export to one destination.** Every cluster exports straight to the destination the fleet
+configures, under one vocabulary and the same dimensions, so one query answers across the
+fleet. Modelplane runs no store and sits on no path the telemetry travels. It could not
+deploy a collector into its own control plane in any case.
+
+**Use an OpenTelemetry collector.** It replaces the kube-prometheus-stack
+`compose-serving-stack` installs today, run by the OpenTelemetry Operator, so Modelplane
+composes one `OpenTelemetryCollector` per cluster.
+
+Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
+`engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
+where telemetry goes, for the fleet or for the clusters its selector matches. Two smaller
+changes go with them: naming the engine port, which happens in `compose-model-replica` and
+not in an API, and an optional `gpuTelemetry` on `InferenceCluster`.
+
+Approving this means agreeing that normalization and aggregation are Modelplane's job and
+not the platform team's, that collection is on for every source once a destination exists,
+that the collector is OpenTelemetry in place of the Prometheus stack we install today, and
+that control-plane health stays with whoever runs the control plane.
 
 ## Architecture
 
@@ -132,24 +130,24 @@ control plane, since Modelplane has no way to deploy a collector alongside its o
 Crossplane. The section on getting the series across names the two paths that already
 serve it.
 
-Two audiences read the result and only one of them operates it. A platform team wants the
-substrate, the roll-up and the control plane, and that is the destination they already run. A
-`ModelDeployment`'s author wants the first category for their own model, which the same series
-answer: every one carries `deployment`, `model`, `cluster` and `engine`, so their view is a
-filter on a dashboard, not a separate pipeline. Modelplane runs no second, author-facing
-store, and the shipped dashboard is written to filter that way.
+Two audiences read this and only one of them operates it. The platform team wants the
+substrate, the roll-up and the control plane, and they already run the destination those
+land in. A `ModelDeployment`'s author wants the first category for one model, and the same
+series answer that: each carries `deployment`, `model`, `cluster` and `engine`, so an
+author's view is a filter on the shipped dashboard. There is no second, author-facing
+store.
 
-Access to it is the platform team's to grant, which is also why an author gets no collection
-toggle: they do not own the destination, the cost, or the retention, so a switch on their
-resource would govern none of the things that make collection a decision. What an author owns
-without asking anyone is on the API, where a `ModelDeployment`'s conditions say whether its
-replicas placed and are ready.
+Getting to that dashboard is the platform team's to grant, which is the honest reason an
+author has no collection toggle. They own neither the destination, the cost, nor the
+retention, so a switch on their resource would govern nothing that makes collection a
+decision. What they own outright is on the API: a `ModelDeployment`'s conditions say
+whether its replicas placed and are ready.
 
 ## Collect on every cluster
 
 On each cluster Modelplane collects from every source it owns. The switch is one level up
 and at the fleet: with no destination configured anywhere, no cluster composes a collector,
-because a collector nothing reads is cost with no reader.
+because a collector nothing reads is pure cost.
 
 **Every cluster means every cluster, including one with no engines on it.** An
 `InferenceGateway` can be hosted on an `InferenceCluster` of its own, and a fleet can run
@@ -162,10 +160,9 @@ scrape at all. A cluster's collector reports what that cluster has.
 **A gateway also produces usage records, and they are logs.** An `InferenceGateway` fronts
 requests with Envoy, which can write a structured access log line per request carrying the
 caller, the service, the endpoint, the served model and the token counts. Those travel the
-collector this document composes and land at the same `TelemetryDestination`, which is what
-that name is for: the destination is signal-agnostic, and usage records are the first
-signal through it that isn't a metric. Their shape belongs to the gateway's own design;
-carrying them belongs to this one.
+collector this document composes and land at the same destination the metrics do. They are
+the first signal through it that isn't a metric. Their shape belongs to the gateway's own
+design; carrying them belongs to this one.
 
 The pieces are already there.
 
@@ -174,7 +171,7 @@ The pieces are already there.
   since it's the label the InferencePool selects on. One selector on it follows the shape,
   so leader/worker, prefill/decode, and a Dynamo cluster's PodCliqueSets need no special
   casing. The Dynamo work added a fourth workload kind without touching this, which is the
-  test this approach had to pass.
+  test it had to pass.
 - **Modelplane owns the picker.** The EPP is Modelplane's own Deployment, so its metrics
   port and flags are ours to set.
 
@@ -190,7 +187,7 @@ replica. A second selector covers the endpoint pickers, and a third the substrat
 controller on a `Standard` cluster, or Grove, the KAI Scheduler and the ModelExpress
 server on a `Dynamo` one. The substrate selector follows the stack. The ModelExpress
 server goes in it, and where it serves no metrics endpoint its readiness still arrives
-through `k8s_cluster`, which is what the substrate question needs from it.
+through `k8s_cluster`, which is all the substrate question needs.
 
 Scrape the engine port by name and not by number, which needs a change first:
 `native.py`, `llmd.py`, and `grove.py` all compose `{"containerPort": 8000}` with no
@@ -338,7 +335,7 @@ nowhere to put a collector, a listener or the certificate it would need. It woul
 wrong size anyway: Crossplane reconciles resources, it does not carry a stream that grows
 with every engine pod.
 
-**The gateway doesn't rescue it either,** and it is the obvious next thought, since an
+**The gateway doesn't rescue it either.** It is the obvious next thought, since an
 `InferenceGateway` is a surface a cluster can already reach. It speaks the inference APIs,
 so routing OTLP through it means teaching Envoy a protocol it has no reason to know, to
 reach a collector that still has nowhere to run. It also couples telemetry to a component a
