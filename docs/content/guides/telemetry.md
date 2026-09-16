@@ -125,7 +125,7 @@ spec:
     vllm:num_requests_waiting: modelplane_requests_waiting
 ```
 
-Applying it is the whole change. No fork of Modelplane, and no waiting on a release.
+That apply is the whole change. No fork of Modelplane, and no waiting on a release.
 
 ## What you get
 
@@ -159,7 +159,7 @@ Nothing here changes by serving shape. Modelplane scrapes engine pods by the
 workers, and a prefill/decode pair are all found the same way. Only the leader of a
 leader/worker gang carries the serving label, which is right: the workers serve no API and
 publish nothing. A decode engine listening on 8001 behind its routing sidecar is found by
-name and not by number, which the old `targetPort` had to special-case.
+name and not by number, so it needs no rule of its own the way the old `targetPort` did.
 
 One engine still needs a flag. SGLang publishes `/metrics` only when it runs with
 `--enable-metrics`, so add it to the engine args; vLLM needs nothing.
