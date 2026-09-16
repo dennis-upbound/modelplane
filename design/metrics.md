@@ -33,7 +33,8 @@ gives the reasons and what covers each thing that stack did.
 
 Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
 `engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
-where telemetry goes, for the fleet or for the clusters its selector matches. Two smaller ones go with them: naming the engine port, in
+where telemetry goes, for the fleet or for the clusters its selector matches. Two smaller ones
+go with them: naming the engine port, in
 `compose-model-replica` rather than in an API, and an optional `gpuTelemetry` on
 `InferenceCluster`.
 
@@ -41,6 +42,31 @@ Approving this means agreeing that normalization and aggregation are Modelplane'
 rather than the platform team's, that collection is on for every source once a destination
 exists, that the collector is OpenTelemetry in place of the Prometheus stack we install
 today, and that control-plane health stays with whoever runs the control plane.
+
+## Background
+
+Collecting a deployment's metrics is hand-wired. `compose-serving-stack` installs a
+kube-prometheus-stack on every workload cluster with `PodMonitor` discovery open across
+namespaces, and everything after that is the operator's: write a `PodMonitor` that matches the
+serving shape, keep it in sync as that shape changes, and delete it on teardown. The published
+[collecting-engine-metrics]({{< ref "guides/collecting-engine-metrics.md" >}}) guide is that
+workflow written down, which is the evidence it is manual rather than a gap in the docs.
+
+Three things are wrong with it, and they are what the proposal answers one for one.
+
+**Nothing is collected until someone wires it.** A deployment that nobody wrote a `PodMonitor`
+for publishes metrics that reach no one, and a deployment whose shape changed under one scrapes
+nothing without saying so. The failure is silence, on the signal that would have explained it.
+
+**Each engine names its metrics its own way.** `vllm:time_to_first_token_seconds` and
+`sglang:time_to_first_token_seconds` are the same number, so an operator running two engines
+reads two vocabularies and writes every dashboard twice. Reconciling them by hand is
+per-cluster recording rules nobody owns.
+
+**Each cluster is an island.** The Prometheus is in-cluster and reachable by `port-forward`, so
+a fleet question has no single place to ask it. Answering "how is this model doing everywhere"
+means visiting N stores and merging the results by hand, which is the work the fleet exists to
+avoid.
 
 ## Architecture
 
@@ -502,7 +528,8 @@ answering them: what consent it needs, how long it may be kept, and whether samp
 requests is enough. Emitting metrics about a request needs none of that, which is why metrics
 do not wait on it.
 
-The cardinality cost that shapes the metric labels does not carry over. A label added to a metric multiplies series
+The cardinality cost that shapes the metric labels does not carry over. A label added to a
+metric multiplies series
 for as long as the series exists; a log record is one record. Logs are priced on volume and
 retention instead, so the control that matters is what is captured and how much of it, not
 which attributes are dropped before export.
