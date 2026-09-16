@@ -69,13 +69,24 @@ control plane, since Modelplane has no way to deploy a collector alongside its o
 Crossplane. The section on getting the series across names the two paths that already
 serve it.
 
+Two audiences read the result and only one of them operates it. A platform team wants the
+substrate, the roll-up and the control plane, and that is the destination they already run. A
+`ModelDeployment`'s author wants the first category for their own model, which the same series
+answer: every one carries `deployment`, `model`, `cluster` and `engine`, so their view is a
+filter on a dashboard rather than a separate pipeline. Modelplane runs no second, author-facing
+store, and the shipped dashboard is written to filter that way.
+
+Access to it is the platform team's to grant, which is also why an author gets no collection
+toggle: they do not own the destination, the cost, or the retention, so a switch on their
+resource would govern none of the things that make collection a decision. What an author owns
+without asking anyone is on the API, where a `ModelDeployment`'s conditions say whether its
+replicas placed and are ready.
+
 ## Collect on every cluster
 
-On each cluster Modelplane collects from every source it owns, with no per-deployment
-opt-in or opt-out, and a `ModelDeployment` author gets no toggle over telemetry the
-platform team consumes. The switch is one level up and at the fleet: with no destination
-configured anywhere, no cluster composes a collector, because a collector nothing reads is
-cost with no reader.
+On each cluster Modelplane collects from every source it owns. The switch is one level up
+and at the fleet: with no destination configured anywhere, no cluster composes a collector,
+because a collector nothing reads is cost with no reader.
 
 **Every cluster means every cluster, including one with no engines on it.** An
 `InferenceGateway` can be hosted on an `InferenceCluster` of its own, and a fleet can run
@@ -588,8 +599,7 @@ order of 40,000 series. A managed Prometheus at roughly $6.50 per thousand serie
 at one sample a minute, four times that at the 15s interval above, puts the fleet's
 telemetry near $640 a month. Fifty A100s cost between $40,000 and $125,000 a month
 depending on where they run. Telemetry is about one percent of the GPUs it watches, which
-is what makes always-on collection an easy trade and a per-deployment opt-out an answer to
-a question nobody asks.
+is what makes always-on collection an easy trade.
 
 That ratio holds because of one decision. A billing backend counts a series as active while
 it is still receiving data, for fifteen to thirty minutes after it stops, so every rolling
