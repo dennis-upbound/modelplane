@@ -72,6 +72,7 @@ guide is that workflow written down.
 - An operator configures where telemetry goes, and nothing else.
 - One vocabulary. A dashboard reads `modelplane_*` and never an engine's own names.
 - One endpoint answers for the fleet, the way any other project's `/metrics` does.
+- One pipeline carries metrics, logs and traces, and holds no state on a GPU cluster.
 - A metric is useful with the operations any Prometheus user already performs. Reconciling
   engines is Modelplane's work, not the reader's.
 - A workload cluster needs egress and nothing inbound.
@@ -404,11 +405,28 @@ every XR carries `Ready` and `Synced` on the API.
 
 ### The collector
 
-An OpenTelemetry collector replaces the kube-prometheus-stack, run by the OpenTelemetry
-Operator so Modelplane composes one `OpenTelemetryCollector` per cluster and the operator owns
+Both tiers are OpenTelemetry collectors, run by the OpenTelemetry Operator, so Modelplane
+composes one `OpenTelemetryCollector` per cluster and one at the centre and the operator owns
 the Deployment, the service account and the config reload. Everything the Prometheus stack does
 has a receiver that does it, and the Envoy scrape config Modelplane already composes transfers
 unchanged.
+
+The fleet endpoint is a Prometheus exporter on the central collector, so it serves `/metrics`
+to be scraped the way any project's does. Choosing the collector costs nothing on that.
+
+What it costs is the one thing a Prometheus does that a collector cannot: evaluate an
+expression over a window and store the answer. Nothing here needs that. Renaming, unit
+conversion, deriving one metric from two and merging after a label drop are all per-sample
+work; `rate()` and `histogram_quantile()` are the reader's and should be, since they belong
+where the queries run. A recording rule would precompute them, which is a query optimisation
+and belongs with the queries.
+
+Against that, a collector carries metrics, logs and traces on one pipeline, where a Prometheus
+carries metrics and this design already has the other two: component logs, the GenAI events
+below, and a gateway's usage records. It also holds no state, where a Prometheus on every GPU
+cluster is a store to size, retain and lose. If a windowed derivation ever turns out to be
+necessary, a Prometheus downstream of the collector computes it without changing anything
+upstream.
 
 Removing that stack is the one breaking change, so it lands separately: the collector and the
 destination arrive alongside it, where an operator can compare them, and the removal follows.
@@ -440,6 +458,14 @@ about one engine and never one about a fleet: a deployment spread over two engin
 dashboard, and every panel added afterwards costs one per engine. Mapping a metric once is less
 work than maintaining a dashboard per engine per panel, and the mapping adds rather than
 replaces, so the engine's own names survive either way.
+
+**Prometheus instead of the collector.** A Prometheus per cluster and one at the centre would
+do the same job with more expressive power, since recording rules can evaluate over a window
+and a collector cannot. It is the incumbent, PromQL is standard, and it leaves a local store an
+operator can query. It buys expressiveness this design does not use, at the price of a stateful
+store on every GPU cluster and a second pipeline for logs and traces. The one capability it
+adds is precomputing windowed expressions, which is a query optimisation and can live at the
+destination or in a Prometheus downstream of the collector.
 
 **Reconcile somewhere else.** The destination could do it, with recording rules where it is
 Prometheus or its own transforms where it is not. It is less for Modelplane to build and every
