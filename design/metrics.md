@@ -207,9 +207,12 @@ time. That is a recording rule, and it is the clearest case for the tier below.
 
 ### Normalizing an engine
 
-A `MetricMapping` says what an engine calls a metric and what Modelplane calls it.
-Modelplane provides one per engine it supports, and it renders into the per-cluster
-Prometheus as relabel and recording rules.
+A `MetricMapping` says what an engine calls a metric and what Modelplane calls it. It is
+cluster-scoped and it lives on the control plane: one object per engine, rendered into the
+Prometheus on every workload cluster running that engine, and into the next cluster to join
+without anyone revisiting it. That is the part an operator cannot assemble themselves, since
+the knowledge is fleet-wide and the configuration it produces is per-cluster. Modelplane
+provides one per engine it supports.
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -303,11 +306,14 @@ status:
     reason: histogram buckets do not match the convention
 ```
 
-`rename` covers a series that already means what it should. `expr` covers one that does not,
-and it is a PromQL expression because that is what recording rules take: a ratio from two
-gauges, a unit conversion, a sum across a label an engine exposes and we do not want. An
-engine with no mapping is still scraped, under its own names, and `status` says nothing
-matched.
+The two halves are different mechanisms, not two spellings of one. `rename` becomes a
+scrape-time relabel, so one entry carries a histogram's `_bucket`, `_sum` and `_count`
+together and nothing extra is stored. `expr` becomes a recording rule, evaluated on an
+interval and written back as a second series, which is what a ratio from two gauges, a unit
+conversion or a sum across a label we do not want actually needs. That cost is why `expr` is
+the exception: a cluster's Prometheus keeps short retention because it transforms rather than
+stores, and a mapping written entirely in `expr` would double what it holds. An engine with
+no mapping is still scraped, under its own names, and `status` says nothing matched.
 
 The engine's own series stay in the cluster's Prometheus either way. An operator who came
 for `vllm:*` still has them locally; only `modelplane_*` travels.
@@ -513,6 +519,17 @@ decline collection, which is how most of Modelplane's API works, since the team 
 resource configures it. Telemetry does not divide that way. Its cost, destination and
 retention belong to the platform team, and a toggle would cover only the data plane, leaving
 the substrate and the roll-up collected anyway.
+
+**Ship recording rules instead of a kind.** Prometheus already models both halves of this:
+`PrometheusRule` carries recording rules and a `PodMonitor`'s `metricRelabelings` carries
+renames. A platform team running Prometheus knows them, they need no API from us, and a new
+engine is a `PrometheusRule` they write without waiting for a Modelplane release. Both
+objects are per-cluster, which is where this falls down. The knowledge that vLLM calls it
+`vllm:time_to_first_token_seconds` is one fact about an engine, and expressing it as a
+`PrometheusRule` makes the operator apply that fact to every cluster running vLLM and to
+every cluster that joins afterwards. A `MetricMapping` is that fact once. It still renders
+into exactly those two mechanisms, so nothing is hidden: an operator who wants to read the
+generated relabel and rule config can.
 
 **Declare the engine type.** A required `type` on the engine selects the mapping without
 depending on metric names. It asks every user to state something the metrics already say,
