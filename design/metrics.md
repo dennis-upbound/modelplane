@@ -209,8 +209,8 @@ time to first token.
 A mapping adds rather than replaces. `vllm:time_to_first_token_seconds` still arrives under its
 own name, so an operator who came for vLLM's metrics still has them and their existing
 dashboards keep working. `modelplane_time_to_first_token` arrives beside it, and the fleet view
-reads that one. The cost is a handful of extra series per engine pod, which the arithmetic
-above makes immaterial.
+reads that one. Duplicating the mapped subset costs roughly seventy-five extra series per
+engine pod, mostly histogram buckets, which the arithmetic above absorbs.
 
 ### Make a metric a definition, not a rename
 
