@@ -31,8 +31,8 @@ spec:
       name: telemetry-destination
 ```
 
-From there `modelplane_time_to_first_token_seconds` means one thing on every cluster, and
-`modelplane:gpu_hours:1h` answers for the fleet at one endpoint.
+From there `modelplane_time_to_first_token_seconds` means one thing on every cluster that
+serves it, and `modelplane:gpu_hours:1h` answers for the fleet at one endpoint.
 
 This document is about metrics. Logs and traces travel their own path and are out of scope.
 
@@ -130,11 +130,9 @@ property of the nodes, and no deployment owns it. Two metrics carry a label of t
 `outcome` on the request counter is the response class, so a rise in 5xx separates from a
 rise in 4xx, and `kind` on the token counter separates input from output.
 
-Labels naming a pod are dropped before anything leaves the cluster, because a billing
-backend counts a series as active for fifteen to thirty minutes after it stops and every
-rolling update would mint a fresh set. Dropping `pod` from a gauge sums the replicas
-together, which is the figure the fleet wants anyway. `caller` is never added: a caller is
-unbounded by construction.
+No label names a pod. The fleet's question is about a deployment and its replicas are
+interchangeable, so the series that leave a cluster are summed across them. `caller` is
+never added: a caller is unbounded by construction.
 
 Four choices in that list are worth stating.
 
@@ -174,8 +172,8 @@ vLLM publishes every one of them, including prompt and generation length as hist
 SGLang publishes the gauges and counters, including KV utilisation as `sglang:token_usage`,
 but reports prefix-cache hit rate only as an instantaneous ratio, and its latency histograms
 use bucket boundaries that do not merge with vLLM's, so those are absent on SGLang until it
-adopts the convention. Triton and TensorRT-LLM publish batch-manager statistics and no
-latency histograms at all.
+adopts the convention. Triton and TensorRT-LLM report through their own batch-manager
+statistics, under names and a shape that need their own rules rather than a prefix swap.
 
 **The endpoint picker** publishes `llm_d_epp_*`, which is where queue depth comes from when
 a router queues in front of the engine. That is a different measurement from the engine's
@@ -190,15 +188,24 @@ pair no engine can report.
 LeaderWorkerSet or Grove controller, cert-manager and the DRA driver each report readiness,
 which `kube-state-metrics` turns into `modelplane_stack_component_up` per component.
 
-**The cluster and the GPUs** answer capacity, and the two GPU gauges come from different
-places. `modelplane_gpus_allocatable` is `nvidia.com/gpu` on the nodes, so it is a cluster
-figure and carries nothing finer. `modelplane_gpus_allocated` is the same resource requested
-by the serving pods, which `kube-state-metrics` reports per pod; the pod's owner labels come
-across with it, so once `pod` is dropped the series sums per deployment and joins the token
-counters. `kube-state-metrics` also reports a deployment's desired and ready replicas, and
-the count of its pods Pending on an unsatisfiable resource claim is where
-`modelplane_replicas_unschedulable` comes from. That one has no engine behind it by
-definition, which is the point of collecting it. DCGM reports the hardware underneath, and
+**Modelplane itself** answers capacity, and it has to. Modelplane requests GPUs as DRA
+resource claims, so a GPU is a claim against a `ResourceSlice` rather than an
+`nvidia.com/gpu` count on a node, and the series `kube-state-metrics` publishes about pod
+requests describe neither the claim nor the workload: they carry `pod` and `namespace` and
+no `model`, `deployment` or `engine`, so a fleet query grouped by model would have nothing
+to group. Modelplane knows all of it without asking, because it made the placement.
+
+So this design adds one component: a small exporter beside the Crossplane functions on the
+control plane, publishing `modelplane_gpus_allocatable`, `modelplane_gpus_allocated`,
+`modelplane_replicas_desired`, `modelplane_replicas_ready` and
+`modelplane_replicas_unschedulable` from the state those functions already reconcile,
+labelled the way everything else is. Allocatable it reads from each cluster's
+`ResourceSlices`, over the connection it already holds. These are the only metrics born on
+the control plane rather than collected on a cluster and written to it, which suits them:
+`modelplane_replicas_unschedulable` describes replicas that never started, and a cluster
+where nothing started is the cluster least able to report it.
+
+DCGM reports the hardware underneath for anyone who wants it, and
 `InferenceCluster.spec.telemetry.gpuExporter` names the exporter where a cluster runs
 something other than the default.
 
@@ -207,113 +214,66 @@ time. That is a recording rule, and it is the clearest case for the tier below.
 
 ### Normalizing an engine
 
-A `MetricMapping` says what an engine calls a metric and what Modelplane calls it. It is
-cluster-scoped and it lives on the control plane: one object per engine, rendered into the
-Prometheus on every workload cluster running that engine, and into the next cluster to join
-without anyone revisiting it. That is the part an operator cannot assemble themselves, since
-the knowledge is fleet-wide and the configuration it produces is per-cluster. Modelplane
-provides one per engine it supports.
+Modelplane knows what vLLM calls each metric, and normalizing it is configuration rather
+than API: the per-cluster Prometheus Modelplane composes carries the relabel rules already.
+An operator running a supported engine writes nothing.
+
+| Modelplane | vLLM |
+|---|---|
+| `modelplane_time_to_first_token_seconds` | `vllm:time_to_first_token_seconds` |
+| `modelplane_inter_token_latency_seconds` | `vllm:inter_token_latency_seconds` |
+| `modelplane_inference_duration_seconds` | `vllm:e2e_request_latency_seconds` |
+| `modelplane_request_queue_seconds` | `vllm:request_queue_time_seconds` |
+| `modelplane_requests_running` | `vllm:num_requests_running` |
+| `modelplane_requests_waiting` | `vllm:num_requests_waiting` |
+| `modelplane_kv_cache_utilization_ratio` | `vllm:kv_cache_usage_perc` |
+| `modelplane_prefix_cache_hits_total` | `vllm:prefix_cache_hits_total` |
+| `modelplane_prefix_cache_lookups_total` | `vllm:prefix_cache_queries_total` |
+| `modelplane_tokens_total{kind="input"}` | `vllm:prompt_tokens_total` |
+| `modelplane_tokens_total{kind="output"}` | `vllm:generation_tokens_total` |
+
+A rename is a scrape-time relabel on the metric name, so one rule carries a histogram's
+`_bucket`, `_sum` and `_count` together and adds nothing to what the cluster stores. Nothing
+declares which engine a deployment runs, because the engine already says so: every engine
+Modelplane maps prefixes its metrics with its own name, `vllm:`, `sglang:`, `nv_trt_llm_`,
+and a series arriving under a known prefix is renamed. A fork that kept vLLM's names is
+handled by vLLM's rules without knowing it is a fork.
+
+**An engine Modelplane has never seen is the case worth designing for**, because Modelplane
+runs any OpenAI-compatible server and an operator should not wait on a release to see its
+metrics. That operator writes recording rules, in the `PrometheusRule` the cluster's
+Prometheus already selects:
 
 ```yaml
-apiVersion: modelplane.ai/v1alpha1
-kind: MetricMapping
-metadata:
-  name: vllm
-spec:
-  prefix: "vllm:"
-  rename:
-  - from: vllm:time_to_first_token_seconds
-    to: modelplane_time_to_first_token_seconds
-  - from: vllm:inter_token_latency_seconds
-    to: modelplane_inter_token_latency_seconds
-  - from: vllm:e2e_request_latency_seconds
-    to: modelplane_inference_duration_seconds
-  - from: vllm:request_queue_time_seconds
-    to: modelplane_request_queue_seconds
-  - from: vllm:num_requests_running
-    to: modelplane_requests_running
-  - from: vllm:num_requests_waiting
-    to: modelplane_requests_waiting
-  - from: vllm:kv_cache_usage_perc
-    to: modelplane_kv_cache_utilization_ratio
-  - from: vllm:prefix_cache_hits_total
-    to: modelplane_prefix_cache_hits_total
-  - from: vllm:prefix_cache_queries_total
-    to: modelplane_prefix_cache_lookups_total
-  - from: vllm:prompt_tokens_total
-    to: modelplane_tokens_total
-    labels: {kind: input}
-  - from: vllm:generation_tokens_total
-    to: modelplane_tokens_total
-    labels: {kind: output}
-```
-
-`rename` is a list rather than a map because two source series can land on one name.
-`modelplane_tokens_total` is one metric distinguished by `kind`, and vLLM counts prompt and
-generation tokens separately, so the label is part of the rename. The gateway's mapping sets
-`outcome` on `modelplane_requests_total` the same way.
-
-Nothing declares which engine a deployment runs, because the engine already says so. Every
-engine Modelplane maps prefixes its metrics with its own name: `vllm:`, `sglang:`,
-`nv_trt_llm_`. A mapping claims a prefix and a series arriving under it is renamed.
-
-A fork gets this right without trying. One that kept vLLM's metric names keeps the mapping,
-and one that renamed them writes a mapping against its own prefix, which it needed either
-way.
-
-**An opaque engine is the case the mapping exists for.** An OpenAI-compatible server whose
-names carry no engine in them has nothing to match on, so the deployment names the mapping
-and the mapping selects on the label Modelplane stamps from it:
-
-```yaml
-apiVersion: modelplane.ai/v1alpha1
-kind: ModelDeployment
-metadata:
-  name: qwen3-8b
-  namespace: ml-team
-spec:
-  replicas: 2
-  template:
-    spec:
-      engines:
-      - name: qwen3-8b
-        type: my-engine                   # only when the metric names don't say
-        members:
-        - role: Standalone
-          template:
-            spec:
-              containers:
-              - name: engine
-                image: ghcr.io/acme/my-engine:v1
-                args: [--model=Qwen/Qwen3-8B]
----
-apiVersion: modelplane.ai/v1alpha1
-kind: MetricMapping
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
 metadata:
   name: my-engine
+  namespace: ml-team
+  labels:
+    modelplane.ai/metrics: normalize
 spec:
-  engineType: my-engine                   # instead of a prefix
-  rename:
-  - from: my_engine_running_requests
-    to: modelplane_requests_running
-  expr:
-  - record: modelplane_kv_cache_utilization_ratio
-    query: my_engine_kv_used_bytes / my_engine_kv_total_bytes
-status:
-  matched: true
-  absent:
-  - metric: modelplane_time_to_first_token_seconds
-    reason: histogram buckets do not match the convention
+  groups:
+  - name: my-engine
+    rules:
+    - record: modelplane_requests_running
+      expr: sum without (pod) (my_engine_running_requests)
+    - record: modelplane_kv_cache_utilization_ratio
+      expr: |
+        sum without (pod) (my_engine_kv_used_bytes)
+          / sum without (pod) (my_engine_kv_total_bytes)
 ```
 
-The two halves are different mechanisms, not two spellings of one. `rename` becomes a
-scrape-time relabel, so one entry carries a histogram's `_bucket`, `_sum` and `_count`
-together and nothing extra is stored. `expr` becomes a recording rule, evaluated on an
-interval and written back as a second series, which is what a ratio from two gauges, a unit
-conversion or a sum across a label we do not want actually needs. That cost is why `expr` is
-the exception: a cluster's Prometheus keeps short retention because it transforms rather than
-stores, and a mapping written entirely in `expr` would double what it holds. An engine with
-no mapping is still scraped, under its own names, and `status` says nothing matched.
+The rule needs no labels of its own. Modelplane's scrape config attaches `cluster`,
+`deployment`, `namespace`, `model`, `engine` and `role` to every series it collects from a
+serving pod, and a recorded series inherits them, so a rule that names the right output
+metric produces a series the fleet can already read. An engine whose metric names carry no
+prefix to identify it sets `type` on the engine, which is what Modelplane stamps into the
+`engine` label.
+
+What the operator gives up is that a `PrometheusRule` is a per-cluster object, so a fleet
+running an unsupported engine on several clusters applies it to each of them. That is the
+cost of not adding an API for it, and the alternative that would have removed it is below.
 
 The engine's own series stay in the cluster's Prometheus either way. An operator who came
 for `vllm:*` still has them locally; only `modelplane_*` travels.
@@ -324,9 +284,16 @@ Two tiers, both Prometheus.
 
 **On each inference cluster**, a Prometheus scrapes the engines by the
 `modelplane.ai/serving` label Modelplane stamps, the pickers, the substrate and the GPU
-exporter. Its recording rules apply the mappings and produce `modelplane_*`. Retention is
-short, because this tier transforms rather than stores, and it remote-writes only the
-`modelplane_*` series onward, dropping pod labels on the way out.
+exporter. Its relabel and recording rules produce `modelplane_*`, and it remote-writes only
+those series onward. Retention is short, because this tier transforms rather than stores.
+
+Dropping `pod` is the one part that needs care. A relabel on the way out would leave several
+replicas' series identical, which the receiver rejects as duplicates rather than adding up,
+so the rules aggregate first: every `modelplane_*` series is recorded as `sum without (pod)`
+of what was scraped, and it is the summed series that travels. A per-pod figure stays
+readable on the cluster, and a fleet that kept the label would pay for it, since a billing
+backend counts a series as active for fifteen to thirty minutes after it stops and every
+rolling update would mint a fresh set.
 
 **On the control plane**, a Prometheus receives those writes and is the fleet. Four questions
 only it can answer, each a rule over series every cluster now agrees on:
@@ -452,12 +419,13 @@ carries `Ready` and `Synced` on the API.
 A quantile over misaligned buckets is wrong rather than approximate, so bucket alignment is
 a condition of a metric and not a caveat on reading it. Modelplane's boundaries are the ones
 the OpenTelemetry GenAI conventions define, and vLLM's are already those. A histogram whose
-boundaries match maps; one that diverges is absent on that engine, and `status` says why.
+boundaries match are renamed; one that diverges is left alone under the engine's own name.
 
 SGLang's time-to-first-token buckets match to 0.1 seconds and diverge above it, so its
-latency histograms are the metrics its mapping leaves absent. Its gauges and counters map
-normally. An operator running SGLang loses the latency panels and `status` says why, which
-beats a fleet quantile that quietly averaged two bucket layouts.
+latency histograms are what Modelplane's SGLang rules leave out. Its gauges and counters are
+renamed normally. An operator running SGLang loses the latency panels, and the dashboards
+Modelplane ships say which engines fill each one, which beats a fleet quantile that quietly
+averaged two bucket layouts.
 
 ### Removing the Prometheus stack
 
@@ -520,18 +488,19 @@ resource configures it. Telemetry does not divide that way. Its cost, destinatio
 retention belong to the platform team, and a toggle would cover only the data plane, leaving
 the substrate and the roll-up collected anyway.
 
-**Ship recording rules instead of a kind.** Prometheus already models both halves of this:
-`PrometheusRule` carries recording rules and a `PodMonitor`'s `metricRelabelings` carries
-renames. A platform team running Prometheus knows them, they need no API from us, and a new
-engine is a `PrometheusRule` they write without waiting for a Modelplane release. Both
-objects are per-cluster, which is where this falls down. The knowledge that vLLM calls it
-`vllm:time_to_first_token_seconds` is one fact about an engine, and expressing it as a
-`PrometheusRule` makes the operator apply that fact to every cluster running vLLM and to
-every cluster that joins afterwards. A `MetricMapping` is that fact once. It still renders
-into exactly those two mechanisms, so nothing is hidden: an operator who wants to read the
-generated relabel and rule config can.
+**A `MetricMapping` kind.** A cluster-scoped kind on the control plane naming what an engine
+calls each metric, rendered into every cluster running that engine and into the next one to
+join. It makes an engine's names one fact stated once, where a `PrometheusRule` makes it a
+fact restated per cluster, and it gives Modelplane somewhere to report that a mapping matched
+nothing. The cost is a kind, which is permanent: a kind can be added later and cannot
+gracefully be removed. Prometheus already models both halves, in `PrometheusRule` and in a
+`PodMonitor`'s `metricRelabelings`, and a team running Prometheus knows them. The per-cluster
+burden falls only on an operator running an engine Modelplane does not ship rules for, who
+has already taken on more than that by running it. If a fleet with several unsupported
+engines finds the repetition real, the kind can be added then, over a metric surface that
+would not change.
 
-**Declare the engine type.** A required `type` on the engine selects the mapping without
+**Declare the engine type.** A required `type` on the engine says which rules apply without
 depending on metric names. It asks every user to state something the metrics already say,
-and an enum of known engines locks out a fork. It survives as the optional escape for an
-engine whose names carry no prefix.
+and an enum of known engines locks out a fork. It survives as the optional field that names
+an engine whose metric names carry no prefix.
