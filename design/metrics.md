@@ -319,13 +319,16 @@ from end-to-end.
 | --- | --- | --- | --- |
 | `time_to_first_token` | `vllm:time_to_first_token_seconds` | `sglang:time_to_first_token_seconds` | derived |
 | `inter_token_latency` | `vllm:inter_token_latency_seconds` | `sglang:inter_token_latency_seconds` | derived |
-| `time_per_output_token` | `vllm:time_per_output_token_seconds` | `sglang:time_per_output_token_seconds` | derived |
+| `time_per_output_token` | `vllm:request_time_per_output_token_seconds` | `sglang:time_per_output_token_seconds` | derived |
 | `request_prefill_time` | `vllm:request_prefill_time_seconds` | `sglang:per_stage_req_latency_seconds` | `nv_trt_llm_*` |
 | `request_decode_time` | `vllm:request_decode_time_seconds` | per-stage | `nv_trt_llm_*` |
 | `e2e_request_latency` | `vllm:e2e_request_latency_seconds` | `sglang:e2e_request_latency_seconds` | `nv_inference_request_duration_us` |
 | `requests_waiting` | `vllm:num_requests_waiting` | scheduler waiting | `nv_trt_llm_request_metrics` |
-| `kv_cache_usage` | `vllm:gpu_cache_usage_perc` | token usage | TRT-LLM KV metrics |
+| `requests_running` | `vllm:num_requests_running` | scheduler running | `nv_trt_llm_request_metrics` |
+| `request_queue_time` | `vllm:request_queue_time_seconds` | queue latency | derived |
+| `kv_cache_usage` | `vllm:kv_cache_usage_perc` | token usage | TRT-LLM KV metrics |
 | `prefix_cache_hits` | `vllm:prefix_cache_hits` | cache hit | n/a |
+| `prefix_cache_queries` | `vllm:prefix_cache_queries` | cache queries | n/a |
 | `input_sequence_tokens` | `vllm:request_prompt_tokens` | prompt tokens | `nv_trt_llm_*` |
 | `output_sequence_tokens` | `vllm:request_generation_tokens` | generation tokens | `nv_trt_llm_*` |
 | `requests_total{outcome}` | `vllm:request_success_total` | request counters | Triton success/fail |
@@ -338,9 +341,30 @@ newer TensorRT-LLM metrics. Shipping it as a third built-in would hand the first
 user a mapping that doesn't map, so the docs carry it as a `MetricMapping` to write, with
 the gaps named. It is the extension point's first real use.
 
-Inter-token latency and time per output token stay separate. ITL is the per-token gap a
-streaming user feels. TPOT is the amortized decode rate. Only TPOT is in the OpenTelemetry
-set, so we carry both.
+That alignment is worth being exact about, because it decides what `modelplane_*` is for.
+The GenAI conventions define three server-side metrics, `gen_ai.server.request.duration`,
+`gen_ai.server.time_to_first_token` and `gen_ai.server.time_per_output_token`, alongside
+client-side `gen_ai.client.token.usage`. Those are the first rows of the table, and where
+an engine emits them they pass through under their standard names, so a backend that reads
+the convention needs no mapping at all.
+
+The standard stops at latency and tokens. Everything that answers "why is it slow" sits
+outside it: queue depth and queue time, the running and waiting split, KV-cache occupancy,
+and prefix-cache hit rate. That is what the normalized surface is for, rather than a
+preference for our own names, and where the convention already covers a series we do not
+rename it.
+
+Inter-token latency and time per output token stay separate for the same reason. Only TPOT
+is in the standard; ITL is the per-token gap a streaming user feels, where TPOT is the
+amortized decode rate, so we carry both.
+
+Saturation is where the table earns its keep. Latency says a deployment is unhealthy and
+these say why. KV-cache occupancy approaching full forces the scheduler to preempt and
+recompute, which arrives as a latency cliff rather than a slope, and queue time separates
+"the request waited" from "the model is slow". Prefix-cache hits need `prefix_cache_queries`
+as a denominator, which is why both are collected rather than the hit counter alone. vLLM
+v1 exposes no preemption counter, so the cliff is inferred from occupancy and queue time
+rather than read directly. That is a gap in the engine, not one this design can close.
 
 Under disaggregation the two roles show different health. A prefill worker is watched on
 `modelplane_time_to_first_token` and prefill-queue depth. A decode worker is watched on
@@ -569,6 +593,35 @@ Getting this wrong looks like it worked and reports nonsense.
 Histogram buckets are the other cost, and not one to trim. `le` is what makes
 the fleet histogram and the SLO ratio above possible, so the buckets stay as the GenAI
 conventions define them.
+
+### Logs
+
+A `TelemetryDestination` names a destination rather than a metrics endpoint because the same
+pipeline carries the other signals. Logs are the one with a decision attached, so the shape is
+recorded here even though metrics land first.
+
+Two kinds travel under the name and they are not alike. Component logs are what the engine, the
+gateway and the controllers write to stderr, read by the `filelog` receiver. They earn their
+place the way they always do: a metric says a deployment is failing, and the log says the
+engine could not find the weights. Those ship with the rest.
+
+GenAI events are the other kind. The conventions define
+`gen_ai.client.inference.operation.details` as a log record carrying the prompt, the completion
+and the sampling parameters, correlated back to its span by trace and span id. That is what
+makes one slow request inspectable rather than only counted.
+
+It is also the most sensitive thing the pipeline could move, and the largest. A prompt and its
+completion are orders of magnitude bigger than a metric sample, and they are user content,
+which makes them a consent and retention question before a volume one. So it is off by default
+and stays off until an operator turns it on, and this design records the questions rather than
+answering them: what consent it needs, how long it may be kept, and whether sampling a share of
+requests is enough. Emitting metrics about a request needs none of that, which is why metrics
+do not wait on it.
+
+The cardinality argument above does not carry over. A label added to a metric multiplies series
+for as long as the series exists; a log record is one record. Logs are priced on volume and
+retention instead, so the control that matters is what is captured and how much of it, not
+which attributes are dropped before export.
 
 ## Collector: OpenTelemetry
 
