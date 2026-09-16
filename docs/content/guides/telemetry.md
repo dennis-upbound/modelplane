@@ -88,10 +88,13 @@ spec:
 
 ## Naming your engine
 
-Metrics arrive under whatever name the engine gave them.
-`vllm:num_requests_waiting` and SGLang's queue depth counter are the same number, so
-Modelplane renames both to `modelplane_requests_waiting` once it knows which engine
-produced them. Set `type` to say:
+There is nothing to set. `vllm:num_requests_waiting` and SGLang's queue depth counter are
+the same number, and Modelplane renames both to `modelplane_requests_waiting` by matching
+the prefix each engine puts on its own metric names. Rules ship for `vllm:`, `sglang:` and
+TensorRT-LLM's `nv_`.
+
+An engine whose metric names don't say what it is, an OpenAI-compatible server publishing a
+bare `http_requests_total`, has nothing to match on. Name the mapping for it with `type`:
 
 ```yaml {nocopy=true}
 spec:
@@ -99,31 +102,31 @@ spec:
     spec:
       engines:
       - name: qwen3-8b
-        type: vllm             # selects the rename rules
+        type: my-engine        # only when the metric names don't say
 ```
 
-Modelplane provides rules for `vllm`, `sglang`, and `trtllm`. Leave `type` off and the
-engine's metrics still arrive, under their own names, and Modelplane reports that no
-mapping matched instead of guessing one.
+Either way an engine with no mapping still gets collected, under its own names, and
+Modelplane reports that nothing matched instead of guessing.
 
 ## Adding an engine Modelplane doesn't cover
 
-A forked or new engine needs a `MetricMapping`. Set `type` to any value and write the
-mapping that selects it:
+A forked or new engine needs a `MetricMapping`. Write one against the prefix it publishes
+under:
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
 kind: MetricMapping
 metadata:
-  name: my-vllm-fork
+  name: my-engine
 spec:
-  selector:
-    matchLabels:
-      modelplane.ai/engine: my-vllm-fork
+  prefix: "myengine_"
   rename:
-    vllm:time_to_first_token_seconds: modelplane_time_to_first_token
-    vllm:num_requests_waiting: modelplane_requests_waiting
+    myengine_ttft_seconds: modelplane_time_to_first_token
+    myengine_queue_depth: modelplane_requests_waiting
 ```
+
+A fork that kept vLLM's metric names needs nothing at all: it already matches the `vllm:`
+mapping, because that is what it calls them.
 
 That apply is the whole change. No fork of Modelplane, and no waiting on a release.
 

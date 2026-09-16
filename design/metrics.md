@@ -43,8 +43,8 @@ destination configured collects nothing, and always-on is affordable because a f
 telemetry runs about one percent of the GPUs it watches.
 
 **Normalize to `modelplane_*`.** The collector renames each engine's series to one
-vocabulary, picked by an engine-type label Modelplane stamps from a new `engines[].type` on
-the `ModelDeployment`. A dashboard reads Modelplane's names, not each engine's.
+vocabulary, matched on the prefix each engine already puts on its metric names. A dashboard
+reads Modelplane's names, not each engine's, and nobody declares which engine they run.
 
 **Export to one destination.** Every cluster exports straight to the destination the fleet
 configures, under one vocabulary and the same dimensions, so one query answers across the
@@ -55,11 +55,12 @@ deploy a collector into its own control plane in any case.
 `compose-serving-stack` installs today, run by the OpenTelemetry Operator, so Modelplane
 composes one `OpenTelemetryCollector` per cluster.
 
-Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
-`engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
-where telemetry goes, for the fleet or for the clusters its selector matches. Two smaller
-changes go with them: naming the engine port, which happens in `compose-model-replica` and
-not in an API, and an optional `gpuTelemetry` on `InferenceCluster`.
+Two API changes carry it: a `MetricMapping` kind holding one engine's renames, and a
+cluster-scoped `TelemetryDestination` naming where telemetry goes, for the fleet or for the
+clusters its selector matches. Three smaller ones go with them: an optional
+`engines[].type` for an engine whose metric names don't say what it is, naming the engine
+port, which happens in `compose-model-replica` and not in an API, and an optional
+`gpuTelemetry` on `InferenceCluster`.
 
 Approving this means agreeing that normalization and aggregation are Modelplane's job and
 not the platform team's, that collection is on for every source once a destination exists,
@@ -769,21 +770,27 @@ args, and serving stays opaque to the engine inside. Normalization is the opposi
 `modelplane_*` series only if something knows which engine produced them. So we need just
 enough engine identity to pick a mapping, and no more.
 
-The pattern is the one the [GAIE model-server-protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/003-model-server-protocol/README.md)
-uses: read a label, don't detect the engine. The GAIE endpoint picker carries metric
-mappings for vLLM and SGLang and selects one from an engine-type label on the pod.
+The engine already says which it is. Every engine we map prefixes its metrics with its own
+name: `vllm:time_to_first_token_seconds`, `sglang:time_to_first_token_seconds`,
+`nv_trt_llm_request_metrics`. A `MetricMapping` matches on that prefix, so nothing has to be
+declared and nothing has to be stamped. An engine whose metrics arrive under `vllm:` gets the
+vLLM mapping because that is what it called them.
 
-No such label exists in Modelplane today, and an ML team can't add one. The
-`ModelDeployment` XRD rejects any label key under the reserved `modelplane.ai/` prefix, on
-both the deployment and the member pod template, so `modelplane.ai/engine: vllm` fails to
-apply. That prefix is Modelplane's to stamp, which is how `modelplane.ai/serving`,
-`modelplane.ai/workload` and `modelplane.ai/pool` already reach pods.
+This is what a fork gets right for free. A vLLM fork that keeps the metric names keeps the
+mapping with no field to set, and one that renames them needs a mapping either way, which it
+writes against its own prefix.
 
-So the engine type is a field, and the label is derived from it. An optional `type` on the
-engine, naming the engine's kind, which `compose-model-replica` stamps onto the pod as
-`modelplane.ai/engine` alongside the labels it already applies. One field feeds two
-consumers, the picker for routing and the collector for normalization, and the reserved
-prefix keeps meaning what it means.
+The prefix runs out on an engine whose names carry no engine in them. An OpenAI-compatible
+server publishing `http_requests_total` is indistinguishable from anything else publishing the
+same, and no rule recovers what the names don't say. For that case, and only that case, an
+optional `type` on the engine names the mapping to use. `compose-model-replica` stamps it as
+`modelplane.ai/engine`, since the `ModelDeployment` XRD reserves that prefix for Modelplane and
+an ML team can't set it themselves, and a mapping can select on the label instead of the
+prefix.
+
+So the field exists and almost nobody sets it. That ordering matters more than the field:
+derived is the path, declared is the escape, and an engine nobody anticipated is passthrough
+under its own names rather than an error.
 
 The picker routes any engine. Its KV- and queue-aware scoring reads the engine's standard
 metrics through the same mapping, so an engine without them still routes, only less
@@ -793,10 +800,10 @@ informed.
   follows the GAIE protocol and the OpenTelemetry GenAI conventions: TTFT, time per output
   token, queue depth, KV-cache occupancy. It's the metrics analogue of the OpenAI API
   contract Modelplane already assumes for serving.
-- **Selection by a stamped label.** `modelplane.ai/engine` picks the `MetricMapping`.
-  `type` is a free-form string validated as a label value rather than an enum, so the
-  mappings below stay open to a forked or unreleased engine an enum would lock out. A
-  value with no mapping degrades to passthrough.
+- **Selection by metric prefix, or by label where that fails.** A `MetricMapping` names
+  the prefix it claims. Where an engine's names carry no prefix, `type` is a free-form
+  string validated as a label value and not an enum, so a forked or unreleased engine an
+  enum would lock out still has a way in. Neither matching degrades to passthrough.
 - **An extension point, not a registry.** The built-in mappings live in
   `compose-serving-stack` as code, since a Crossplane configuration package ships XRDs and
   compositions rather than instances, and a composition can't apply one to the control
@@ -819,12 +826,14 @@ per-pod labels a mapping attaches to series it does not rename; and a forked eng
 emits the upstream names while needing its own mapping. Scheduler names are plain
 `scheduler_*` with no namespace at all.
 
-In collector terms that makes the rename an OTTL transform gated on a resource attribute,
-rather than the simpler metrics-transform processor, which matches on metric name only.
-The pod label reaches OTTL as a resource attribute through the k8sattributes processor.
+In collector terms the rename is a match on metric name, which is what both the transform
+processor and the simpler metrics-transform processor do natively. Matching on the name is why:
+with the engine in the name there is no pod label to lift onto the series first, and no
+`k8sattributes` dependency in the rename path. Where a mapping selects on `type` instead, that
+dependency comes back for that mapping alone.
 
-A `MetricMapping` is small: a selector for the pods it applies to, the source names, the
-`modelplane_*` name each becomes, and the labels to keep or add. The vLLM one:
+A `MetricMapping` is small: the prefix it claims, the source names, the `modelplane_*` name
+each becomes, and the labels to keep or add. The vLLM one:
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -832,9 +841,7 @@ kind: MetricMapping
 metadata:
   name: vllm
 spec:
-  selector:
-    matchLabels:
-      modelplane.ai/engine: vllm      # stamped by Modelplane from engines[].type
+  prefix: "vllm:"                     # what this engine calls its metrics
   rename:
     vllm:time_to_first_token_seconds: modelplane_time_to_first_token
     vllm:inter_token_latency_seconds: modelplane_inter_token_latency
@@ -871,18 +878,10 @@ receivers:
           regex: http
 
 processors:
-  # lifts the stamped engine label onto the series as a resource attribute
-  k8sattributes:
-    extract:
-      labels:
-      - { tag_name: engine, key: modelplane.ai/engine, from: pod }
-
-  # one block per MetricMapping, gated on the engine it selects
+  # one block per MetricMapping, gated on the prefix it claims
   transform/vllm:
     metric_statements:
     - context: metric
-      conditions:
-      - resource.attributes["engine"] == "vllm"
       statements:                           # one per rename entry
       - set(name, "modelplane_time_to_first_token")
           where name == "vllm:time_to_first_token_seconds"
