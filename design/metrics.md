@@ -12,9 +12,9 @@ reach the store by `port-forward`. Each engine names its metrics its own way, an
 cluster answers only for itself.
 
 This proposes that Modelplane collect from every source it runs, publish a `modelplane_*`
-metric wherever an engine can produce one that means the same thing, and export to one
-destination the operator names. Configuring where telemetry goes is the whole of the common
-case:
+metric wherever an engine can produce one that means the same thing, and serve the fleet at one
+endpoint on the control plane that also forwards to wherever the operator keeps telemetry.
+Configuring where telemetry goes is the whole of the common case:
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -32,8 +32,8 @@ spec:
       name: telemetry-destination
 ```
 
-From there `modelplane_time_to_first_token` means one thing wherever it appears, and one
-query answers across the fleet.
+From there `modelplane_time_to_first_token` means one thing wherever it appears, one endpoint
+answers for the fleet, and the series arrive wherever the operator already keeps telemetry.
 
 ## Background
 
@@ -71,6 +71,7 @@ guide is that workflow written down.
 
 - An operator configures where telemetry goes, and nothing else.
 - One vocabulary. A dashboard reads `modelplane_*` and never an engine's own names.
+- One endpoint answers for the fleet, the way any other project's `/metrics` does.
 - A metric is useful with the operations any Prometheus user already performs. Reconciling
   engines is Modelplane's work, not the reader's.
 - A workload cluster needs egress and nothing inbound.
@@ -124,6 +125,23 @@ thirty minutes after it stops and every rolling update would mint a fresh set pe
 `engine`, `cluster`, `model`, `deployment` and `namespace` are kept, which is what a
 dashboard groups by. `caller` is never added: a caller is unbounded by construction, and
 what a caller was served is a usage record rather than a metric.
+
+### Decide the metrics first, then find them
+
+The set comes from what an operator needs to answer, not from what an engine happens to
+publish. Four questions, and the series that answer them:
+
+| Question | Metrics |
+|---|---|
+| How long before a user sees anything? | `modelplane_time_to_first_token`, histogram |
+| How fast does it read after that? | `modelplane_inter_token_latency`, `modelplane_time_per_output_token`, histograms |
+| Is it saturated? | `modelplane_requests_waiting`, `modelplane_requests_running`, gauges; `modelplane_request_queue_time`, histogram; `modelplane_kv_cache_usage`, a 0-to-1 gauge |
+| Is the work paying off? | `modelplane_tokens_total` by kind, counter; `modelplane_prefix_cache_hit_rate`, gauge; `modelplane_requests_total` by outcome, counter |
+
+Each names its instrument and its unit before any engine is consulted, which is what makes the
+next step a question with an answer: can the components we run produce these? Mostly yes,
+sometimes only by arithmetic, and occasionally not at all. The rest of this section is that
+exercise.
 
 ### Publish one vocabulary
 
@@ -284,14 +302,31 @@ until it adopts the convention.
 An operator running SGLang loses two panels and knows why, which Alternatives weighs against
 the other answer.
 
-### Export to one destination
+### Serve the fleet from one endpoint
 
-Every cluster's collector exports straight to the destination. Modelplane holds one
-connection to a workload cluster it can rely on, the API server the control plane reaches
-with the kubeconfig `provider-kubernetes` holds, and it runs the wrong way for telemetry.
-An on-premise or neocloud GPU cluster behind a firewall can reach out where nothing can
-reach in. So a cluster needs egress and nothing inbound, and the credential travels the way
-a `ModelCache` already propagates a HuggingFace token.
+Every other cloud native project answers "how is it doing" at one `/metrics`, with the series
+its authors chose. A fleet of GPU clusters should not be worse. So Modelplane composes a
+collector on the control plane that every cluster exports to, and it serves the fleet's
+`modelplane_*` series at one endpoint and forwards them to wherever the operator keeps
+telemetry.
+
+That tier is what makes the roll-up ours rather than an exercise for the reader. Capacity,
+GPU-hours and replicas ready against desired are computed there and published as series, so an
+operator scrapes one endpoint and gets the fleet, and a `TelemetryDestination` still decides
+where the data goes afterwards.
+
+It is skippable, and skipping it is one field. A control plane that schedules no workloads has
+nowhere to put a collector, and a fleet whose clusters cannot reach the control plane has no
+path to it. Those clusters export straight to the destination and lose the fleet endpoint,
+keeping every per-cluster series and the queries that aggregate them. The pipeline is the same
+either way; the tier is a hop, not a fork.
+
+Either way a cluster needs egress and nothing inbound.Modelplane holds one connection to a
+workload cluster it can rely on, the API server the
+control plane reaches with the kubeconfig `provider-kubernetes` holds, and it runs the wrong
+way for telemetry. An on-premise or neocloud GPU cluster behind a firewall can reach out where
+nothing can reach in, so everything here pushes outward and the credential travels the way a
+`ModelCache` already propagates a HuggingFace token.
 
 Two things follow for a backend inside an operator's own network, and a third for a cluster
 that cannot reach the fleet's. A private CA needs naming, an egress proxy needs declaring, and
@@ -413,11 +448,12 @@ mechanism, they exist only on some destinations, and either way an OSS user woul
 which engines differ and how, which is the knowledge the vocabulary exists to hold. A
 destination that wants recording rules for its own queries can still have them.
 
-**Collect at the control plane.** A collector where Modelplane already knows about every
-cluster reads naturally, and it is the first shape to rule out. A control plane schedules no
-workloads, so there is nowhere to put a collector, a listener, or the certificate it needs. It
-would also be the wrong size: Crossplane reconciles resources, it does not carry a stream that
-grows with every engine pod.
+**No central tier, every cluster straight to the destination.** It is one fewer thing to run
+and one fewer thing to reach, and a fleet whose telemetry lands in a backend anyway gains
+nothing from a stop on the way. It gives up the endpoint that makes this feel like one
+project's metrics, and it hands the reader the fleet roll-up to assemble in whatever query
+language their backend speaks. It stays available as a field, because a control plane that
+schedules no workloads cannot host the tier at all.
 
 **Route telemetry through the gateway.** An `InferenceGateway` is already a surface a cluster
 can reach. It speaks the inference APIs, so carrying OTLP means teaching Envoy a protocol it
