@@ -33,7 +33,7 @@ gives the reasons and what covers each thing that stack did.
 
 Three API changes carry it: a `MetricMapping` kind holding one engine's renames,
 `engines[].type` on a `ModelDeployment`, and a cluster-scoped `TelemetryDestination` naming
-where the fleet's telemetry goes. Two smaller ones go with them: naming the engine port, in
+where telemetry goes, for the fleet or for the clusters its selector matches. Two smaller ones go with them: naming the engine port, in
 `compose-model-replica` rather than in an API, and an optional `gpuTelemetry` on
 `InferenceCluster`.
 
@@ -41,6 +41,43 @@ Approving this means agreeing that normalization and aggregation are Modelplane'
 rather than the platform team's, that collection is on for every source once a destination
 exists, that the collector is OpenTelemetry in place of the Prometheus stack we install
 today, and that control-plane health stays with whoever runs the control plane.
+
+## Architecture
+
+Every cluster collects what it runs and exports it outward. Modelplane composes the collectors
+and holds the destination; it stores nothing, aggregates nothing, and sits on no path the
+telemetry travels.
+
+```mermaid
+flowchart LR
+    subgraph icA["InferenceCluster: serving"]
+        SA["engines / EPPs / substrate / DCGM"]
+        CA["OpenTelemetryCollector\n(scrape + rename to modelplane_*)"]
+    end
+    subgraph icB["InferenceCluster: gateway only"]
+        SB["Envoy AI Gateway"]
+        CB["OpenTelemetryCollector"]
+    end
+    subgraph cp["control plane (composes, collects nothing)"]
+        XP["Crossplane\n(functions, fleet scheduler, XRs)"]
+        TD["TelemetryDestination"]
+    end
+    CPM["/metrics on Crossplane's own pods"]
+    DEST["destination\n(OTLP or Prometheus-compatible)"]
+    OP["operator\ndashboards + alerting"]
+    SA --> CA
+    SB --> CB
+    TD -.-> XP
+    XP -.->|"composes the collectors"| CA
+    XP -.-> CB
+    CA -->|"OTLP"| DEST
+    CB -->|"OTLP"| DEST
+    XP --- CPM
+    CPM -.->|"operator's existing scrape"| OP
+    DEST --> OP
+    classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
+    class CA,CB new
+```
 
 ## What to monitor
 
@@ -169,155 +206,6 @@ usually runs the GPU Operator's already. `InferenceCluster.spec.gpuTelemetry`, `
 the `Existing` one that has none. The scrape stays unconditional and collects whichever
 exporter is there.
 
-## Capture from an opaque engine
-
-Modelplane doesn't know which engine a deployment runs. The ML team supplies an image and
-args, and serving stays opaque to the engine inside. Normalization is the opposite.
-`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` fold into one
-`modelplane_*` series only if something knows which engine produced them. So we need just
-enough engine identity to pick a mapping, and no more.
-
-The pattern is the one the [GAIE model-server-protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/003-model-server-protocol/README.md)
-uses: read a label, don't detect the engine. The GAIE endpoint picker carries metric
-mappings for vLLM and SGLang and selects one from an engine-type label on the pod.
-
-No such label exists in Modelplane today, and an ML team can't add one. The
-`ModelDeployment` XRD rejects any label key under the reserved `modelplane.ai/` prefix, on
-both the deployment and the member pod template, so `modelplane.ai/engine: vllm` fails to
-apply. That prefix is Modelplane's to stamp, which is how `modelplane.ai/serving`,
-`modelplane.ai/workload` and `modelplane.ai/pool` already reach pods.
-
-So the engine type is a field, and the label is derived from it. An optional `type` on the
-engine, naming the engine's kind, which `compose-model-replica` stamps onto the pod as
-`modelplane.ai/engine` alongside the labels it already applies. One field feeds two
-consumers, the picker for routing and the collector for normalization, and the reserved
-prefix keeps meaning what it means.
-
-The picker routes any engine. Its KV- and queue-aware scoring reads the engine's standard
-metrics through the same mapping, so an engine without them still routes, only less
-informed.
-
-- **A capture contract.** An engine exposes Prometheus `/metrics`. The required set
-  follows the GAIE protocol and the OpenTelemetry GenAI conventions: TTFT, time per output
-  token, queue depth, KV-cache occupancy. It's the metrics analogue of the OpenAI API
-  contract Modelplane already assumes for serving.
-- **Selection by a stamped label.** `modelplane.ai/engine` picks the `MetricMapping`.
-  `type` is a free-form string validated as a label value rather than an enum, so the
-  mappings below stay open to a forked or unreleased engine an enum would lock out. A
-  value with no mapping degrades to passthrough.
-- **An extension point, not a registry.** The built-in mappings live in
-  `compose-serving-stack` as code, since a Crossplane configuration package ships XRDs and
-  compositions rather than instances, and a composition can't apply one to the control
-  plane it runs on. `MetricMapping` is what a platform team adds for an engine Modelplane
-  doesn't ship, and a mapping selecting an engine already built in replaces it. Being
-  typed, it validates on apply and lists under `kubectl get metricmappings`, and adding one
-  is no fork and no Modelplane release.
-- **Graceful degradation.** An unlabelled or unmapped engine still gets scraped and
-  aggregated under its own names. The rename is skipped and Modelplane surfaces it
-  ("no mapping for `X`") rather than guessing a mapping and reporting the wrong thing.
-  Passthrough keeps the name and not the punctuation: the collector's Prometheus exporter
-  sanitizes `:` to `_`, so an unmapped `vllm:gpu_cache_usage_perc` arrives as
-  `vllm_gpu_cache_usage_perc`. Measured, not assumed.
-
-Selecting by label rather than by metric name looks redundant at first, since engine
-metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
-rename them unambiguously. The label carries what a name cannot: which engine a pod claims
-to run, so "no mapping for `X`" is distinguishable from a rename that matched nothing; the
-per-pod labels a mapping attaches to series it does not rename; and a forked engine, which
-emits the upstream names while needing its own mapping. Scheduler names are plain
-`scheduler_*` with no namespace at all.
-
-In collector terms that makes the rename an OTTL transform gated on a resource attribute,
-rather than the simpler metrics-transform processor, which matches on metric name only.
-The pod label reaches OTTL as a resource attribute through the k8sattributes processor.
-
-A `MetricMapping` is small: a selector for the pods it applies to, the source names, the
-`modelplane_*` name each becomes, and the labels to keep or add. The vLLM one:
-
-```yaml
-apiVersion: modelplane.ai/v1alpha1
-kind: MetricMapping
-metadata:
-  name: vllm
-spec:
-  selector:
-    matchLabels:
-      modelplane.ai/engine: vllm      # stamped by Modelplane from engines[].type
-  rename:
-    vllm:time_to_first_token_seconds: modelplane_time_to_first_token
-    vllm:inter_token_latency_seconds: modelplane_inter_token_latency
-    vllm:num_requests_waiting: modelplane_requests_waiting
-    vllm:gpu_cache_usage_perc: modelplane_kv_cache_usage
-  labels:
-    add: { engine: vllm }
-```
-
-`compose-serving-stack` reads every `MetricMapping` as a required resource, the same way
-`compose-model-deployment` reads `InferenceCluster` and `ModelCache`. It renders them into
-the collector's config, which is the `config` block of the `OpenTelemetryCollector`
-composed on each cluster. The `rename` map becomes transform-processor rules, applied to
-metrics from the pods the `selector` matches. A new engine is a new `MetricMapping`, not
-a package change.
-
-What that renders, with the vLLM mapping above as the only one installed:
-
-```yaml
-receivers:
-  prometheus:
-    config:
-      scrape_configs:
-      - job_name: modelplane-engines
-        kubernetes_sd_configs: [{ role: pod }]
-        relabel_configs:
-        # every engine of every deployment, whatever its workload kind
-        - source_labels: [__meta_kubernetes_pod_label_modelplane_ai_serving]
-          action: keep
-          regex: .+
-        # the engine's own port, not a sidecar's
-        - source_labels: [__meta_kubernetes_pod_container_port_name]
-          action: keep
-          regex: http
-
-processors:
-  # lifts the stamped engine label onto the series as a resource attribute
-  k8sattributes:
-    extract:
-      labels:
-      - { tag_name: engine, key: modelplane.ai/engine, from: pod }
-
-  # one block per MetricMapping, gated on the engine it selects
-  transform/vllm:
-    metric_statements:
-    - context: metric
-      conditions:
-      - resource.attributes["engine"] == "vllm"
-      statements:                           # one per rename entry
-      - set(name, "modelplane_time_to_first_token")
-          where name == "vllm:time_to_first_token_seconds"
-      - set(name, "modelplane_kv_cache_usage")
-          where name == "vllm:gpu_cache_usage_perc"
-
-exporters:
-  otlp:
-    endpoint: ${MODELPLANE_OTLP_ENDPOINT}
-    auth: { authenticator: bearertokenauth }
-```
-
-An unmapped engine matches the scrape config and no `transform` block, so it arrives under
-its own names. That is the degradation above, and the structure gives it rather than a
-rule having to.
-
-All of this was built and run in
-[#412](https://github.com/modelplaneai/modelplane/pull/412), on a GKE cluster with vLLM
-0.23.0 and its 359 metric lines: the mapped ones came back renamed in place and labelled
-with their engine, and the remaining 308 passed through. That PR is closed unmerged waiting
-on this design, and the branch `dennis/metrics-poc` stays. The EPP half is unbuilt, since
-the endpoint picker exposes no metrics port today.
-
-As engines emit the OpenTelemetry conventions directly (vLLM already emits OTLP traces,
-and native OTLP metrics are in progress), each mapping shrinks toward identity and the
-label becomes optional.
-
 ## Normalize to `modelplane_*`
 
 The collector renames each engine's series to a `modelplane_*` surface with a consistent
@@ -394,37 +282,6 @@ substrate and `k8s_cluster` jobs stay at 30s, since a controller's health doesn'
 fast. Both live in the composed scrape config, so they are Modelplane's to set. Surfacing
 them is a field this design doesn't add.
 
-## Cluster scheduler metrics
-
-The engine is not the only pluggable component on a workload cluster. The pod scheduler
-that places the engine pods is one too. By default it is kube-scheduler, which on a managed
-cluster sits in the provider's control plane and is often not scrapable.
-
-A gang scheduler runs as in-cluster pods the collector reaches, and on a `Dynamo` cluster
-Modelplane now installs one itself. `compose-serving-stack` composes the KAI Scheduler and
-the queues its pods schedule against, so KAI's series are first-party rather than something
-a platform team might have brought: the queue is `modelplane` under an unbounded
-`modelplane-root`, and every Grove pod carries `kai.scheduler/queue: modelplane`.
-
-Modelplane treats a scheduler like an engine. A per-scheduler mapping, keyed by the one
-installed, normalizes to a `modelplane_cluster_scheduler_*` surface. The name says cluster
-because a future Modelplane fleet scheduler, placing replicas across clusters rather than
-pods across nodes, would get its own `modelplane_fleet_scheduler_*` surface.
-
-The signals are waiting work, scheduling latency, gang readiness, per-queue GPU
-allocation against quota, and preemptions. KAI publishes all five, `kai_queue_*` for the
-queue-shaped ones, which answers whether a replica's pods reach GPUs and whether a
-cluster's capacity is shared fairly across teams.
-
-Gang readiness has to come from the scheduler rather than from Grove.
-`PodCliqueSet.status.podGangStatuses` exists on the type and nothing writes it, so
-`availableReplicas` is all Grove publishes, and it can't tell a gang that never formed from
-one still forming.
-
-A scheduler's mapping is a `MetricMapping` like an engine's, and the degradation rule
-carries over, punctuation caveat included. A fleet that brought Volcano writes one mapping,
-which is the mechanism working rather than a new problem.
-
 ## Aggregate to one view
 
 Per-cluster collection is half the ask. Every cluster's series have to land in one place,
@@ -483,10 +340,11 @@ deployment's degraded-ness is a condition on an XR the control plane holds. The 
 them is a deployment the fleet scheduler never placed, which shows on the API and not in
 the roll-up.
 
-**Pull direct** stays ruled out: a LoadBalancer or Ingress per cluster needs inbound
-exposure on every GPU cluster, which exporting avoids. A cluster with no egress at all is
-out of scope. If one turns up, a collector on a neighbouring cluster it can reach is a
-smaller answer than a mode field on the API.
+**Pull direct** stays ruled out: a LoadBalancer or Ingress per cluster needs inbound exposure
+on every GPU cluster, which exporting avoids. A cluster that can reach some backend but not the
+fleet's is handled by a destination of its own, below. A cluster with no egress at all is out
+of scope; if one turns up, a collector on a neighbouring cluster it can reach is a smaller
+answer than a mode field on the API.
 
 ### What aggregates, and where
 
@@ -578,9 +436,39 @@ no `insecure` flag to skip verification: it is the kind of thing that gets set t
 backend during a bring-up and is still set two years later, and naming a CA is the same amount
 of typing.
 
-A fleet usually has one. Where there are several, every cluster's collector exports to all
-of them, one exporter per destination in the same pipeline, which is how an operator moves
-between backends without a gap.
+A fleet usually has one, and every cluster exports to it. Where there are several, a
+destination says which clusters send to it with an optional `clusterSelector`, the same shape
+and the same meaning `ModelCache` already gives that field. Omitting it means every cluster,
+which keeps the common case to one object with no selector to write.
+
+```yaml
+spec:
+  clusterSelector:
+    matchLabels:
+      modelplane.ai/region: eu
+```
+
+**A cluster that cannot reach the fleet destination is the reason that field exists.** The
+argument for exporting outward is that a GPU cluster behind a firewall can reach out where
+nothing can reach in, and the same reasoning says an operator's backend is not automatically
+reachable from every cluster they run. A neocloud with no route to a private network, a region
+whose telemetry is not allowed to leave it, a cluster a different team operates: in each the
+cluster can export, just not there. Without a selector that cluster collects nothing, which is
+the worst of the options, because the failure is silent and the telemetry is exactly what would
+explain it.
+
+So a destination is per-cluster by construction and fleet-wide by default. A second destination
+with a selector covers the isolated clusters, and a cluster matched by several exports to each,
+one exporter per destination in the same pipeline, which is also how an operator moves between
+backends without a gap.
+
+The cost is honest and worth stating: a fleet whose clusters export to different backends has
+no single place the fleet query runs. That is not something this design can fix, because it is
+a property of the network the operator has rather than of the pipeline. What it can do is make
+the split deliberate and visible, in a selector someone wrote, rather than a cluster quietly
+collecting nothing. Where the split is unwanted, the answer is a collector the isolated cluster
+can reach that forwards to the main backend, which is the operator's hop to run and needs
+nothing here.
 
 The name is telemetry rather than metrics. An OTLP endpoint carries metrics, logs and
 traces on the same wire, so the destination is signal-agnostic and `MetricsDestination`
@@ -593,7 +481,7 @@ describe.
 Collection is on for every source with no per-deployment toggle, so the fleet pays for all
 of it and the number belongs in this document.
 
-One vLLM 0.23.0 pod publishes 359 metric lines, measured on the GKE cluster above. Fifty
+One vLLM 0.23.0 pod publishes 359 metric lines, measured on the GKE run in the appendix. Fifty
 engine pods, plus the pickers, Envoy, the substrate, `k8s_cluster` and DCGM, is on the
 order of 40,000 series. A managed Prometheus at roughly $6.50 per thousand series a month
 at one sample a minute, four times that at the 15s interval above, puts the fleet's
@@ -746,38 +634,47 @@ guide installs one Prometheus-compatible store on the cluster it creates and poi
 `TelemetryDestination` at it. That is a step in a guide rather than a default in the API,
 and an operator who already has a backend points the same resource at theirs instead.
 
-## Architecture
+## Removing the Prometheus stack
 
-```mermaid
-flowchart LR
-    subgraph icA["InferenceCluster: serving"]
-        SA["engines / EPPs / substrate / DCGM"]
-        CA["OpenTelemetryCollector\n(scrape + rename to modelplane_*)"]
-    end
-    subgraph icB["InferenceCluster: gateway only"]
-        SB["Envoy AI Gateway"]
-        CB["OpenTelemetryCollector"]
-    end
-    subgraph cp["control plane (composes, collects nothing)"]
-        XP["Crossplane\n(functions, fleet scheduler, XRs)"]
-        TD["TelemetryDestination"]
-    end
-    CPM["/metrics on Crossplane's own pods"]
-    DEST["destination\n(OTLP or Prometheus-compatible)"]
-    OP["operator\ndashboards + alerting"]
-    SA --> CA
-    SB --> CB
-    TD -.-> XP
-    XP -.->|"composes the collectors"| CA
-    XP -.-> CB
-    CA -->|"OTLP"| DEST
-    CB -->|"OTLP"| DEST
-    XP --- CPM
-    CPM -.->|"operator's existing scrape"| OP
-    DEST --> OP
-    classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
-    class CA,CB new
-```
+This is the one breaking change here, so it lands last and on its own. The collector, the
+destination and the built-in renames go in alongside the existing stack, where an operator
+can compare the two and nothing they rely on moves. The API changes follow. The removal
+comes after that, because approving a new collector and approving the deletion of the store
+people query today are different decisions.
+
+The [#264](https://github.com/modelplaneai/modelplane/issues/264) example documents the
+manual path, and it is the published `collecting-engine-metrics` guide. Both halves of that
+workflow go: the hand-written `PodMonitor`, because discovery moves into the collector's
+scrape config, and the port-forward to the in-cluster Prometheus, because there is no
+longer one. The replacement is written already, as the draft `telemetry` guide in this
+change, which takes that page's URL when the removal lands. Its rewrite is part of the
+removal rather than a follow-up.
+
+A hand-written `PodMonitor` left in place is inert once the Prometheus Operator is gone, so
+it stops working rather than double-scraping, which is quieter and worse. An operator
+relying on that Prometheus for anything of their own loses it, so the release note has to
+say the store is going and where the series go instead.
+## Testing
+
+The local two-cluster end-to-end test covers most of this, and it needs no cloud and no
+GPU. `nix run .#e2e` already brings up a control-plane cluster and a workload cluster
+registered with `source: Existing`, running a mock engine that answers the serving APIs the
+way a vLLM server does. Teaching that mock to serve a vLLM-shaped `/metrics` on a port
+named `http` turns it into the fixture this design needs.
+
+What that proves is the whole claim: the collector composes on the workload cluster, the
+scrape finds the engine by `modelplane.ai/serving` and by port name, a `MetricMapping`
+renders into transform rules that rewrite `vllm:*` to `modelplane_*`, and a
+`TelemetryDestination` with its Secret propagates from the control plane and exports there.
+Pointing the destination at a collector running in the test makes the assertion a query. Two
+clusters is also what makes the fleet view testable rather than asserted. Giving that in-test
+collector a self-signed certificate covers `tls.caSecretRef` in the same run, which is worth
+doing because a trust path nobody exercises is where a private-CA backend fails for the first
+user who has one.
+
+What it can't cover: DCGM, which needs GPUs, and which an `Existing` cluster skips by
+default anyway; the `kubeletstats` tier; and the fidelity of any real engine's metrics,
+which is what #412's GKE run is for.
 
 ## Alternatives considered
 
@@ -836,45 +733,187 @@ The EPP's `/metrics` could sit behind controller-runtime auth, and since Modelpl
 the EPP args and the endpoint carries routing stats reachable only in-cluster,
 `--metrics-endpoint-auth=false` collects them with nothing to manage.
 
-## Testing
+## Appendix
 
-The local two-cluster end-to-end test covers most of this, and it needs no cloud and no
-GPU. `nix run .#e2e` already brings up a control-plane cluster and a workload cluster
-registered with `source: Existing`, running a mock engine that answers the serving APIs the
-way a vLLM server does. Teaching that mock to serve a vLLM-shaped `/metrics` on a port
-named `http` turns it into the fixture this design needs.
+Mechanics the design rests on, kept out of the argument above.
 
-What that proves is the whole claim: the collector composes on the workload cluster, the
-scrape finds the engine by `modelplane.ai/serving` and by port name, a `MetricMapping`
-renders into transform rules that rewrite `vllm:*` to `modelplane_*`, and a
-`TelemetryDestination` with its Secret propagates from the control plane and exports there.
-Pointing the destination at a collector running in the test makes the assertion a query. Two
-clusters is also what makes the fleet view testable rather than asserted. Giving that in-test
-collector a self-signed certificate covers `tls.caSecretRef` in the same run, which is worth
-doing because a trust path nobody exercises is where a private-CA backend fails for the first
-user who has one.
+### Capture from an opaque engine
 
-What it can't cover: DCGM, which needs GPUs, and which an `Existing` cluster skips by
-default anyway; the `kubeletstats` tier; and the fidelity of any real engine's metrics,
-which is what #412's GKE run is for.
+Modelplane doesn't know which engine a deployment runs. The ML team supplies an image and
+args, and serving stays opaque to the engine inside. Normalization is the opposite.
+`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` fold into one
+`modelplane_*` series only if something knows which engine produced them. So we need just
+enough engine identity to pick a mapping, and no more.
 
-## Removing the Prometheus stack
+The pattern is the one the [GAIE model-server-protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/blob/main/docs/proposals/003-model-server-protocol/README.md)
+uses: read a label, don't detect the engine. The GAIE endpoint picker carries metric
+mappings for vLLM and SGLang and selects one from an engine-type label on the pod.
 
-This is the one breaking change here, so it lands last and on its own. The collector, the
-destination and the built-in renames go in alongside the existing stack, where an operator
-can compare the two and nothing they rely on moves. The API changes follow. The removal
-comes after that, because approving a new collector and approving the deletion of the store
-people query today are different decisions.
+No such label exists in Modelplane today, and an ML team can't add one. The
+`ModelDeployment` XRD rejects any label key under the reserved `modelplane.ai/` prefix, on
+both the deployment and the member pod template, so `modelplane.ai/engine: vllm` fails to
+apply. That prefix is Modelplane's to stamp, which is how `modelplane.ai/serving`,
+`modelplane.ai/workload` and `modelplane.ai/pool` already reach pods.
 
-The [#264](https://github.com/modelplaneai/modelplane/issues/264) example documents the
-manual path, and it is the published `collecting-engine-metrics` guide. Both halves of that
-workflow go: the hand-written `PodMonitor`, because discovery moves into the collector's
-scrape config, and the port-forward to the in-cluster Prometheus, because there is no
-longer one. The replacement is written already, as the draft `telemetry` guide in this
-change, which takes that page's URL when the removal lands. Its rewrite is part of the
-removal rather than a follow-up.
+So the engine type is a field, and the label is derived from it. An optional `type` on the
+engine, naming the engine's kind, which `compose-model-replica` stamps onto the pod as
+`modelplane.ai/engine` alongside the labels it already applies. One field feeds two
+consumers, the picker for routing and the collector for normalization, and the reserved
+prefix keeps meaning what it means.
 
-A hand-written `PodMonitor` left in place is inert once the Prometheus Operator is gone, so
-it stops working rather than double-scraping, which is quieter and worse. An operator
-relying on that Prometheus for anything of their own loses it, so the release note has to
-say the store is going and where the series go instead.
+The picker routes any engine. Its KV- and queue-aware scoring reads the engine's standard
+metrics through the same mapping, so an engine without them still routes, only less
+informed.
+
+- **A capture contract.** An engine exposes Prometheus `/metrics`. The required set
+  follows the GAIE protocol and the OpenTelemetry GenAI conventions: TTFT, time per output
+  token, queue depth, KV-cache occupancy. It's the metrics analogue of the OpenAI API
+  contract Modelplane already assumes for serving.
+- **Selection by a stamped label.** `modelplane.ai/engine` picks the `MetricMapping`.
+  `type` is a free-form string validated as a label value rather than an enum, so the
+  mappings below stay open to a forked or unreleased engine an enum would lock out. A
+  value with no mapping degrades to passthrough.
+- **An extension point, not a registry.** The built-in mappings live in
+  `compose-serving-stack` as code, since a Crossplane configuration package ships XRDs and
+  compositions rather than instances, and a composition can't apply one to the control
+  plane it runs on. `MetricMapping` is what a platform team adds for an engine Modelplane
+  doesn't ship, and a mapping selecting an engine already built in replaces it. Being
+  typed, it validates on apply and lists under `kubectl get metricmappings`, and adding one
+  is no fork and no Modelplane release.
+- **Graceful degradation.** An unlabelled or unmapped engine still gets scraped and
+  aggregated under its own names. The rename is skipped and Modelplane surfaces it
+  ("no mapping for `X`") rather than guessing a mapping and reporting the wrong thing.
+  Passthrough keeps the name and not the punctuation: the collector's Prometheus exporter
+  sanitizes `:` to `_`, so an unmapped `vllm:kv_cache_usage_perc` arrives as
+  `vllm_kv_cache_usage_perc`. Measured, not assumed.
+
+Selecting by label rather than by metric name looks redundant at first, since engine
+metric names are already namespaced (`vllm:`, `sglang:`) and a flat name-to-name map would
+rename them unambiguously. The label carries what a name cannot: which engine a pod claims
+to run, so "no mapping for `X`" is distinguishable from a rename that matched nothing; the
+per-pod labels a mapping attaches to series it does not rename; and a forked engine, which
+emits the upstream names while needing its own mapping. Scheduler names are plain
+`scheduler_*` with no namespace at all.
+
+In collector terms that makes the rename an OTTL transform gated on a resource attribute,
+rather than the simpler metrics-transform processor, which matches on metric name only.
+The pod label reaches OTTL as a resource attribute through the k8sattributes processor.
+
+A `MetricMapping` is small: a selector for the pods it applies to, the source names, the
+`modelplane_*` name each becomes, and the labels to keep or add. The vLLM one:
+
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: MetricMapping
+metadata:
+  name: vllm
+spec:
+  selector:
+    matchLabels:
+      modelplane.ai/engine: vllm      # stamped by Modelplane from engines[].type
+  rename:
+    vllm:time_to_first_token_seconds: modelplane_time_to_first_token
+    vllm:inter_token_latency_seconds: modelplane_inter_token_latency
+    vllm:num_requests_waiting: modelplane_requests_waiting
+    vllm:kv_cache_usage_perc: modelplane_kv_cache_usage
+  labels:
+    add: { engine: vllm }
+```
+
+`compose-serving-stack` reads every `MetricMapping` as a required resource, the same way
+`compose-model-deployment` reads `InferenceCluster` and `ModelCache`. It renders them into
+the collector's config, which is the `config` block of the `OpenTelemetryCollector`
+composed on each cluster. The `rename` map becomes transform-processor rules, applied to
+metrics from the pods the `selector` matches. A new engine is a new `MetricMapping`, not
+a package change.
+
+What that renders, with the vLLM mapping above as the only one installed:
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+      - job_name: modelplane-engines
+        kubernetes_sd_configs: [{ role: pod }]
+        relabel_configs:
+        # every engine of every deployment, whatever its workload kind
+        - source_labels: [__meta_kubernetes_pod_label_modelplane_ai_serving]
+          action: keep
+          regex: .+
+        # the engine's own port, not a sidecar's
+        - source_labels: [__meta_kubernetes_pod_container_port_name]
+          action: keep
+          regex: http
+
+processors:
+  # lifts the stamped engine label onto the series as a resource attribute
+  k8sattributes:
+    extract:
+      labels:
+      - { tag_name: engine, key: modelplane.ai/engine, from: pod }
+
+  # one block per MetricMapping, gated on the engine it selects
+  transform/vllm:
+    metric_statements:
+    - context: metric
+      conditions:
+      - resource.attributes["engine"] == "vllm"
+      statements:                           # one per rename entry
+      - set(name, "modelplane_time_to_first_token")
+          where name == "vllm:time_to_first_token_seconds"
+      - set(name, "modelplane_kv_cache_usage")
+          where name == "vllm:kv_cache_usage_perc"
+
+exporters:
+  otlp:
+    endpoint: ${MODELPLANE_OTLP_ENDPOINT}
+    auth: { authenticator: bearertokenauth }
+```
+
+An unmapped engine matches the scrape config and no `transform` block, so it arrives under
+its own names. That is the degradation above, and the structure gives it rather than a
+rule having to.
+
+All of this was built and run in
+[#412](https://github.com/modelplaneai/modelplane/pull/412), on a GKE cluster with vLLM
+0.23.0 and its 359 metric lines: the mapped ones came back renamed in place and labelled
+with their engine, and the remaining 308 passed through. That PR is closed unmerged waiting
+on this design, and the branch `dennis/metrics-poc` stays. The EPP half is unbuilt, since
+the endpoint picker exposes no metrics port today.
+
+As engines emit the OpenTelemetry conventions directly (vLLM already emits OTLP traces,
+and native OTLP metrics are in progress), each mapping shrinks toward identity and the
+label becomes optional.
+
+### Cluster scheduler metrics
+
+The engine is not the only pluggable component on a workload cluster. The pod scheduler
+that places the engine pods is one too. By default it is kube-scheduler, which on a managed
+cluster sits in the provider's control plane and is often not scrapable.
+
+A gang scheduler runs as in-cluster pods the collector reaches, and on a `Dynamo` cluster
+Modelplane now installs one itself. `compose-serving-stack` composes the KAI Scheduler and
+the queues its pods schedule against, so KAI's series are first-party rather than something
+a platform team might have brought: the queue is `modelplane` under an unbounded
+`modelplane-root`, and every Grove pod carries `kai.scheduler/queue: modelplane`.
+
+Modelplane treats a scheduler like an engine. A per-scheduler mapping, keyed by the one
+installed, normalizes to a `modelplane_cluster_scheduler_*` surface. The name says cluster
+because a future Modelplane fleet scheduler, placing replicas across clusters rather than
+pods across nodes, would get its own `modelplane_fleet_scheduler_*` surface.
+
+The signals are waiting work, scheduling latency, gang readiness, per-queue GPU
+allocation against quota, and preemptions. KAI publishes all five, `kai_queue_*` for the
+queue-shaped ones, which answers whether a replica's pods reach GPUs and whether a
+cluster's capacity is shared fairly across teams.
+
+Gang readiness has to come from the scheduler rather than from Grove.
+`PodCliqueSet.status.podGangStatuses` exists on the type and nothing writes it, so
+`availableReplicas` is all Grove publishes, and it can't tell a gang that never formed from
+one still forming.
+
+A scheduler's mapping is a `MetricMapping` like an engine's, and the degradation rule
+carries over, punctuation caveat included. A fleet that brought Volcano writes one mapping,
+which is the mechanism working rather than a new problem.
+

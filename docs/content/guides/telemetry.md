@@ -66,8 +66,13 @@ kubectl create secret generic otlp-token \
 
 Every cluster sends to the destination itself, so each one needs egress to that endpoint and
 nothing needs to reach into the cluster. Point the destination at a backend your clusters
-can already reach, which for most fleets is the observability stack you run today. A cluster
-with no route to it collects nothing.
+can already reach, which for most fleets is the observability stack you run today.
+
+If some cluster can't reach it, give that cluster a destination it can reach. A destination
+with no `clusterSelector` covers every cluster; add one and it covers the clusters it
+matches, so an isolated region or a neocloud with no route to your network sends somewhere
+else rather than collecting nothing. Your fleet query then covers what shares a backend,
+which is the trade that split buys.
 
 A backend inside your own network usually needs two more things. If its certificate is
 signed by your own CA, name a Secret holding the bundle, and if your clusters egress through
