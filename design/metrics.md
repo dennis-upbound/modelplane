@@ -80,7 +80,7 @@ guide is that workflow written down.
 ### Collect from every source, on every cluster
 
 Modelplane collects from the engines, the endpoint pickers and the substrate it installs.
-There is no per-deployment switch. The switch is at the fleet: with no
+The switch is at the fleet: with no
 `TelemetryDestination` anywhere, no cluster composes a collector.
 
 A cluster-wide selector on `modelplane.ai/serving` finds every engine of every deployment.
@@ -102,7 +102,7 @@ publishes 359 metric lines, counted from a live scrape. Fifty engine pods with t
 gateway, substrate and GPU exporters come to roughly 40,000 series, which a managed Prometheus
 bills at about $6.50 per thousand series a month, so near $640. Fifty A100s cost between
 $40,000 and $125,000 a month depending on where they run. Telemetry is about one percent of the
-GPUs it watches, and a per-deployment opt-out saves a fraction of that one percent.
+GPUs it watches.
 
 Cardinality holds at that ratio because of one decision. `pod`, `pod_uid` and `container_id`
 are dropped before export, since a billing backend counts a series as active for fifteen to
@@ -149,9 +149,19 @@ either way.
 
 The prefix runs out on an engine whose names carry no engine in them. An OpenAI-compatible
 server publishing a bare `http_requests_total` is indistinguishable from anything else
-publishing the same. For that case an optional `engines[].type` names the mapping to use,
-and Modelplane stamps it onto the pod as `modelplane.ai/engine` for a mapping to select on.
-Derived is the path; declared is the escape.
+publishing the same. For that case the deployment names the mapping:
+
+```yaml
+spec:
+  template:
+    spec:
+      engines:
+      - name: qwen3-8b
+        type: my-engine        # only when the metric names don't say
+```
+
+Modelplane stamps that onto the pod as `modelplane.ai/engine`, and a mapping selects on the
+label instead of a prefix. Derived is the path; declared is the escape.
 
 An engine with no matching mapping is still collected, under its own names, and the cluster
 reports that nothing matched.
@@ -267,32 +277,41 @@ An on-premise or neocloud GPU cluster behind a firewall can reach out where noth
 reach in. So a cluster needs egress and nothing inbound, and the credential travels the way
 a `ModelCache` already propagates a HuggingFace token.
 
-A backend inside an operator's own network usually needs two more things:
+Two things follow for a backend inside an operator's own network, and a third for a cluster
+that cannot reach the fleet's. A private CA needs naming, an egress proxy needs declaring, and
+a `clusterSelector` scopes a destination to the clusters that can reach it. The destination in
+the summary is the whole of the common case; this is the whole of the awkward one:
 
 ```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: TelemetryDestination
+metadata:
+  name: eu-isolated
 spec:
+  type: OTLP
+  otlp:
+    endpoint: otlp.eu.internal:4317
+    protocol: gRPC
+  auth:
+    type: Bearer
+    secretRef:
+      name: telemetry-destination-eu
   tls:
     caSecretRef:
-      name: telemetry-destination-ca
-  proxyURL: http://proxy.acme.example:3128
-```
-
-There is no flag to skip certificate verification. It gets set to finish a bring-up and is
-still set two years later, and naming a CA is the same amount of typing.
-
-A cluster that cannot reach the fleet's destination gets one it can. A `TelemetryDestination`
-takes an optional `clusterSelector`, the shape `ModelCache` already uses, and omitting it
-means every cluster:
-
-```yaml
-spec:
+      name: telemetry-destination-eu-ca
+  proxyURL: http://proxy.eu.internal:3128
   clusterSelector:
     matchLabels:
       modelplane.ai/region: eu
 ```
 
-A region whose telemetry may not leave it, or a cluster another team operates, exports
-somewhere it can reach. The cost is that a fleet split across backends has no single place
+There is no flag to skip certificate verification. It gets set to finish a bring-up and is
+still set two years later, and naming a CA is the same amount of typing.
+
+Omitting `clusterSelector` means every cluster, which is the summary's destination and the
+common case. With one, a region whose telemetry may not leave it, or a cluster another team
+operates, exports somewhere it can reach. The cost is that a fleet split across backends has no
+single place
 the fleet query runs, which is a property of the operator's network. Making the split
 deliberate beats a cluster quietly collecting nothing.
 
@@ -323,7 +342,8 @@ target.
 
 A platform team reads all of it. A `ModelDeployment`'s author reads their own model, which
 is a filter on the same dashboard. There is no second, author-facing store, and no
-collection toggle on a `ModelDeployment`: its author owns neither the destination, its cost,
+collection toggle, for the reason Alternatives gives: its author owns neither the destination,
+its cost,
 nor its retention.
 
 Control-plane health stays with whoever runs the control plane. A control plane hosts
@@ -394,6 +414,14 @@ smaller answer than a mode field on the API.
 is less for Modelplane to build, and every Prometheus-compatible store can sum and merge.
 It fails the third goal: an OSS user would have to know which engines differ and how, which
 is exactly the knowledge the vocabulary exists to hold.
+
+**A per-deployment collection toggle.** An `enabled` field on a `ModelDeployment` lets a team
+decline collection they do not want, which is how most of Modelplane's API works: the team that
+owns a resource configures it. Telemetry does not divide that way. Its cost, its destination
+and its retention belong to the platform team, and at about one percent of GPU spend the saving
+is a fraction of a fraction. A toggle would also cover only the data plane, leaving the
+substrate and the roll-up collected anyway, so a fleet view would have holes no one could
+predict from the resources.
 
 **Declare the engine type.** A required `type` on the engine selects the mapping without
 depending on metric names. It asks every user to state something the metrics already say,
