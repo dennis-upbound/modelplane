@@ -132,6 +132,10 @@ spec:
     vllm:num_requests_running: modelplane_requests_running
     vllm:request_queue_time_seconds: modelplane_request_queue_time
     vllm:kv_cache_usage_perc: modelplane_kv_cache_usage
+  derive:
+  - name: modelplane_prefix_cache_hit_rate
+    operation: divide
+    operands: [vllm:prefix_cache_hits, vllm:prefix_cache_queries]
 ```
 
 Nothing declares which engine a deployment runs, because the engine already says so. Every
@@ -160,17 +164,47 @@ means that. Renaming is what it usually takes, and it is not what makes the voca
 
 Three things happen when a source does not already match the definition.
 
-**Modelplane reconciles it before export** where the difference is mechanical. An engine
-reporting a KV cache as used and total tokens instead of a fraction, a counter where another
-engine has a gauge, seconds where another has milliseconds: each is arithmetic on what arrived,
-and it belongs in the pipeline.
+**Modelplane reconciles it before export** where the difference is mechanical, and a mapping
+says how. Prefix-cache hit rate is the case that shows why renaming alone does not carry a
+vocabulary. The vLLM mapping above divides two counters to reach
+`modelplane_prefix_cache_hit_rate`. SGLang publishes the rate itself, so its mapping renames:
 
-| Needed | Where | |---|---| | Rename a series | pipeline, `transform` | | Drop a label and
-merge the series that collide | pipeline, `metricstransform` | | Convert a unit, scale a value
-| pipeline, `transform` | | Derive one metric from two, a hit rate from hits and queries |
-pipeline, `metricsgeneration` | | Sum or combine several series into one | pipeline,
-`metricstransform` | | Convert a counter between cumulative and delta | pipeline,
-`cumulativetodelta` | | `rate()` over a window | query | | `histogram_quantile()` | query |
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: MetricMapping
+metadata:
+  name: sglang
+spec:
+  prefix: "sglang:"
+  rename:
+    sglang:time_to_first_token_seconds: modelplane_time_to_first_token
+    sglang:time_per_output_token_seconds: modelplane_time_per_output_token
+    sglang:e2e_request_latency_seconds: modelplane_e2e_request_latency
+    sglang:num_queue_reqs: modelplane_requests_waiting
+    sglang:num_running_reqs: modelplane_requests_running
+    sglang:token_usage: modelplane_kv_cache_usage
+    sglang:cache_hit_rate: modelplane_prefix_cache_hit_rate
+```
+
+One metric, two engines, and only one of them a rename. That asymmetry is the rule and not
+the exception, which is why a mapping carries more than a rename table.
+
+`derive` takes the arithmetic the OpenTelemetry `metricsgeneration` processor supports, an
+operation over two operand metrics, and `scale` multiplies one series by a constant for an
+engine reporting milliseconds where another reports seconds. Between them they cover the
+mechanical differences, and an operator writing a mapping for an engine Modelplane has never
+seen reaches the same two fields we do.
+
+| Needed | Where |
+|---|---|
+| Rename a series | pipeline, `transform` |
+| Drop a label and merge the series that collide | pipeline, `metricstransform` |
+| Convert a unit, scale a value | pipeline, `transform` |
+| Derive one metric from two | pipeline, `metricsgeneration` |
+| Sum or combine several series into one | pipeline, `metricstransform` |
+| Convert a counter between cumulative and delta | pipeline, `cumulativetodelta` |
+| `rate()` over a window | query |
+| `histogram_quantile()` | query |
 
 The line falls where a reader would not expect to do the work. `rate()` on a counter and
 `histogram_quantile()` on a histogram are how anyone uses those instrument types in any
