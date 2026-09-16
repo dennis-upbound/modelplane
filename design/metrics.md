@@ -369,7 +369,7 @@ destination is that it sums across clusters and merges histogram buckets, which 
 backend and every Prometheus-compatible store does, so it is the population the two
 exporters below already reach.
 
-### Exporters and destination
+## The destination
 
 The exporter contract is OTLP, `otlp` over gRPC or `otlphttp`, taken by any
 OpenTelemetry-compatible backend. `prometheusremotewrite` covers an operator who wants the
@@ -476,42 +476,6 @@ would describe it narrower than it is. Creating one is the first thing a user do
 nothing is collected until a destination exists, so it is also the first thing the docs
 describe.
 
-### Cost and cardinality
-
-Collection is on for every source with no per-deployment toggle, so the fleet pays for all
-of it and the number belongs in this document.
-
-One vLLM 0.23.0 pod publishes 359 metric lines, measured on the GKE run in the appendix. Fifty
-engine pods, plus the pickers, Envoy, the substrate, `k8s_cluster` and DCGM, is on the
-order of 40,000 series. A managed Prometheus at roughly $6.50 per thousand series a month
-at one sample a minute, four times that at the 15s interval above, puts the fleet's
-telemetry near $640 a month. Fifty A100s cost between $40,000 and $125,000 a month
-depending on where they run. Telemetry is about one percent of the GPUs it watches, which
-is what makes always-on collection an easy trade.
-
-That ratio holds because of one decision. A billing backend counts a series as active while
-it is still receiving data, for fifteen to thirty minutes after it stops, so every rolling
-update mints a fresh set of series per pod that stays billable long after the pod is gone.
-
-Dropped, therefore: `pod`, `pod_uid`, and `container_id`. Kept: `engine`, `cluster`,
-`model`, `deployment`, and `namespace`, which are the dimensions the roll-up and every
-dashboard query group by. Never added: `caller`. A caller is unbounded by construction, so
-every new key would be permanent cardinality, and per-caller token counts are what a usage
-record is for. `modelplane_tokens_total` is the engine's count of what it generated; what a
-caller was served is a log line. Dropping the churning three in the collector is cheaper than
-paying for them downstream and then aggregating them away, and it is the difference between
-one percent and a number someone argues about.
-
-The obvious processor is the wrong one. The `attributes` processor's `delete_key` removes a
-label but leaves the series that collided on it as separate, undefined points rather than
-merging them. Merging within a dropped dimension is `metricstransform` with an aggregation
-action, which sums the colliding series into one.
-Getting this wrong looks like it worked and reports nonsense.
-
-Histogram buckets are the other cost, and not one to trim. `le` is what makes
-the fleet histogram and the SLO ratio above possible, so the buckets stay as the GenAI
-conventions define them.
-
 ### Logs
 
 A `TelemetryDestination` names a destination rather than a metrics endpoint because the same
@@ -538,7 +502,7 @@ answering them: what consent it needs, how long it may be kept, and whether samp
 requests is enough. Emitting metrics about a request needs none of that, which is why metrics
 do not wait on it.
 
-The cardinality argument above does not carry over. A label added to a metric multiplies series
+The cardinality cost that shapes the metric labels does not carry over. A label added to a metric multiplies series
 for as long as the series exists; a log record is one record. Logs are priced on volume and
 retention instead, so the control that matters is what is captured and how much of it, not
 which attributes are dropped before export.
@@ -633,6 +597,42 @@ for a fleet and the wrong one for a first afternoon with Modelplane, so the gett
 guide installs one Prometheus-compatible store on the cluster it creates and points a
 `TelemetryDestination` at it. That is a step in a guide rather than a default in the API,
 and an operator who already has a backend points the same resource at theirs instead.
+
+## Cost and cardinality
+
+Collection is on for every source with no per-deployment toggle, so the fleet pays for all
+of it and the number belongs in this document.
+
+One vLLM 0.23.0 pod publishes 359 metric lines, measured on the GKE run in the appendix. Fifty
+engine pods, plus the pickers, Envoy, the substrate, `k8s_cluster` and DCGM, is on the
+order of 40,000 series. A managed Prometheus at roughly $6.50 per thousand series a month
+at one sample a minute, four times that at the 15s interval above, puts the fleet's
+telemetry near $640 a month. Fifty A100s cost between $40,000 and $125,000 a month
+depending on where they run. Telemetry is about one percent of the GPUs it watches, which
+is what makes always-on collection an easy trade.
+
+That ratio holds because of one decision. A billing backend counts a series as active while
+it is still receiving data, for fifteen to thirty minutes after it stops, so every rolling
+update mints a fresh set of series per pod that stays billable long after the pod is gone.
+
+Dropped, therefore: `pod`, `pod_uid`, and `container_id`. Kept: `engine`, `cluster`,
+`model`, `deployment`, and `namespace`, which are the dimensions the roll-up and every
+dashboard query group by. Never added: `caller`. A caller is unbounded by construction, so
+every new key would be permanent cardinality, and per-caller token counts are what a usage
+record is for. `modelplane_tokens_total` is the engine's count of what it generated; what a
+caller was served is a log line. Dropping the churning three in the collector is cheaper than
+paying for them downstream and then aggregating them away, and it is the difference between
+one percent and a number someone argues about.
+
+The obvious processor is the wrong one. The `attributes` processor's `delete_key` removes a
+label but leaves the series that collided on it as separate, undefined points rather than
+merging them. Merging within a dropped dimension is `metricstransform` with an aggregation
+action, which sums the colliding series into one.
+Getting this wrong looks like it worked and reports nonsense.
+
+Histogram buckets are the other cost, and not one to trim. `le` is what makes
+the fleet histogram and the SLO ratio above possible, so the buckets stay as the GenAI
+conventions define them.
 
 ## Removing the Prometheus stack
 
