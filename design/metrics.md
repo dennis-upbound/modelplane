@@ -91,14 +91,26 @@ selector covers the pickers and a third the substrate, which varies by
 `InferenceCluster.spec.stack`.
 
 A cluster with no engines still collects. An `InferenceGateway` can run on a cluster of its
-own, and it answers what the fleet was asked for and what it returned.
+own, and it answers what the fleet was asked for and what it returned. What a cluster runs, and
+which GPU exporter it has, come from the `InferenceCluster` a platform team already writes:
+
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: InferenceCluster
+metadata:
+  name: prod-us-east
+spec:
+  stack: Standard              # decides which substrate the collector scrapes
+  gpuTelemetry:
+    endpoint: dcgm-exporter.gpu-operator:9400   # only where it isn't DCGM's default
+```
 
 The GPU itself comes from an exporter the cluster already runs, DCGM on most clusters and the
 GPU Operator's on some, and `InferenceCluster.spec.gpuTelemetry` names one where the cluster
 runs something else. Allocation comes from `k8s_cluster`, which reports allocatable and
 requested `nvidia.com/gpu`.
 
-Collection is always on because it is cheap against what it watches. A vLLM 0.23.0 pod
+Collection is always on, for the reason Alternatives gives. A vLLM 0.23.0 pod
 publishes 359 metric lines, counted from a live scrape. Fifty engine pods with their pickers,
 gateway, substrate and GPU exporters reach under 40,000 series before the pod labels below are
 dropped, and far fewer after, since fifty replicas of one deployment collapse into one series
@@ -155,7 +167,7 @@ apiVersion: modelplane.ai/v1alpha1
 kind: ModelDeployment
 metadata:
   name: qwen3-8b
-  namespace: ml-team
+  namespace: ml-team           # Modelplane stamps modelplane.ai/serving on its pods
 spec:
   replicas: 2
   template:
@@ -179,14 +191,14 @@ metadata:
 spec:
   engineType: my-engine                   # instead of a prefix
   rename:
-    http_request_duration_seconds: modelplane_e2e_request_latency
+    my_engine_running_requests: modelplane_requests_running
   scale:
-    my_engine_ttft_milliseconds: 0.001    # to seconds
-  merge:
-    modelplane_e2e_request_latency: histogram
+    my_engine_queue_wait_milliseconds: 0.001   # to seconds
 status:
-  matchedEngines: ["my-engine"]
-  absent: ["modelplane_time_to_first_token"]   # buckets don't match the convention
+  matched: true
+  absent:
+  - metric: modelplane_time_to_first_token
+    reason: histogram buckets do not match the convention
 ```
 
 Derived is the path; declared is the escape. `merge` says how a metric combines when the pod
@@ -214,11 +226,13 @@ When a source does not already mean it, one of three things happens.
 **Modelplane reconciles it in the pipeline** where the difference is mechanical.
 `modelplane_prefix_cache_hit_rate` is the share of lookups served from cache, and vLLM
 publishes the two counters it comes from, so the vLLM mapping above divides them. A mapping
-also declares how each metric merges when the pod labels are dropped, since a summing merge
-over fifty replicas would take a fraction to 50, and derivation runs after that merge so a rate
-divides summed hits by summed queries. What leaves is a cumulative counter, a gauge or a
-histogram, so `rate()` and `histogram_quantile()` mean what a reader expects and nothing
-downstream has to join two of our metrics to recover a third.
+names the metrics that average rather than sum when the pod labels are dropped, since
+a summing merge over fifty replicas would take a fraction to 50, and derivation runs after that
+merge so a rate divides summed hits by summed queries. A counter is converted to a delta before
+that merge and back after it, so one pod restarting does not read downstream as the whole sum
+resetting. What leaves is a cumulative counter, a gauge or a histogram, so `rate()` and
+`histogram_quantile()` mean what a reader expects and nothing downstream has to join two of our
+metrics to recover a third.
 
 **A source that measures something else gets its own metric.** SGLang publishes
 `sglang:cache_hit_rate`, which reads as the same thing and is a gauge of the rate right now
@@ -267,8 +281,8 @@ and one that diverges is absent on that engine the way Triton's is. SGLang's
 time-to-first-token buckets match to 0.1 seconds and diverge above, so SGLang publishes none
 until it adopts the convention.
 
-That is a real cost and the right one. An operator running SGLang loses two panels and knows
-it, against a fleet quantile that quietly averaged two bucket layouts.
+An operator running SGLang loses two panels and knows why, which Alternatives weighs against
+the other answer.
 
 ### Export to one destination
 
