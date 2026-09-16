@@ -486,10 +486,9 @@ naming the series the same way everywhere and stamping the same dimensions on th
 
 So the `modelplane_*` roll-up is a set of queries Modelplane ships rather than a collector
 it runs. Capacity, GPU allocation, GPU-hours and replicas ready against desired are sums
-over the fleet. GPU-hours is Modelplane's half of the metering that design describes:
-Modelplane publishes GPU-hours per `ModelDeployment` because it owns the pools, and tokens
-per request because the gateway reads them, and it prices neither. That is why cost is
-absent from this roll-up. SLO
+over the fleet. Metering is split, and Modelplane publishes only its half: GPU-hours per
+`ModelDeployment`, because it owns the pools, and tokens per request, because the gateway
+reads them. It prices neither, which is why cost is absent from this roll-up. SLO
 attainment, the fraction of requests under a TTFT target, is a ratio of buckets in the
 merged histogram, which works because Modelplane owns the histogram boundaries and puts one
 on the target. Modelplane runs no store and now hosts no pipeline either.
@@ -544,8 +543,29 @@ spec:
 `self.type != 'OTLP' || has(self.otlp)`. The variant object earns its place on its first
 field, since OTLP is gRPC or HTTP and remote write is neither. `auth.type` starts with the
 three that cover most backends, where Grafana's chart also carries `oauth2` and `sigv4`.
-The Secret resolves in `modelplane-system`, the way `InferenceCluster` resolves a
-kubeconfig.
+The Secret resolves in `modelplane-system`, the way `InferenceCluster` resolves a kubeconfig.
+
+**Reaching it is the other half of the configuration.** The export is one outbound connection
+from each cluster's collector to `endpoint`, gRPC on 4317 or HTTP on 4318 by convention, and
+nothing on the cluster listens. Two things break that in exactly the networks this shape exists
+for. A backend inside an operator's own network is often signed by a private CA the collector
+has no reason to trust, and a cluster that egresses through a corporate proxy reaches nothing
+until it is told so. Both belong on the destination rather than in a collector config an
+operator patches by hand:
+
+```yaml
+spec:
+  tls:
+    caSecretRef:                       # when the backend's CA isn't a public one
+      name: telemetry-destination-ca   # in modelplane-system, beside the auth Secret
+  proxyURL: http://proxy.acme.example:3128
+```
+
+`proxyURL` renders to the standard proxy variables on the collector rather than into one
+exporter's settings, so it covers every exporter in the pipeline at once. There is deliberately
+no `insecure` flag to skip verification: it is the kind of thing that gets set to reach a
+backend during a bring-up and is still set two years later, and naming a CA is the same amount
+of typing.
 
 A fleet usually has one. Where there are several, every cluster's collector exports to all
 of them, one exporter per destination in the same pipeline, which is how an operator moves
@@ -730,6 +750,7 @@ flowchart LR
         XP["Crossplane\n(functions, fleet scheduler, XRs)"]
         TD["TelemetryDestination"]
     end
+    CPM["/metrics on Crossplane's own pods"]
     DEST["destination\n(OTLP or Prometheus-compatible)"]
     OP["operator\ndashboards + alerting"]
     SA --> CA
@@ -739,6 +760,8 @@ flowchart LR
     XP -.-> CB
     CA -->|"OTLP"| DEST
     CB -->|"OTLP"| DEST
+    XP --- CPM
+    CPM -.->|"operator's existing scrape"| OP
     DEST --> OP
     classDef new fill:#ffb74d,stroke:#e65100,stroke-width:3px,color:#000;
     class CA,CB new
