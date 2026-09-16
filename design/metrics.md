@@ -631,9 +631,11 @@ pipeline carries the other signals. Logs are the one with a decision attached, s
 recorded here even though metrics land first.
 
 Two kinds travel under the name and they are not alike. Component logs are what the engine, the
-gateway and the controllers write to stderr, read by the `filelog` receiver. They earn their
-place the way they always do: a metric says a deployment is failing, and the log says the
-engine could not find the weights. Those ship with the rest.
+gateway and the controllers write to stderr. They earn their place the way they always do: a
+metric says a deployment is failing, and the log says the engine could not find the weights.
+Reading them is the `filelog` receiver, which is node-scoped, so they arrive with the DaemonSet
+tier rather than the first cut. That tier is what node CPU, memory and disk wait for too, and
+logs are what make it worth running.
 
 GenAI events are the other kind. The conventions define
 `gen_ai.client.inference.operation.details` as a log record carrying the prompt, the completion
@@ -846,8 +848,11 @@ What that proves is the whole claim: the collector composes on the workload clus
 scrape finds the engine by `modelplane.ai/serving` and by port name, a `MetricMapping`
 renders into transform rules that rewrite `vllm:*` to `modelplane_*`, and a
 `TelemetryDestination` with its Secret propagates from the control plane and exports there.
-Pointing the destination at a collector running in the test makes the assertion a query.
-Two clusters is also what makes the fleet view testable rather than asserted.
+Pointing the destination at a collector running in the test makes the assertion a query. Two
+clusters is also what makes the fleet view testable rather than asserted. Giving that in-test
+collector a self-signed certificate covers `tls.caSecretRef` in the same run, which is worth
+doing because a trust path nobody exercises is where a private-CA backend fails for the first
+user who has one.
 
 What it can't cover: DCGM, which needs GPUs, and which an `Existing` cluster skips by
 default anyway; the `kubeletstats` tier; and the fidelity of any real engine's metrics,
