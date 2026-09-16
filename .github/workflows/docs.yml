@@ -41,6 +41,20 @@ jobs:
       SITE_REPO: modelplaneai/docs-site
 
     steps:
+      # Dispatching to another repository needs a credential this repo's own
+      # token cannot provide. A GitHub App installed on the site repo alone
+      # mints one that expires in an hour and belongs to no person, so it does
+      # not quietly die when someone leaves. Contents: read & write is the
+      # permission repository_dispatch requires.
+      - name: Mint a token for the site repo
+        id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.DOCS_SITE_APP_ID }}
+          private-key: ${{ secrets.DOCS_SITE_APP_KEY }}
+          owner: modelplaneai
+          repositories: docs-site
+
       # The head sha rather than the merge commit: it is what the reviewer is
       # reading. A fork's commits are reachable here through refs/pull/<n>/head,
       # so the site can fetch that sha from this repo without knowing the fork
@@ -48,7 +62,7 @@ jobs:
       - name: Request a preview
         if: github.event_name == 'pull_request_target'
         env:
-          GH_TOKEN: ${{ secrets.DOCS_SITE_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
           REF: ${{ github.event.pull_request.head.sha }}
           PR: ${{ github.event.number }}
         run: |
@@ -66,12 +80,12 @@ jobs:
           PR: ${{ github.event.number }}
         run: |
           gh pr comment "$PR" --body \
-            "Docs preview: https://modelplane-docs-pr-${PR}.vercel.app (ready once the site's Content wor
+            "Docs preview: https://modelplane-docs-pr-${PR}.vercel.app (ready once the site's Content workflow finishes)"
 
       - name: Publish
         if: github.event_name == 'push'
         env:
-          GH_TOKEN: ${{ secrets.DOCS_SITE_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
           gh api "repos/$SITE_REPO/dispatches" \
             -f event_type=content-published
