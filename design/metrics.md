@@ -32,7 +32,8 @@ spec:
       name: telemetry-destination
 ```
 
-From there `modelplane_time_to_first_token` means one thing wherever it appears, one endpoint
+From there `modelplane_time_to_first_token_seconds` means one thing wherever it appears, one
+endpoint
 answers for the fleet, and the series arrive wherever the operator already keeps telemetry.
 
 ## Background
@@ -72,7 +73,7 @@ guide is that workflow written down.
 - An operator configures where telemetry goes, and nothing else.
 - One vocabulary. A dashboard reads `modelplane_*` and never an engine's own names.
 - One endpoint answers for the fleet, the way any other project's `/metrics` does.
-- One pipeline carries metrics, logs and traces, and holds no state on a GPU cluster.
+- One pipeline carries metrics, logs and traces, and runs no persistent store on a GPU cluster.
 - A metric is useful with the operations any Prometheus user already performs. Reconciling
   engines is Modelplane's work, not the reader's.
 - A workload cluster needs egress and nothing inbound.
@@ -134,15 +135,14 @@ publish. Four questions, and the series that answer them:
 
 | Question | Metrics |
 |---|---|
-| How long before a user sees anything? | `modelplane_time_to_first_token`, histogram |
-| How fast does it read after that? | `modelplane_inter_token_latency`, `modelplane_time_per_output_token`, histograms |
-| Is it saturated? | `modelplane_requests_waiting`, `modelplane_requests_running`, gauges; `modelplane_request_queue_time`, histogram; `modelplane_kv_cache_usage`, a 0-to-1 gauge |
+| How long before a user sees anything? | `modelplane_time_to_first_token_seconds`, histogram |
+| How fast does it read after that? | `modelplane_inter_token_latency_seconds`, `modelplane_time_per_output_token_seconds`, histograms |
+| Is it saturated? | `modelplane_requests_waiting`, `modelplane_requests_running`, gauges; `modelplane_request_queue_time_seconds`, histogram; `modelplane_kv_cache_usage`, a 0-to-1 gauge |
 | Is the work paying off? | `modelplane_tokens_total` by kind, counter; `modelplane_prefix_cache_hit_rate`, gauge; `modelplane_requests_total` by outcome, counter |
 
-Each names its instrument and its unit before any engine is consulted, which is what makes the
-next step a question with an answer: can the components we run produce these? Mostly yes,
-sometimes only by arithmetic, and occasionally not at all. The rest of this section is that
-exercise.
+Each names its instrument and unit before any engine is consulted. Whether the components we
+run can produce them is the next question, and the answer is mostly yes, sometimes only by
+arithmetic, and occasionally not at all.
 
 ### Publish one vocabulary
 
@@ -158,18 +158,26 @@ metadata:
 spec:
   prefix: "vllm:"
   rename:
-    vllm:time_to_first_token_seconds: modelplane_time_to_first_token
-    vllm:inter_token_latency_seconds: modelplane_inter_token_latency
-    vllm:request_time_per_output_token_seconds: modelplane_time_per_output_token
-    vllm:e2e_request_latency_seconds: modelplane_e2e_request_latency
+    vllm:time_to_first_token_seconds: modelplane_time_to_first_token_seconds
+    vllm:inter_token_latency_seconds: modelplane_inter_token_latency_seconds
+    vllm:request_time_per_output_token_seconds: modelplane_time_per_output_token_seconds
+    vllm:e2e_request_latency_seconds: modelplane_e2e_request_latency_seconds
     vllm:num_requests_waiting: modelplane_requests_waiting
     vllm:num_requests_running: modelplane_requests_running
-    vllm:request_queue_time_seconds: modelplane_request_queue_time
-    vllm:kv_cache_usage_perc: modelplane_kv_cache_usage
+    vllm:request_queue_time_seconds: modelplane_request_queue_time_seconds
+    vllm:kv_cache_usage_perc: modelplane_kv_cache_usage      # already 0 to 1
+    vllm:prefix_cache_hits: modelplane_prefix_cache_hits
+    vllm:prefix_cache_queries: modelplane_prefix_cache_queries
+    vllm:prompt_tokens_total: modelplane_prompt_tokens_total
+    vllm:generation_tokens_total: modelplane_generation_tokens_total
+  merge:
+    modelplane_kv_cache_usage: average    # a fraction; counters sum unless named here
   derive:
   - name: modelplane_prefix_cache_hit_rate
     operation: divide
-    operands: [vllm:prefix_cache_hits, vllm:prefix_cache_queries]
+    operands: [modelplane_prefix_cache_hits, modelplane_prefix_cache_queries]
+status:
+  matched: true
 ```
 
 Nothing declares which engine a deployment runs, because the engine already says so. Every
@@ -216,7 +224,7 @@ spec:
 status:
   matched: true
   absent:
-  - metric: modelplane_time_to_first_token
+  - metric: modelplane_time_to_first_token_seconds
     reason: histogram buckets do not match the convention
 ```
 
@@ -227,9 +235,9 @@ time to first token.
 
 A mapping adds rather than replaces. `vllm:time_to_first_token_seconds` still arrives under its
 own name, so an operator who came for vLLM's metrics still has them and their existing
-dashboards keep working. `modelplane_time_to_first_token` arrives beside it, and the fleet view
-reads that one. Duplicating the mapped subset costs roughly seventy-five extra series per
-engine pod, mostly histogram buckets, which the arithmetic above absorbs.
+dashboards keep working. `modelplane_time_to_first_token_seconds` arrives beside it, and the
+fleet view
+reads that one.
 
 ### Make a metric a definition, not a rename
 
@@ -266,7 +274,7 @@ metadata:
 spec:
   prefix: "sglang:"
   rename:                                 # histograms map only where buckets match
-    sglang:e2e_request_latency_seconds: modelplane_e2e_request_latency
+    sglang:e2e_request_latency_seconds: modelplane_e2e_request_latency_seconds
     sglang:num_queue_reqs: modelplane_requests_waiting
     sglang:num_running_reqs: modelplane_requests_running
     sglang:token_usage: modelplane_kv_cache_usage
@@ -276,7 +284,7 @@ spec:
 status:
   matched: true
   absent:
-  - metric: modelplane_time_to_first_token
+  - metric: modelplane_time_to_first_token_seconds
     reason: histogram buckets do not match the convention
 ```
 
@@ -311,16 +319,16 @@ collector on the control plane that every cluster exports to, and it serves the 
 `modelplane_*` series at one endpoint and forwards them to wherever the operator keeps
 telemetry.
 
-That tier is what makes the roll-up ours rather than an exercise for the reader. Capacity,
-GPU-hours and replicas ready against desired are computed there and published as series, so an
-operator scrapes one endpoint and gets the fleet, and a `TelemetryDestination` still decides
-where the data goes afterwards.
+That tier is what makes the roll-up ours rather than an exercise for the reader. Capacity, GPU
+allocation and replicas ready against desired are sums across clusters, computed there and
+published as series, so an operator scrapes one endpoint and gets the fleet. GPU-hours stays a
+query over the allocation gauge, since integrating over time is the one thing neither tier
+does. A `TelemetryDestination` decides where the series go afterwards.
 
-It is skippable, and skipping it is one field. A control plane that schedules no workloads has
-nowhere to put a collector, and a fleet whose clusters cannot reach the control plane has no
-path to it. Those clusters export straight to the destination and lose the fleet endpoint,
-keeping every per-cluster series and the queries that aggregate them. The pipeline is the same
-either way; the tier is a hop, not a fork.
+`InferenceCluster.spec.telemetry.fleetEndpoint: false` skips the tier for a control plane that
+schedules no workloads, or for a cluster that cannot reach one. Those clusters export straight
+to the destination, keeping every per-cluster series, and Alternatives weighs what that gives
+up. The pipeline is the same either way.
 
 Either way a cluster needs egress and nothing inbound.Modelplane holds one connection to a
 workload cluster it can rely on, the API server the
@@ -343,7 +351,7 @@ spec:
   type: OTLP
   otlp:
     endpoint: otlp.eu.internal:4317
-    protocol: gRPC
+    protocol: HTTP                      # proxyURL applies to the HTTP exporter
   auth:
     type: Bearer
     secretRef:
@@ -359,17 +367,16 @@ spec:
 
 Omitting `clusterSelector` means every cluster, which is the summary's destination and the
 common case. With one, a region whose telemetry may not leave it, or a cluster another team
-operates, exports somewhere it can reach. The cost is that a fleet split across backends has no
-single place
-the fleet query runs, which is a property of the operator's network. Making the split
-deliberate beats a cluster quietly collecting nothing.
+operates, exports somewhere it can reach. The fleet endpoint still answers for every cluster; a
+selector decides only where the series
+go afterwards.
 
 ### What an operator reads
 
 Every series carries `engine`, `cluster`, `model`, `deployment` and `namespace`:
 
 ```
-modelplane_time_to_first_token_bucket{engine="vllm", cluster="prod-us-east",
+modelplane_time_to_first_token_seconds_bucket{engine="vllm", cluster="prod-us-east",
   deployment="qwen3-8b", model="Qwen/Qwen3-8B", namespace="ml-team", le="0.25"} 1841
 ```
 
@@ -378,7 +385,7 @@ series under that name has the same buckets:
 
 ```promql
 histogram_quantile(0.99, sum by (le) (
-  rate(modelplane_time_to_first_token_bucket{model="Qwen/Qwen3-8B"}[5m])))
+  rate(modelplane_time_to_first_token_seconds_bucket{model="Qwen/Qwen3-8B"}[5m])))
 ```
 
 A `cluster="prod-us-east"` matcher narrows it to one cluster, and adding `cluster` to the
@@ -393,45 +400,24 @@ target.
 
 A platform team reads all of it. A `ModelDeployment`'s author reads their own model, which
 is a filter on the same dashboard. No second, author-facing store exists, and there is no
-collection toggle, for the reason Alternatives gives: its author owns neither the destination,
-its cost,
+collection toggle, for the reason Alternatives gives: its author owns neither the destination, its cost,
 nor its retention.
 
-Control-plane health stays with whoever runs the control plane. Modelplane cannot deploy a
-collector beside its own Crossplane, for the reason
-Alternatives gives. Crossplane serves
+Control-plane health stays with whoever runs the control plane. Modelplane composes no
+collector for its own Crossplane, which serves
+`/metrics` on its core, provider and function pods for an operator's existing scrape, and
 `/metrics` on its core, provider and function pods for an operator's existing scrape, and
 every XR carries `Ready` and `Synced` on the API.
 
 ### The collector
 
-Both tiers are OpenTelemetry collectors, run by the OpenTelemetry Operator, so Modelplane
-composes one `OpenTelemetryCollector` per cluster and one at the centre and the operator owns
-the Deployment, the service account and the config reload. Everything the Prometheus stack does
-has a receiver that does it, and the Envoy scrape config Modelplane already composes transfers
-unchanged.
+Both tiers are OpenTelemetry collectors, run by the OpenTelemetry Operator. The fleet endpoint
+is a Prometheus exporter on the central one, so it serves `/metrics` to be scraped the way any
+project's does, and the Envoy scrape config Modelplane already composes transfers unchanged.
 
-The fleet endpoint is a Prometheus exporter on the central collector, so it serves `/metrics`
-to be scraped the way any project's does. Choosing the collector costs nothing on that.
-
-What it costs is the one thing a Prometheus does that a collector cannot: evaluate an
-expression over a window and store the answer. Nothing here needs that. Renaming, unit
-conversion, deriving one metric from two and merging after a label drop are all per-sample
-work; `rate()` and `histogram_quantile()` are the reader's and should be, since they belong
-where the queries run. A recording rule would precompute them, which is a query optimisation
-and belongs with the queries.
-
-Against that, a collector carries metrics, logs and traces on one pipeline, where a Prometheus
-carries metrics and this design already has the other two: component logs, the GenAI events
-below, and a gateway's usage records. It also holds no state, where a Prometheus on every GPU
-cluster is a store to size, retain and lose. If a windowed derivation ever turns out to be
-necessary, a Prometheus downstream of the collector computes it without changing anything
-upstream.
-
-Removing that stack is the one breaking change, so it lands separately: the collector and the
-destination arrive alongside it, where an operator can compare them, and the removal follows.
-Approving a new collector and approving the deletion of a store people query today are
-different decisions. A hand-written `PodMonitor` goes inert rather than double-scraping, so the
+Removing the per-cluster Prometheus stack is the one breaking change, so it lands separately:
+the collector and the destination arrive alongside it, where an operator can compare them, and
+the removal follows. A hand-written `PodMonitor` goes inert rather than double-scraping, so the
 release note says the store is going and where the series go instead.
 
 ## Future improvements
@@ -505,15 +491,7 @@ correct answer per engine. It moves the problem into every query anyone writes: 
 know which engines conform, and one who forgets gets a quantile over misaligned buckets that is
 wrong rather than approximate. An absent metric with a reason is the smaller surprise.
 
-**Allow skipping certificate verification.** An `insecure` flag reaches a backend with a
-self-signed certificate in one line, and every OTLP client offers one. It gets set to finish a
-bring-up and is still set two years later, and naming a CA is the same amount of typing.
-
 **Declare the engine type.** A required `type` on the engine selects the mapping without
 depending on metric names. It asks every user to state something the metrics already say, and
 an enum of known engines locks out a fork. It survives as the optional escape for an engine
 whose names carry no prefix.
-
-**A `PodMonitor` per replica.** Composing discovery per replica from `compose-model-replica`
-matches the resource that knows the serving shape. It composes N objects where one cluster-wide
-selector does the same job, and it assumes the CRD that goes with the Prometheus stack.
