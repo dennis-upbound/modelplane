@@ -86,9 +86,17 @@ that workflow written down.
 
 ### Where they come from
 
+What each component emits is verified against a live deployment running vLLM, Envoy AI
+Gateway, the llm-d picker and DCGM, rather than read off documentation.
+
 **The gateway** measures what the caller experienced, in GenAI vocabulary, for whatever
 engine sits behind it. Being one component, its histograms share a bucket layout, so a fleet
-quantile over them is sound. That is why the SLO metrics come from here.
+quantile over them is sound. That is why the SLO metrics come from here. Two details matter
+for the scrape. The GenAI metrics are on the ext-proc sidecar's admin port, so the gateway
+needs a scrape target of its own rather than riding the proxy's. And time to first token
+exists only for a streaming request, because a non-streaming one has no first token to time,
+so that histogram counts a subset of what the duration histogram counts. Envoy's own proxy
+statistics come across as well, which is where refusals at a rate limit are visible.
 
 **The engine** explains what the gateway measured. vLLM and SGLang both publish queue depth,
 running and waiting counts, KV utilization and preemptions as gauges and counters, which
@@ -100,15 +108,30 @@ though those stay per-engine diagnostics, since their buckets do not merge.
 which inflates the gateway's time to first token without appearing anywhere in the engine's
 own numbers.
 
-**The GPUs** are read through DCGM, which reports memory, compute activity, power and
-energy per device.
+**The GPUs** are read through DCGM, which reports memory, compute activity, bandwidth,
+power and energy per device, and the fault taxonomy behind a drain: temperature, throttling,
+ECC and interconnect errors. The last two need collectors that DCGM leaves off by default,
+and Modelplane enables them, because on a multi-node gang one bad NVLink degrades an engine
+that otherwise looks healthy.
 
-**Modelplane** supplies the rest, because nothing else can. Under DRA, a driver advertises
+**The substrate** reports whether the machinery works. The gang controller, LeaderWorkerSet
+or Grove, carries completeness in its status, which is how a gang that placed its leader and
+none of its workers becomes visible: the leader runs, so every per-pod view looks fine. The
+DRA driver counts allocation failures, which is the reason a replica stays Pending.
+`kube-state-metrics` supplies container restart counts and reads those controller statuses
+through its custom-resource-state collector.
+
+**ModelExpress** times staging a model onto a cluster and the engine's warmup to first
+inference. Those two are most of a cold start, and a `ModelCache` exists to shorten them, so
+a fleet deciding whether to scale onto a cold cluster is reading these numbers.
+
+**Modelplane** supplies what none of them can. Under DRA, a driver advertises
 its devices as `ResourceSlices` and a workload requests them through a `ResourceClaim`. No
 exporter turns those into an allocatable count, so capacity has no series until something
 reads the slices. DCGM labels a GPU with its UUID and its host and nothing about the
 workload, so nothing joins a GPU to a replica. Nothing times a replica from created to
-serving. And only the control plane knows whether it can still reach a cluster.
+serving, and nothing says whether its weights were already staged when it started. And only
+the control plane knows whether it can still reach a cluster.
 
 Modelplane made every one of those decisions or holds the object that answers them, so an
 exporter beside the composition functions reads the `ResourceSlices` and the replicas'
@@ -336,50 +359,87 @@ avoid, and a kind is where the condition that reports them lives.
 
 ## Appendix: the metric surface
 
-The set comes from what an operator has to answer. Latency appears twice on purpose: once
-as the caller experienced it and once as the engine did. The gap between them is routing,
-queueing and network, and one number alone cannot separate those from a slow model.
+Four things read these metrics, and the set is what they need between them: **alerting**,
+on latency targets, availability and saturation; **autoscaling**, which places and sizes
+whole replicas from cost and capacity signals; **cost**, which needs GPU-time and energy
+attributed to a tenant; and **performance tuning**, which needs the queue, cache and
+routing numbers behind a latency figure.
 
-**Is a model serving well?** From the gateway, for any engine.
+Latency appears twice on purpose: once as the caller experienced it and once as the engine
+did. The gap between them is routing, queueing and network, and one number alone cannot
+separate those from a slow model.
 
-| Metric | Type | Unit |
+**What the caller got.**
+
+| Metric | Type | Source |
 |---|---|---|
-| `modelplane_frontend_request_duration_seconds` | histogram | seconds |
-| `modelplane_frontend_ttft_seconds` | histogram | seconds |
-| `modelplane_frontend_tpot_seconds` | histogram | seconds |
-| `modelplane_requests_total{status}` | counter | requests |
-| `modelplane_tokens_total{direction}` | counter | tokens |
+| `modelplane_frontend_request_duration_seconds` | histogram | gateway |
+| `modelplane_frontend_ttft_seconds` | histogram | gateway, streaming only |
+| `modelplane_frontend_tpot_seconds` | histogram | gateway |
+| `modelplane_requests_total{status}` | counter | gateway |
+| `modelplane_tokens_total{direction}` | counter | gateway |
+| `modelplane_requests_throttled_total` | counter | Envoy rate limits |
 
-**Why is it serving that way?** From the engine, and from the picker in front of it.
+**Why it served that way.**
 
-| Metric | Type | Unit |
+| Metric | Type | Source |
 |---|---|---|
-| `modelplane_request_ttft_seconds` | histogram | seconds |
-| `modelplane_request_duration_seconds` | histogram | seconds |
-| `modelplane_request_queue_seconds` | histogram | seconds |
-| `modelplane_request_input_tokens` | histogram | tokens |
-| `modelplane_request_output_tokens` | histogram | tokens |
-| `modelplane_requests_running` | gauge | requests |
-| `modelplane_requests_waiting` | gauge | requests |
-| `modelplane_kv_cache_utilization_ratio` | gauge | 0 to 1 |
-| `modelplane_requests_preempted_total` | counter | requests |
-| `modelplane_route_decision_seconds` | histogram | seconds |
+| `modelplane_request_ttft_seconds` | histogram | engine |
+| `modelplane_request_duration_seconds` | histogram | engine |
+| `modelplane_request_queue_seconds` | histogram | engine |
+| `modelplane_request_prefill_seconds` | histogram | engine, where reported |
+| `modelplane_request_decode_seconds` | histogram | engine, where reported |
+| `modelplane_request_kv_transfer_seconds` | histogram | engine, disaggregated only |
+| `modelplane_request_input_tokens` | histogram | engine |
+| `modelplane_request_output_tokens` | histogram | engine |
+| `modelplane_requests_running` | gauge | engine |
+| `modelplane_requests_waiting` | gauge | engine |
+| `modelplane_kv_cache_utilization_ratio` | gauge (0 to 1) | engine |
+| `modelplane_requests_preempted_total` | counter | engine |
+| `modelplane_tokens_recomputed_total` | counter | engine, where reported |
+| `modelplane_route_decision_seconds` | histogram | picker |
+| `modelplane_route_requests_total{decision}` | counter | picker |
+| `modelplane_route_pd_pairings_total{status}` | counter | picker, disaggregated only |
 
-**Is the fleet healthy, and what is it costing?** From the GPUs and from Modelplane.
+**What it costs.**
 
-| Metric | Type | Unit |
+| Metric | Type | Source |
 |---|---|---|
-| `modelplane_gpu_memory_used_bytes` | gauge | bytes |
-| `modelplane_gpu_compute_active_ratio` | gauge | 0 to 1 |
-| `modelplane_energy_joules_total` | counter | joules |
-| `modelplane_replicas_desired` | gauge | replicas |
-| `modelplane_replicas_ready` | gauge | replicas |
-| `modelplane_replica_gpus` | gauge | GPUs |
-| `modelplane_replica_gpu{gpu_uuid}` | gauge | 0 or 1 |
-| `modelplane_replica_ready_seconds` | histogram | seconds |
-| `modelplane_gpu_seconds_total` | counter | GPU-seconds |
-| `modelplane_cluster_gpus_allocatable` | gauge | GPUs |
-| `modelplane_cluster_connected` | gauge | 0 or 1 |
+| `modelplane_gpu_memory_used_bytes` | gauge | DCGM |
+| `modelplane_gpu_compute_active_ratio` | gauge (0 to 1) | DCGM |
+| `modelplane_gpu_memory_bandwidth_ratio` | gauge (0 to 1) | DCGM |
+| `modelplane_energy_joules_total` | counter | DCGM, scaled from millijoules |
+| `modelplane_replica_gpus` | gauge | Modelplane |
+| `modelplane_replica_gpu{gpu_uuid}` | gauge (0 or 1) | Modelplane |
+| `modelplane_gpu_seconds_total` | counter | Modelplane |
+| `modelplane_cluster_gpus_allocatable` | gauge | Modelplane, from `ResourceSlices` |
+
+**Whether the machinery works.**
+
+| Metric | Type | Source |
+|---|---|---|
+| `modelplane_replicas_desired` | gauge | Modelplane |
+| `modelplane_replicas_ready` | gauge | Modelplane |
+| `modelplane_replica_ready_seconds` | histogram | Modelplane |
+| `modelplane_replica_staging_seconds` | histogram | ModelExpress |
+| `modelplane_replica_warmup_seconds` | histogram | ModelExpress |
+| `modelplane_modelcache_hits_total` | counter | Modelplane |
+| `modelplane_modelcache_misses_total` | counter | Modelplane |
+| `modelplane_gang_incomplete` | gauge | LWS or Grove status |
+| `modelplane_dra_allocation_errors_total` | counter | DRA driver |
+| `modelplane_engine_restarts_total` | counter | kube-state-metrics |
+| `modelplane_cluster_connected` | gauge (0 or 1) | Modelplane |
+
+**When the hardware is the problem.** A bad link or a throttling card explains a latency
+regression that load alone does not, and on a multi-node gang one bad link degrades the
+whole engine. Some of these need the exporter's optional collectors enabled.
+
+| Metric | Type | Source |
+|---|---|---|
+| `modelplane_gpu_temperature_celsius` | gauge | DCGM |
+| `modelplane_gpu_thermal_throttle_seconds_total` | counter | DCGM |
+| `modelplane_gpu_ecc_errors_total{type}` | counter | DCGM, off by default |
+| `modelplane_gpu_interconnect_errors_total{link}` | counter | DCGM, off by default |
 
 Every series carries `cluster`, stamped by the collector that scraped it. A series about a
 deployment also carries `deployment`, `namespace` and `model`. `engine` goes only on
