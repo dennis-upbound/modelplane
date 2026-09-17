@@ -21,6 +21,8 @@ EKSCluster
 ServingStack
 ModelCache
 ModelCaches
+MetricMapping
+MetricMappings
 ModelDeployment
 ModelDeployments
 ModelEndpoint
