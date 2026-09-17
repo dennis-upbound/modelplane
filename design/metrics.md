@@ -100,10 +100,10 @@ rising from longer requests look identical in a latency graph and want opposite 
 | `modelplane_stack_component_up{component}` | gauge | 0 or 1 |
 
 Every series carries `cluster`. A series about a deployment also carries `deployment`,
-`namespace`, `model` and `engine`, plus a `role` of `prefill` or `decode` under
-disaggregated serving, because the two do different work and an average of them describes
-neither. `modelplane_gpus_allocatable` carries `cluster` alone, since it is a property of
-the nodes. No series names a pod: replicas are interchangeable, so they are summed. No
+`namespace`, `model` and `engine`. Under disaggregated serving it carries a `role` of
+`prefill` or `decode` too, because the two do different work and an average of them
+describes neither. `modelplane_gpus_allocatable` carries `cluster` alone, being a property
+of the nodes. No series names a pod: replicas are interchangeable, so they are summed. No
 series names a caller, which is unbounded by construction.
 
 Four choices in that list are worth stating.
@@ -115,9 +115,9 @@ Fast inference and a slow request means routing, queueing or the network. One nu
 cannot tell those apart.
 
 **Hit rate as two counters, not a ratio**, because a ratio cannot be re-aggregated and two
-counters can. Tokens per second is absent for a related reason: it means one user's rate to
-some readers and total throughput to others, so this publishes the counter and lets a query
-say which it wants.
+counters can. Tokens per second is absent for a related reason. It means one user's rate to
+some readers and total throughput to others. So this publishes the counter, and a query
+says which one it wants.
 
 **`modelplane_replicas_unschedulable`**, because the gap between desired and ready is the
 failure a fleet hides best. A GPU pool that cannot satisfy a claim leaves every replica
@@ -150,11 +150,12 @@ into `modelplane_stack_component_up`.
 **Modelplane itself** answers capacity, and it has to. Modelplane requests GPUs as DRA
 resource claims, so a GPU is a claim against a `ResourceSlice`, not an `nvidia.com/gpu`
 count on a node. The series `kube-state-metrics` publishes about pod requests describe
-neither the claim nor the workload: they carry `pod` and `namespace` and no `model`, so a
-fleet query grouped by model would have nothing to group. Modelplane made the placement and
+neither the claim nor the workload. They carry `pod` and `namespace` and no `model`, so a
+fleet query grouped by model would find nothing to group. Modelplane made the placement and
 knows all of it, so a small exporter beside the Crossplane functions publishes the capacity
-and replica gauges from state those functions already reconcile. That is the one component
-this design adds. It suits these metrics: a cluster where nothing started is the cluster
+and replica gauges from state those functions already reconcile. They carry the same labels
+as everything else, so they divide into the engine's counters on `model` and `deployment`.
+That is the one component this design adds. It suits these metrics: a cluster where nothing started is the cluster
 least able to report that nothing started.
 
 ### Normalizing an engine
@@ -236,8 +237,9 @@ summed series is what travels. Dropping the label on the way out instead would l
 several replicas' series identical, which the receiver rejects as duplicates rather than
 adding up.
 
-**On the control plane**, a Prometheus receives those writes and is the fleet. Four
-questions only it can answer, each a rule over series every cluster now agrees on:
+**On the control plane**, a Prometheus receives those writes and scrapes Modelplane's
+exporter. Between them it holds the fleet, and four questions only it can answer are each a
+rule over series every cluster now agrees on:
 
 ```yaml
 - record: modelplane:slo_attainment:ratio5m
@@ -352,8 +354,8 @@ is the better place for it.
 **Modelplane kinds for mapping and forwarding.** A cluster-scoped `MetricMapping` naming
 what each engine calls each metric, and a `TelemetryDestination` naming where the fleet's
 series go. The mapping states an engine's names once and renders into every cluster running
-it, where a `PrometheusRule` restates them per cluster, and it gives Modelplane somewhere
-to report that a mapping matched nothing. The destination gives forwarding a schema instead
+it. A `PrometheusRule` restates them per cluster instead. The mapping also gives Modelplane
+somewhere to report that nothing matched. The destination gives forwarding a schema instead
 of asking an operator to edit a resource Crossplane composes.
 
 Both lose to what they wrap. Prometheus already models each half, in `PrometheusRule` and
