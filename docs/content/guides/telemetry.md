@@ -55,20 +55,28 @@ it replaced.
 
 ## Sending it somewhere
 
-Point the control plane's collector at whatever you already run:
+Create a `TelemetryDestination` naming whatever you already run:
 
 ```yaml
-exporters:
-  otlphttp:
-    endpoint: https://otel.example.internal
+apiVersion: modelplane.ai/v1alpha1
+kind: TelemetryDestination
+metadata:
+  name: default
+spec:
+  exporters:
+    otlphttp:
+      endpoint: https://otel.example.internal
 ```
 
-If you run Prometheus, export to it instead and query the fleet there:
+`spec.exporters` is the OpenTelemetry collector's own exporters block, so anything the
+collector supports works, with its usual auth, TLS, and retry settings. If you run
+Prometheus, export to that instead and query the fleet there:
 
 ```yaml
-exporters:
-  prometheusremotewrite:
-    endpoint: https://prom.example.internal/api/v1/write
+spec:
+  exporters:
+    prometheusremotewrite:
+      endpoint: https://prom.example.internal/api/v1/write
 ```
 
 Your clusters reach the control plane, and only the control plane reaches your backend. A
@@ -96,21 +104,22 @@ Any other OpenAI-compatible engine reports its top-line numbers with no configur
 either, because the gateway measures them rather than the engine: `modelplane_frontend_*`
 and the token counters work for an engine Modelplane has never seen.
 
-To normalize that engine's own metrics as well, add rename statements to the collector's
-`transform` processor:
+To normalize that engine's own metrics as well, create a `MetricMapping`:
 
 ```yaml
-processors:
-  transform/my-engine:
-    metric_statements:
-    - context: metric
-      statements:
-      - set(name, "modelplane_requests_waiting")
-          where name == "my_engine_queued_requests"
+apiVersion: modelplane.ai/v1alpha1
+kind: MetricMapping
+metadata:
+  name: my-engine
+spec:
+  statements:
+  - set(name, "modelplane_requests_waiting")
+      where name == "my_engine_queued_requests"
 ```
 
-Apply that to each cluster running the engine. An engine with no statements is still
-collected, under its own names.
+`spec.statements` are OTTL, the collector's own transform language. Modelplane renders them
+into every cluster's collector, so you write them once. An engine with no statements is
+still collected, under its own names.
 
 One engine needs a flag. SGLang publishes `/metrics` only when it runs with
 `--enable-metrics`, so add it to the engine args. vLLM needs nothing.

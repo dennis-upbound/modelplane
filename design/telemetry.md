@@ -170,17 +170,16 @@ exporter and Crossplane's runtime metrics, and exports onward. It sees one merge
 it adds nothing that varies by cluster; `cluster` is already on every series. It is the
 fleet's single egress point.
 
-Where it exports to is the one thing an operator has to write. They write the collector's
-own `exporters` block, in a ConfigMap Modelplane renders into the control-plane collector:
+Where it exports to is the one thing an operator has to write, and a
+`TelemetryDestination` is where they write it:
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
+apiVersion: modelplane.ai/v1alpha1
+kind: TelemetryDestination
 metadata:
-  name: telemetry-exporters
-  namespace: modelplane-system
-data:
-  exporters: |
+  name: default
+spec:
+  exporters:
     otlphttp:
       endpoint: https://otel.acme.example
       auth:
@@ -189,11 +188,15 @@ data:
       endpoint: https://prom.acme.example/api/v1/write
 ```
 
-Anything the collector's exporters support works here, including the auth, TLS, retry and
-queue settings a Modelplane field would have had to restate or cap. A ConfigMap suffices
-where `MetricMapping` needed a kind, because this object stays on the control plane and
-never has to reach a cluster, and reaching every cluster is the whole of what that kind
-buys.
+`spec.exporters` is the collector's exporters block, passed through unread. Modelplane
+validates that it parses and reports whether the destination is accepting writes; it does
+not model what an exporter is. So anything the collector supports works, including the auth,
+TLS, retry and queue settings that a field-by-field schema would have had to restate or cap,
+and a destination keeps working when the collector gains an exporter Modelplane has never
+heard of.
+
+That is the same bargain as `MetricMapping`. Both kinds are typed, named homes for a piece
+of collector configuration, and neither interprets what it holds.
 
 A cluster authenticates to it with a client certificate Modelplane issues and propagates the
 way `ModelCache` already propagates a HuggingFace token.
@@ -318,16 +321,18 @@ than reaching the control plane instead. The backend's credential goes onto ever
 cluster. Repointing the fleet becomes a per-cluster edit. And Modelplane's own exporter
 publishes control-plane metrics, which would need a path of their own.
 
-**A `TelemetryDestination` kind.** A cluster-scoped kind naming where the fleet's series go,
-giving forwarding a schema instead of an exporter block. It would validate what an operator
-writes and give Modelplane somewhere to report that the destination is unreachable.
+**ConfigMaps instead of kinds.** Both `MetricMapping` and `TelemetryDestination` hold
+collector configuration and neither reads it, so a ConfigMap would carry the same bytes and
+cost no API surface at all. A kind is permanent, and two of them is a real price for
+something that is, underneath, a string.
 
-It would express less than what it wraps. The collector's exporters already carry auth, TLS,
-queue tuning and retry, and an operator sending telemetry somewhere has met them before. A
-kind over the top would either restate all of that or quietly cap what a destination can be.
-`MetricMapping` earns its place on different grounds: what it carries is one fact that has
-to reach every cluster, and a ConfigMap of the same statements would be namespaced,
-unvalidated, statusless, and matched by a label convention rather than by a schema.
+They earn it on what a ConfigMap cannot do. A ConfigMap is namespaced, so a cluster-scoped
+fact about an engine would live in somebody's namespace. It is matched by label convention
+instead of by schema, so a typo yields silence. It validates nothing, so a malformed
+exporter block is discovered when telemetry stops rather than when it is applied. And it has
+no status, so nothing reports that a mapping matched no series on any cluster, or that a
+destination is refusing writes. Those are the failures this design is otherwise built to
+avoid, and a kind is where the condition that reports them lives.
 
 ## Appendix: the metric surface
 

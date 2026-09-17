@@ -31,6 +31,8 @@ ModelReplica
 ModelReplicas
 ModelService
 ModelServices
+TelemetryDestination
+TelemetryDestinations
 
 # Spec fields and config keys
 clusterSelector
@@ -583,3 +585,4 @@ quantiles
 precompute
 top-line
 p99
+OTTL
