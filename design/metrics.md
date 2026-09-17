@@ -20,7 +20,7 @@ What lands in that backend means one thing everywhere, whatever produced it:
 
 ```
 modelplane_frontend_ttft_seconds_bucket{cluster="prod-us-east", model="Qwen/Qwen3-8B",
-  deployment="qwen3-8b", namespace="ml-team", engine="vllm", le="0.25"} 1841
+  deployment="qwen3-8b", namespace="ml-team", le="0.25"} 1841
 ```
 
 The same pipeline carries logs and traces when those land. Nothing in it is specific to
@@ -46,8 +46,10 @@ both is wrong rather than approximate.
 
 The front door does not have these problems. Envoy AI Gateway measures every request it
 proxies and publishes the result under the OpenTelemetry GenAI conventions:
-`gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token`, request
-duration and token usage, each labelled with the model. One component, one vocabulary, one
+`gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token`,
+`gen_ai.server.request.duration`, `gen_ai.client.operation.duration` and
+`gen_ai.client.token.usage`, each labelled with the model. The request count comes from the
+duration histogram's `_count` series, split by outcome. One component, one vocabulary, one
 bucket layout, for whatever engine is behind it. It measures time per output token for
 engines that do not report it themselves.
 
@@ -62,9 +64,11 @@ that workflow written down.
 
 ## Requirements
 
-**One namespace.** Every metric the fleet exposes lives under `modelplane_*` and carries the
-same labels, whatever component produced it. A dashboard names a metric once and does not
-care which engine, gateway or exporter answered.
+**One namespace.** Every metric in the fleet's contract lives under `modelplane_*` and
+carries the same labels, whatever component produced it, so a dashboard names a metric once
+and does not care which engine, gateway or exporter answered. A component's own series pass
+through unrenamed alongside, readable but outside the contract and outside what a Modelplane
+dashboard reads.
 
 **Popular engines work out of the box.** vLLM and SGLang need no configuration. So does the
 gateway, the picker, DCGM and the rest of what Modelplane installs, because Modelplane
@@ -76,7 +80,9 @@ take configuration, but never a Modelplane release.
 
 **Vendor-neutral, and aligned with OpenTelemetry.** The wire format, the collector and its
 configuration language are the OSS project's, not ours, and the operator chooses the
-backend. Modelplane picks no query language for them and runs no store on their behalf.
+backend. Modelplane runs no store on their behalf. It does ship queries, and those are
+PromQL, because the `prometheusremotewrite` path is the reference backend; every other
+backend gets the metric surface and writes its own.
 Modelplane adopts the GenAI conventions' definitions and bucket boundaries, then renames
 the series into its own namespace. The conventions cover the gateway's five request metrics
 and nothing else Modelplane collects, so alignment has to be about meaning, not names.
@@ -133,15 +139,32 @@ queueing and network, and one number alone cannot separate those from a slow mod
 | `modelplane_replicas_desired` | gauge | replicas |
 | `modelplane_replicas_ready` | gauge | replicas |
 | `modelplane_replica_gpus` | gauge | GPUs |
+| `modelplane_replica_gpu{gpu_uuid}` | gauge | 0 or 1 |
+| `modelplane_replica_ready_seconds` | histogram | seconds |
 | `modelplane_gpu_seconds_total` | counter | GPU-seconds |
 | `modelplane_cluster_gpus_allocatable` | gauge | GPUs |
 | `modelplane_cluster_connected` | gauge | 0 or 1 |
 
-Every series carries `cluster`. A series about a deployment also carries `deployment`,
-`namespace`, `model` and `engine`. Under disaggregated serving it carries a `role` of
-`prefill` or `decode` too, because the two do different work and an average of them
-describes neither. No series names a pod: replicas are interchangeable, so they are summed
-before export. No series names a caller, which is unbounded by construction.
+Every series carries `cluster`, stamped by the collector that scraped it. A series about a
+deployment also carries `deployment`, `namespace` and `model`. `engine` goes only on
+series an engine produced, because it is read from the engine's own metric prefix and the
+gateway does not know what served a request. Under disaggregated serving an engine series
+carries a `role` of `prefill` or `decode`, because the two do different work and an average
+of them describes neither. GPU series carry `gpu_uuid` and the node, which is all DCGM
+knows.
+
+Two labels have closed value sets: `status` on `modelplane_requests_total` is `ok`,
+`client_error` or `server_error`, and `direction` on `modelplane_tokens_total` is `input` or
+`output`. Neither carries a raw status code, which would be cardinality with no reader.
+
+No series names a pod: replicas are interchangeable, so they are merged before export. No
+series names a caller, which is unbounded by construction.
+
+`modelplane_replica_gpu` is how a GPU reaches a workload. DCGM knows a GPU's UUID and its
+host and nothing else, so it cannot answer a question about a deployment on its own.
+Modelplane placed the replica and holds its DRA claim, so it publishes one series per
+GPU-to-replica binding, and a backend joins DCGM's figures through it. Every cost and
+efficiency question below is that join.
 
 The gateway and the engines both count requests and tokens, and only the gateway's counts
 are renamed onto `modelplane_requests_total` and `modelplane_tokens_total`. It counts the
@@ -168,21 +191,24 @@ Their latency histograms come across too, under `modelplane_request_*`, but they
 per-engine diagnostics and not the fleet's SLO, because their buckets do not merge.
 
 **The endpoint picker** publishes `llm_d_epp_*`, the source of
-`modelplane_route_decision_seconds`. A router's queue is a different measurement from an
-engine's, so it stays a different metric.
+`modelplane_route_decision_seconds`. That is the time the picker spent choosing a backend,
+which inflates the gateway's time to first token without appearing anywhere in the engine's
+own numbers.
 
 **The GPUs** answer the physical picture. DCGM reports memory, compute activity, power and
 energy per device.
 
-**Modelplane itself** answers what nothing else can. Under DRA a GPU is a claim against a
-`ResourceSlice`, and no exporter publishes those, so allocatable capacity has no source.
-DCGM labels a GPU with its UUID and host and nothing about the workload, so no join
-attributes a GPU to a replica. Nothing times a replica from created to serving, and only
-Modelplane knows whether it can still reach a cluster. Modelplane made every one of those
-decisions, so a small exporter beside the Crossplane functions publishes
-`modelplane_replica_gpus`, `modelplane_gpu_seconds_total`,
-`modelplane_cluster_gpus_allocatable`, `modelplane_cluster_connected` and the replica
-counts, labelled like everything else. That is the one component this design adds.
+**Modelplane itself** answers what nothing else can. Under DRA, a driver advertises its
+devices as `ResourceSlices` and a workload requests them through a `ResourceClaim`. No
+exporter turns those into an allocatable count, so capacity has no series until something
+reads the slices. DCGM labels a GPU with its UUID and its host and nothing about the
+workload, so nothing joins a GPU to a replica. Nothing times a replica from created to
+serving. And only the control plane knows whether it can still reach a cluster.
+
+Modelplane made every one of those decisions or holds the object that answers them, so an
+exporter beside the composition functions reads the `ResourceSlices` and the replicas'
+claims, and publishes the whole fleet-and-cost table above. It is the only component here
+Modelplane writes; both collectors are upstream.
 
 ### Normalizing
 
@@ -246,15 +272,26 @@ Modelplane wrapper around it.
 
 Two collectors, and neither stores anything.
 
-**On each inference cluster**, a collector scrapes the gateway, the engines, the picker,
-DCGM and `kube-state-metrics` through the Prometheus receiver, renames what it scraped,
-sums each metric across a deployment's replicas with OTTL's `aggregate_on_attributes` so
-that no series names a pod, and exports OTLP to the control plane. It needs egress and
-nothing inbound.
+**On each inference cluster**, a collector scrapes the gateway, the engines, the picker and
+DCGM, renames what it scraped, merges each deployment's replicas into one series, stamps
+`cluster`, and exports OTLP to the control plane. It needs egress and nothing inbound.
 
-**On the control plane**, a collector receives from every cluster, stamps the fleet's
-labels, adds Modelplane's own exporter and Crossplane's runtime metrics, and exports
-onward. It is the fleet's single egress point:
+Targets come from the OpenTelemetry Operator's target allocator with
+`prometheusCR.enabled`, reading `PodMonitor` objects Modelplane composes. Its selectors
+match labels Modelplane stamps, because an unrestricted selector lets anyone who can create
+a monitor point the collector at a target of their choosing.
+
+Merging replicas is two steps, and the order matters. The Prometheus receiver emits one
+resource per scrape target, so a pod's identity sits in resource attributes where a metric
+processor cannot see it; `groupbyattrs` strips those and merges the resources first, and
+then OTTL's `aggregate_on_attributes` combines the data points. Counters and counts are
+summed. A ratio is averaged, because four replicas each at 0.5 are not a cache two hundred
+percent full.
+
+**On the control plane**, a collector receives from every cluster, scrapes Modelplane's own
+exporter and Crossplane's runtime metrics, and exports onward. It sees one merged stream, so
+it adds nothing that varies by cluster; `cluster` is already on every series. It is the
+fleet's single egress point:
 
 ```yaml
 exporters:
@@ -273,9 +310,10 @@ without a path of their own.
 A cluster authenticates to it with a client certificate Modelplane issues and propagates the
 way `ModelCache` already propagates a HuggingFace token.
 
-This replaces the kube-prometheus-stack `compose-serving-stack` installs today. That is the
-one breaking change, so it lands separately: the collector arrives alongside the old stack
-where an operator can compare them, and the removal follows.
+This replaces the kube-prometheus-stack `compose-serving-stack` installs today, which is
+the one breaking change. It lands on its own with a release note. A hand-written
+`PodMonitor` is still read by the target allocator, so anyone who wrote one keeps their
+targets; what goes away is the in-cluster store they were querying.
 
 ### What the backend computes
 
