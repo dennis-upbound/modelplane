@@ -889,6 +889,41 @@ Deployment and LeaderWorkerSet report `status.replicas` as the observed total an
 keep readiness in a separate field. Autoscaling is opt-in via `kubectl scale` or a
 separate KEDA `ScaledObject` (or similar).
 
+## Observability
+
+Modelplane collects metrics from every component it installs and normalizes them onto one
+`modelplane_*` surface, so a dashboard names a metric once and does not care which engine,
+gateway or exporter answered it. The full design is in [metrics.md](metrics.md).
+
+An OpenTelemetry collector runs on each InferenceCluster. It scrapes the gateway, the
+engines, the endpoint picker, DCGM and kube-state-metrics, renames what it scraped, sums
+each series across a deployment's replicas so that none names a pod, and exports OTLP to a
+collector on the control plane. That collector stamps the fleet's labels and exports onward
+to whatever the platform team already runs. Neither collector stores anything: the control
+plane reconciles a fleet and does not hold a telemetry store to size, retain and back up.
+A workload cluster needs egress and nothing inbound.
+
+The top-line latency and token metrics come from the gateway rather than from the engines.
+Envoy AI Gateway measures every request it proxies and reports time to first token, time per
+output token, duration and token usage under the OpenTelemetry GenAI conventions, per model,
+for whatever engine is behind it. An engine Modelplane has never seen therefore reports its
+headline numbers with no configuration at all, which matters because Modelplane runs any
+OpenAI-compatible server. The engines' own metrics come across too, as the saturation and
+KV-cache diagnostics that explain what the front door measured.
+
+Two things follow for the rest of this design.
+
+Modelplane instruments what no component can report. Under DRA a GPU is a claim against a
+ResourceSlice and no exporter publishes those, DCGM labels a GPU with its UUID and host and
+nothing about the workload, and nothing times a ModelReplica from created to serving. An
+exporter beside the composition functions publishes allocatable capacity, the GPUs a replica
+holds, replica lifecycle timings and whether the control plane can still reach a cluster.
+
+And autoscaling reads from the platform team's backend. A collector holds no history, so
+it computes no rates and no quantiles; those are the backend's. A KEDA `ScaledObject`
+scaling a ModelDeployment's replicas queries there, which is just as well: this design
+leaves no per-cluster Prometheus to reach into.
+
 ## Alternatives considered
 
 ### An opinionated topology block
