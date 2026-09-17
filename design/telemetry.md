@@ -1,4 +1,4 @@
-# Metrics collection
+# Telemetry collection
 
 **Status:** Draft
 **Date:** September 2026
@@ -23,10 +23,9 @@ modelplane_frontend_ttft_seconds_bucket{cluster="prod-us-east", model="Qwen/Qwen
   deployment="qwen3-8b", namespace="ml-team", le="0.25"} 1841
 ```
 
-The same pipeline carries logs and traces when those land. Nothing in it is specific to
-metrics except the receivers on one end.
-
-This document is about metrics. It names logs and traces only where they share a mechanism.
+Nothing in that pipeline is specific to metrics except the receivers on one end, which is
+why it is worth building once. Metrics land first and this document designs them. Logs and
+traces reuse what it builds, and get their own design when they land.
 
 ## Background
 
