@@ -18,8 +18,9 @@ removed, and takes that page's URL with it.
 {{< /hint >}}
 
 Modelplane runs an OpenTelemetry collector on every inference cluster. It collects from
-everything Modelplane installs, renames each component's series to one `modelplane_*`
-vocabulary, and pushes to a collector on your control plane. That collector is your fleet's
+every component Modelplane installs, which is more than your engines. It renames each
+component's series to a single `modelplane_*` vocabulary and pushes to a collector on your
+control plane. That collector is your fleet's
 single egress point, and it sends to any backend that speaks OTLP.
 
 Modelplane has no API for this: nothing to write, and nothing to keep in sync as your
@@ -101,8 +102,8 @@ series. To precompute them, export to Prometheus and write recording rules there
 vLLM and SGLang need no configuration.
 
 Any other OpenAI-compatible engine reports its top-line numbers with no configuration
-either, because the gateway measures them rather than the engine: `modelplane_frontend_*`
-and the token counters work for an engine Modelplane has never seen.
+either. The gateway measures those, not the engine, so `modelplane_frontend_*` and the token
+counters work for an engine Modelplane has never seen.
 
 To normalize that engine's own metrics as well, create a `MetricMapping`:
 

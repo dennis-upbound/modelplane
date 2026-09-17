@@ -19,8 +19,8 @@ end, so logs and traces reuse it instead of each arriving with a path of its own
 
 The telemetry is a normalized `modelplane_*` surface, collected with no configuration for
 the engines people actually run and for everything Modelplane installs around them. An
-operator gets a fleet worth of it on the day they install it, and what lands in their
-backend means one thing everywhere, whatever produced it:
+operator writes one object saying where it all goes, and what lands there means one thing
+everywhere, whatever produced it:
 
 ```
 modelplane_frontend_ttft_seconds_bucket{cluster="prod-us-east", model="Qwen/Qwen3-8B",
@@ -35,17 +35,14 @@ when they land.
 An inference deployment publishes numbers no other workload does. Time to first token is
 how long a user waits before anything appears. Time per output token is the speed of what
 follows. Both come from a queue in front of a GPU and a KV cache on it. When that cache
-fills, the engine evicts work and recomputes it, so latency moves in cliffs, not
-slopes.
+fills, the engine evicts work and recomputes it, so latency moves in cliffs.
 
-Engines disagree about these numbers, and only the first disagreement is about naming.
-`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` are the same
-measurement under different names. SGLang's `inter_token_latency` and vLLM's time per
-output token are *different measurements* under similar names, so renaming one to the other
-produces a wrong answer, and no amount of merging fixes it. Their histogram buckets diverge
-too: vLLM
-resolves down to a millisecond, SGLang to a hundred of them, so a quantile computed across
-both is wrong rather than approximate.
+Engines disagree about these numbers three ways, and only the first is about naming.
+`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` measure the same
+thing. The second is worse. SGLang's `inter_token_latency` and vLLM's time per output token
+have similar names and measure different things, so renaming one onto the other gives a
+wrong answer. The third is arithmetic. vLLM buckets its histograms down to a millisecond and
+SGLang to a hundred of them, so a quantile across both is wrong rather than approximate.
 
 The front door escapes all three. Envoy AI Gateway measures every request it proxies and
 publishes the result under the OpenTelemetry GenAI conventions:
@@ -70,8 +67,8 @@ that workflow written down.
 
 - **One namespace.** Every metric in the fleet's contract is a `modelplane_*` name with the
   same labels, whatever component produced it.
-- **Zero configuration for known components.** vLLM, SGLang, the gateway, the picker and
-  DCGM need nothing from the operator.
+- **Zero configuration for anything Modelplane installs.** The engines, the gateway, the
+  picker, DCGM and the controllers all report without being asked.
 - **Any engine, without a release.** Modelplane runs any OpenAI-compatible server. One it
   has never seen still reports the fleet's top-line metrics.
 - **Upstream conventions, upstream tools.** The wire format, the collector and its
@@ -90,13 +87,15 @@ What each component emits is verified against a live deployment running vLLM, En
 Gateway, the llm-d picker and DCGM, rather than read off documentation.
 
 **The gateway** measures what the caller experienced, in GenAI vocabulary, for whatever
-engine sits behind it. Being one component, its histograms share a bucket layout, so a fleet
-quantile over them is sound. That is why the SLO metrics come from here. Two details matter
-for the scrape. The GenAI metrics are on the ext-proc sidecar's admin port, so the gateway
-needs a scrape target of its own rather than riding the proxy's. And time to first token
-exists only for a streaming request, because a non-streaming one has no first token to time,
-so that histogram counts a subset of what the duration histogram counts. Envoy's own proxy
-statistics come across as well, which is where refusals at a rate limit are visible.
+engine sits behind it. It is one component, so its histograms share a bucket layout and a
+fleet quantile over them is sound. The SLO metrics come from here for that reason.
+
+Two things about scraping it. The GenAI metrics sit on the ext-proc sidecar's admin port, so
+the gateway needs a target of its own rather than riding the proxy's. And time to first
+token exists only for a streaming request, since a non-streaming one has no first token to
+time. That histogram therefore counts fewer requests than the duration histogram beside it.
+Envoy's own proxy statistics come across too, which is where a refusal at a rate limit shows
+up.
 
 **The engine** explains what the gateway measured. vLLM and SGLang both publish queue depth,
 running and waiting counts, KV utilization and preemptions as gauges and counters, which
@@ -115,28 +114,27 @@ and Modelplane enables them, because on a multi-node gang one bad NVLink degrade
 that otherwise looks healthy.
 
 **The substrate** reports whether the machinery works. The gang controller, LeaderWorkerSet
-or Grove, carries completeness in its status, which is how a gang that placed its leader and
-none of its workers becomes visible: the leader runs, so every per-pod view looks fine. The
-DRA driver counts allocation failures, which is the reason a replica stays Pending.
-`kube-state-metrics` supplies container restart counts and reads those controller statuses
-through its custom-resource-state collector.
+or Grove, carries completeness in its status. That is the only place a half-placed gang
+shows up: the leader is running, so every per-pod view looks fine while the workers never
+scheduled. The DRA driver counts allocation failures, which is why a replica stays Pending.
+`kube-state-metrics` reads both controller statuses through its custom-resource-state
+collector, and supplies container restart counts.
 
 **ModelExpress** times staging a model onto a cluster and the engine's warmup to first
 inference. Those two are most of a cold start, and a `ModelCache` exists to shorten them, so
 a fleet deciding whether to scale onto a cold cluster is reading these numbers.
 
-**Modelplane** supplies what none of them can. Under DRA, a driver advertises
-its devices as `ResourceSlices` and a workload requests them through a `ResourceClaim`. No
-exporter turns those into an allocatable count, so capacity has no series until something
-reads the slices. DCGM labels a GPU with its UUID and its host and nothing about the
-workload, so nothing joins a GPU to a replica. Nothing times a replica from created to
-serving, and nothing says whether its weights were already staged when it started. And only
-the control plane knows whether it can still reach a cluster.
+**Modelplane** supplies what none of them can, and there are four such gaps. Under DRA a
+driver advertises its devices as `ResourceSlices`, and no exporter turns those into an
+allocatable count, so capacity has no series at all. DCGM labels a GPU with its UUID and its
+host and nothing about the workload, so nothing joins a GPU to a replica. Nothing times a
+replica from created to serving, or says whether its weights were staged before it started.
+And only the control plane knows whether it can still reach a cluster.
 
-Modelplane made every one of those decisions or holds the object that answers them, so an
-exporter beside the composition functions reads the `ResourceSlices` and the replicas'
-claims, and publishes every capacity and cost series in the appendix. It is the only
-component here that Modelplane writes. Both collectors are upstream.
+Modelplane either made those decisions or holds the object that answers them. So an exporter
+beside the composition functions reads the `ResourceSlices` and the replicas' claims, and
+publishes every capacity and cost series in the appendix. It is the only component here
+Modelplane writes; both collectors are upstream.
 
 ### Normalizing
 
@@ -173,9 +171,11 @@ approximated by a neighbour.
 Collection is two hops: a collector on each inference cluster, and one on the control plane
 that every cluster reports to.
 
-**On each inference cluster**, a collector scrapes the gateway, the engines, the picker and
-DCGM, renames what it scraped, merges each deployment's replicas into one series, stamps
-`cluster`, and exports OTLP to the control plane. It needs egress and nothing inbound.
+**On each inference cluster**, a collector scrapes everything above that runs there: the
+gateway and its sidecar, the engines, the picker, DCGM, the controllers through
+`kube-state-metrics`, and ModelExpress. It renames what it scraped, merges each deployment's
+replicas into one series, stamps `cluster`, and exports OTLP to the control plane. It needs
+egress and nothing inbound.
 
 Targets come from the OpenTelemetry Operator's target allocator with
 `prometheusCR.enabled`, reading `PodMonitor` objects Modelplane composes. Its selectors
@@ -213,10 +213,10 @@ spec:
 
 `spec.exporters` is the collector's exporters block, passed through unread. Modelplane
 validates that it parses and reports whether the destination is accepting writes; it does
-not model what an exporter is. So anything the collector supports works, including the auth,
-TLS, retry and queue settings that a field-by-field schema would have had to restate or cap,
-and a destination keeps working when the collector gains an exporter Modelplane has never
-heard of.
+not model what an exporter is. So anything the collector supports works, with its auth, TLS,
+retry and queue settings intact. A field-by-field schema would have had to restate all of
+that or cap it. This one keeps working when the collector gains an exporter Modelplane has
+never heard of.
 
 That is the same bargain as `MetricMapping`. Both kinds are typed, named homes for a piece
 of collector configuration, and neither interprets what it holds.
@@ -281,9 +281,9 @@ status:
 
 Modelplane does not interpret `statements`. It renders them into each collector's
 `transform` processor beside its own, and reports how many clusters took them. The kind is
-an envelope and a way to reach every cluster, not a language: what an operator writes is
-the collector's configuration, documented by OpenTelemetry, and it is the same thing
-Modelplane writes for vLLM.
+an envelope and a way to reach every cluster, not a language. What an operator writes is the
+collector's own configuration, documented upstream, and identical in form to what Modelplane
+writes for vLLM.
 
 A fork that kept its parent's metric names needs none of this, since the parent's statements
 already match. The statements do the selecting through their own `where` clauses, so nothing
@@ -321,9 +321,9 @@ directly. If either lands, the statements for vLLM shrink or disappear.
 **Prometheus on every cluster, remote-writing to a Prometheus on the control plane.** The
 derivations above stop being the backend's problem and become recording rules Modelplane
 ships and an operator can read. Fleet quantiles, GPU-hours and efficiency ratios arrive as
-series that someone reads off a dashboard instead of assembling, and every one works the
-day the fleet is installed with no backend at all. Prometheus is also what the components
-already speak, so nothing converts.
+series to read rather than queries to assemble, and every one works the day the fleet is
+installed, with no backend at all. Prometheus is also what the components already speak, so
+nothing converts.
 
 The cost lands on the control plane. A Prometheus there is a
 stateful store to run, size and back up, on a cluster whose job is reconciliation. It
@@ -359,11 +359,13 @@ avoid, and a kind is where the condition that reports them lives.
 
 ## Appendix: the metric surface
 
-Four things read these metrics, and the set is what they need between them: **alerting**,
-on latency targets, availability and saturation; **autoscaling**, which places and sizes
-whole replicas from cost and capacity signals; **cost**, which needs GPU-time and energy
-attributed to a tenant; and **performance tuning**, which needs the queue, cache and
-routing numbers behind a latency figure.
+Four things read these metrics, and the set is what they need between them.
+
+- **Alerting**, on latency targets, availability and saturation.
+- **Autoscaling**, which places and sizes whole replicas from cost and capacity signals.
+- **Cost**, which needs GPU-time and energy attributed to a tenant.
+- **Performance tuning**, which needs the queue, cache and routing numbers behind a
+  latency figure.
 
 Latency appears twice on purpose: once as the caller experienced it and once as the engine
 did. The gap between them is routing, queueing and network, and one number alone cannot
@@ -470,8 +472,8 @@ cannot double the fleet's total.
 
 Tokens per second is absent on purpose. It means one user's rate to some readers and the
 service's total throughput to others, so this publishes the counter and lets a query say
-which it wants. GPU utilization as the accelerator reports it is absent for a better reason:
-for inference it says only that the card was not idle, which is almost always true, because
-the work is memory-bandwidth bound. `modelplane_gpu_compute_active_ratio` and the memory
-figures separate a busy GPU from an efficient one.
+which it wants. GPU utilization as the accelerator reports it is absent for a better
+reason. It says the card was not idle, which for inference is almost always true, since the
+work is memory-bandwidth bound. `modelplane_gpu_compute_active_ratio` and the memory figures
+separate a busy GPU from an efficient one.
 
