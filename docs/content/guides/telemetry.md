@@ -4,97 +4,92 @@ weight: 20
 draft: true
 aliases:
 - /guides/collecting-engine-metrics/
-description: Collect engine, router, and cluster telemetry across the fleet and send it to one destination.
+description: Read engine, router, and cluster metrics for the whole fleet from one Prometheus.
 ---
 <!-- vale write-good.Passive = NO -->
 {{< hint warning >}}
 **Draft.** This page documents [the metrics design][design], which isn't built yet. It's
-here to check the API reads well before it's implemented, and it's excluded from the site
-by `draft: true`. It replaces [Collecting engine metrics]({{< ref
+here to check the experience reads well before it's implemented, and it's excluded from the
+site by `draft: true`. It replaces [Collecting engine metrics]({{< ref
 "guides/collecting-engine-metrics.md" >}}) when the per-cluster Prometheus stack is
 removed, and takes that page's URL with it.
-
-The API line below is plain text, not a `ref`, because the reference page is
-generated from a CRD that doesn't exist yet and Hugo fails a `ref` it can't resolve.
 
 [design]: https://github.com/modelplaneai/modelplane/pull/363
 {{< /hint >}}
 
-**API:** `modelplane.ai/v1alpha1` · TelemetryDestination, MetricMapping
+Modelplane collects metrics from everything it runs, renames each engine's series to one
+Modelplane vocabulary, and rolls them up into a Prometheus on your control plane. That
+Prometheus answers for the whole fleet. Modelplane has no API for any of this: nothing to
+write, and nothing to keep in sync as your deployments change.
 
-Modelplane collects metrics from everything it runs and sends them to a single destination
-for the whole fleet. Each engine's names are rewritten to one Modelplane vocabulary on the
-way, so a dashboard doesn't care which engine produced a number. There's no `PodMonitor` to
-write and no per-cluster Prometheus to reach into.
+## What you get
 
-Metrics are what it collects today. The destination is named for telemetry, not
-metrics, because the same pipeline carries logs, which follow once the per-node collector
-they need is running.
+Every series carries `cluster`, and a series about a deployment also carries `deployment`,
+`namespace`, `model`, and `engine`. Some of what you can read:
 
-Two things to set up: where the metrics go, and what engine each deployment runs.
+| Metric | Means |
+| --- | --- |
+| `modelplane_time_to_first_token_seconds` | Latency to the first token, as a histogram |
+| `modelplane_inter_token_latency_seconds` | The gap between output tokens, as a histogram |
+| `modelplane_request_duration_seconds` | What the caller waited, measured at the gateway |
+| `modelplane_requests_waiting` | Queue depth per engine |
+| `modelplane_kv_cache_utilization_ratio` | KV-cache occupancy, 0 to 1 |
+| `modelplane_tokens_total` | Tokens in and out, by `kind` |
+| `modelplane_gpus_allocated` | GPUs a deployment holds |
+| `modelplane_replicas_unschedulable` | Replicas that can't be placed |
 
-## Choosing a destination
+So one query spans the fleet:
 
-Modelplane collects nothing until a destination exists, since a collector nothing reads
-costs GPU-cluster resources for no return. Point it at any endpoint that speaks OTLP, or
-at a Prometheus-compatible store with `type: PrometheusRemoteWrite`:
+```promql
+histogram_quantile(0.99, sum by (le) (
+  rate(modelplane_time_to_first_token_seconds_bucket{model="Qwen/Qwen3-8B"}[5m])))
+```
+
+Add `cluster` to the grouping to break the same number out per cluster. Modelplane also
+records the fleet-wide figures that need a window, under `modelplane:` names:
+`modelplane:slo_attainment:ratio5m`, `modelplane:gpu_allocation:ratio`,
+`modelplane:tokens_per_gpu:rate5m`, and `modelplane:gpu_hours:1h`.
+
+<!-- vale Google.Acronyms = NO -->
+No series names a pod. Replicas are interchangeable, so they're summed before the metrics
+leave the cluster; a rolling update would otherwise leave a dead series behind for every pod
+it replaced.
+<!-- vale Google.Acronyms = YES -->
+
+To read the metrics somewhere else, set `remoteWrite` on the fleet Prometheus. It's an
+ordinary Prometheus, so anything that reads one reads this.
+
+## Adding an engine Modelplane doesn't cover
+
+You set nothing for vLLM, SGLang, or TensorRT-LLM. Modelplane matches the prefix each
+engine puts on its own metric names, so a fork that kept vLLM's names is already covered.
+
+For an engine Modelplane has no rules for, write recording rules that name the
+`modelplane_*` metric you want. Label the `PrometheusRule` so the cluster's Prometheus
+selects it:
 
 ```yaml
-apiVersion: modelplane.ai/v1alpha1
-kind: TelemetryDestination
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
 metadata:
-  name: default
+  name: my-engine
+  namespace: ml-team
+  labels:
+    modelplane.ai/metrics: normalize
 spec:
-  type: OTLP
-  otlp:
-    endpoint: otel.example.internal:4317
-    protocol: gRPC
-  auth:
-    type: Bearer
-    secretRef:
-      name: otlp-token
+  groups:
+  - name: my-engine
+    rules:
+    - record: modelplane_requests_waiting
+      expr: sum without (pod) (my_engine_queued_requests)
 ```
 
-Create the Secret once on the control plane. Modelplane propagates it to every cluster
-that needs it, the same way a `ModelCache` credential travels:
+The rule needs no labels of its own. Modelplane's scrape already attaches `cluster`,
+`deployment`, `model`, and `engine` to the series you're reading, and your recorded series
+inherits them.
 
-```bash
-kubectl create secret generic otlp-token \
-  --namespace modelplane-system \
-  --from-literal=token=<token>
-```
-
-Every cluster sends to the destination itself, so each one needs egress to that endpoint and
-nothing needs to reach into the cluster. Point the destination at a backend your clusters
-can already reach, which for most fleets is the observability stack you run today.
-
-If some cluster can't reach it, give that cluster a destination it can reach. A destination
-with no `clusterSelector` covers every cluster; add one and it covers the clusters it
-matches, so an isolated region or a neocloud with no route to your network sends somewhere
-else instead of collecting nothing. Your fleet query then covers what shares a backend,
-which is what the split costs you.
-
-A backend inside your own network usually needs two more things. If its certificate is
-signed by your own CA, name a Secret holding the bundle, and if your clusters egress through
-a proxy, say so. Both go on the destination, so every cluster gets them:
-
-```yaml
-spec:
-  tls:
-    caSecretRef:
-      name: otlp-ca                    # in modelplane-system
-  proxyURL: http://proxy.example.internal:3128
-```
-
-## Naming your engine
-
-You set nothing. `vllm:num_requests_waiting` and SGLang's queue depth counter are the same
-number, and Modelplane renames both to `modelplane_requests_waiting` by matching the prefix
-each engine puts on its own metric names. Modelplane provides rules for `vllm:`, `sglang:`
-and TensorRT-LLM's `nv_`.
-
-An engine whose metric names carry no engine, an OpenAI-compatible server publishing a bare
-`http_requests_total`, has nothing to match on. Name the mapping for it with `type`:
+Apply that to each cluster running the engine. If your engine's metric names carry nothing
+that identifies it, set `type` on the engine so its series still get an `engine` label:
 
 ```yaml {nocopy=true}
 spec:
@@ -105,55 +100,7 @@ spec:
         type: my-engine        # only when the metric names don't say
 ```
 
-Either way an engine with no mapping still gets collected, under its own names, and
-Modelplane reports that nothing matched instead of guessing.
-
-## Adding an engine Modelplane doesn't cover
-
-A forked or new engine needs a `MetricMapping`. Write one against the prefix it publishes
-under:
-
-```yaml
-apiVersion: modelplane.ai/v1alpha1
-kind: MetricMapping
-metadata:
-  name: my-engine
-spec:
-  prefix: "myengine_"
-  rename:
-    myengine_ttft_seconds: modelplane_time_to_first_token
-    myengine_queue_depth: modelplane_requests_waiting
-```
-
-A fork that kept vLLM's metric names needs nothing at all: it already matches the `vllm:`
-mapping, because that is what it calls them.
-
-That apply is the whole change. No fork of Modelplane, and no waiting on a release.
-
-## What you get
-
-Every series carries `engine`, `cluster`, `model`, `deployment`, and `namespace`, so one
-query spans the fleet:
-
-| Metric | Means |
-| --- | --- |
-| `modelplane_time_to_first_token` | Latency to the first token, as a histogram |
-| `modelplane_inter_token_latency` | The gap between output tokens, as a histogram |
-| `modelplane_requests_waiting` | Queue depth per engine |
-| `modelplane_kv_cache_usage` | KV-cache occupancy per engine |
-
-<!-- vale Google.Acronyms = NO -->
-Labels naming an individual pod are dropped before the metrics leave the cluster. A
-rolling update would otherwise leave a dead series behind for every pod it replaced.
-<!-- vale Google.Acronyms = YES -->
-
-Alongside the engines, Modelplane collects its routers and the stack it installs on each
-cluster, all under `modelplane_*`. Across the fleet it also reports capacity, GPU
-allocation, GPU-hours, and how many replicas are ready against what you asked for.
-
-Your control plane's own health comes from wherever you run it. A self-hosted Crossplane
-serves `/metrics` on its core, provider, and function pods for your own cluster scrape to
-pick up. A hosted control plane reports its health through whoever hosts it.
+An engine with no rules is still collected, under its own names.
 
 ## Other engine shapes
 
@@ -161,17 +108,20 @@ Nothing here changes by serving shape. Modelplane scrapes engine pods by the
 `modelplane.ai/serving` label it stamps and by port name, so a single pod, a leader and its
 workers, and a prefill/decode pair are all found the same way. Only the leader of a
 leader/worker gang carries the serving label, which is right: the workers serve no API and
-publish nothing. A decode engine listening on 8001 behind its routing sidecar is found by
-name and not by number, so it needs no rule of its own the way the old `targetPort` did.
+publish nothing.
 
-One engine still needs a flag. SGLang publishes `/metrics` only when it runs with
-`--enable-metrics`, so add it to the engine args; vLLM needs nothing.
+One engine needs a flag. SGLang publishes `/metrics` only when it runs with
+`--enable-metrics`, so add it to the engine args. vLLM needs nothing.
+
+SGLang's latency histograms use different bucket boundaries from vLLM's. A quantile across
+mismatched buckets is wrong rather than approximate, so those histograms keep SGLang's own
+names and the fleet latency panels cover vLLM only.
 
 ## Migrating from a hand-written `PodMonitor`
 
 [Collecting engine metrics]({{< ref "guides/collecting-engine-metrics.md" >}}) had you write
-a `PodMonitor` and reach into the in-cluster Prometheus over a `port-forward`. Both are
-gone, and this page replaces that one. Delete the `PodMonitor`: with the Prometheus operator no longer installed
-it stops working, and it stops working quietly. Queries you used to run against that
-Prometheus move to whatever consumes your destination.
+a `PodMonitor` and reach the in-cluster Prometheus over a `port-forward`. Both are gone, and
+this page replaces that one. Delete the `PodMonitor`: once the Prometheus operator is no
+longer installed it stops working, and it stops working quietly. Queries you ran against
+that Prometheus move to the fleet one.
 <!-- vale write-good.Passive = YES -->
