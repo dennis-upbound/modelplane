@@ -21,8 +21,6 @@ EKSCluster
 ServingStack
 ModelCache
 ModelCaches
-MetricMapping
-MetricMappings
 ModelDeployment
 ModelDeployments
 ModelEndpoint
@@ -31,8 +29,6 @@ ModelReplica
 ModelReplicas
 ModelService
 ModelServices
-TelemetryDestination
-TelemetryDestinations
 
 # Spec fields and config keys
 clusterSelector
@@ -579,3 +575,4 @@ SuperPOD
 Run:ai
 OTLP
 OpenTelemetry
+Grafana
