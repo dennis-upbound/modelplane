@@ -17,6 +17,29 @@ no store, so the control plane stays a reconciler and the operator keeps whateve
 they already run. Nothing in the pipeline is specific to metrics except the receivers at one
 end, so logs and traces reuse it instead of each arriving with a path of its own.
 
+```mermaid
+flowchart LR
+    subgraph ic1["inference cluster"]
+        S1["gateway · engines · picker<br/>DCGM · controllers · cache"]
+        C1["collector"]
+    end
+    subgraph ic2["inference cluster"]
+        S2["gateway · engines · picker<br/>DCGM · controllers · cache"]
+        C2["collector"]
+    end
+    subgraph cp["control plane"]
+        MX["Modelplane exporter<br/>capacity · replicas"]
+        CC["collector"]
+    end
+    D["your backend"]
+    S1 -->|"scrape"| C1
+    S2 -->|"scrape"| C2
+    C1 -->|"OTLP"| CC
+    C2 -->|"OTLP"| CC
+    MX --> CC
+    CC -->|"TelemetryDestination"| D
+```
+
 The telemetry is a normalized `modelplane_*` surface, collected with no configuration for
 the engines people actually run and for everything Modelplane installs around them. An
 operator writes one object saying where it all goes, and what lands there means one thing
@@ -32,36 +55,36 @@ when they land.
 
 ## Background
 
-An inference deployment publishes numbers no other workload does. Time to first token is
-how long a user waits before anything appears. Time per output token is the speed of what
-follows. Both come from a queue in front of a GPU and a KV cache on it. When that cache
-fills, the engine evicts work and recomputes it, so latency moves in cliffs.
-
-Engines disagree about these numbers three ways, and only the first is about naming.
-`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` measure the same
-thing. The second is worse. SGLang's `inter_token_latency` and vLLM's time per output token
-have similar names and measure different things, so renaming one onto the other gives a
-wrong answer. The third is arithmetic. vLLM buckets its histograms down to a millisecond and
-SGLang to a hundred of them, so a quantile across both is wrong rather than approximate.
-
-The front door escapes all three. Envoy AI Gateway measures every request it proxies and
-publishes the result under the OpenTelemetry GenAI conventions:
-`gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token`,
-`gen_ai.server.request.duration`, `gen_ai.client.operation.duration` and
-`gen_ai.client.token.usage`, each labelled with the model. The request count comes from the
-duration histogram's `_count` series, split by outcome. One component, one vocabulary, one
-bucket layout, for whatever engine is behind it. It measures time per output token for
-engines that do not report it themselves.
-
-Modelplane collects none of it today. `compose-serving-stack` installs a
-kube-prometheus-stack on each cluster with `PodMonitor` discovery open, and stops there.
-Until an operator wires up a `PodMonitor`, a deployment emits nothing at all, including
-the signal that would have explained why it failed. Names go unreconciled, so anyone
-wanting one dashboard across two engines writes it twice. And none of it leaves the
-cluster, so answering "how is this model doing everywhere" means visiting each cluster and
-merging by hand. The published
+`compose-serving-stack` installs a kube-prometheus-stack on every workload cluster with
+`PodMonitor` discovery open, and stops there. Everything after that belongs to the operator.
+They write the `PodMonitor`, keep it matching the serving shape as deployments change, and
+reach the store by `port-forward`. Until they do, a deployment emits nothing at all,
+including the signal that would have explained why it failed. Nothing reconciles one
+engine's metric names against another's, so a dashboard covering two engines gets written
+twice. And nothing leaves the cluster, so answering "how is this model doing everywhere"
+means visiting each one and merging by hand. The published
 [collecting-engine-metrics](../docs/content/guides/collecting-engine-metrics.md) guide is
 that workflow written down.
+
+The gap would matter less if these were ordinary numbers. Time to first token is how long a
+user waits before anything appears, and time per output token is the speed of what follows.
+Both come from a queue in front of a GPU and a KV cache on it. When the cache fills, the
+engine evicts work and recomputes it, so latency does not degrade gradually. It steps.
+
+Reconciling those numbers is also harder than renaming them.
+`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` measure the same
+thing, and a rename settles them. SGLang's `inter_token_latency` and vLLM's time per output
+token are not that: the names are close, the measurements differ, and renaming one onto the
+other produces a number that is confidently wrong. Even where two engines agree on the
+measurement they can disagree on the histogram. vLLM resolves down to a millisecond and
+SGLang to a hundred of them, so a quantile taken across both is wrong rather than
+approximate.
+
+One component sidesteps most of this. Envoy AI Gateway proxies every request and measures it
+itself, reporting under the OpenTelemetry GenAI conventions: time to first token, time per
+output token, request duration and token usage, each labelled with the model. It measures
+the same way whatever engine is behind it, and it measures for engines that report none of
+this themselves. Its histograms share one bucket layout, because there is only one of it.
 
 ## Guiding principles
 
@@ -72,7 +95,8 @@ that workflow written down.
 - **Any engine, without a release.** Modelplane runs any OpenAI-compatible server. One it
   has never seen still reports the fleet's top-line metrics.
 - **Upstream conventions, upstream tools.** The wire format, the collector and its
-  configuration language are OpenTelemetry's, not Modelplane's.
+  configuration language are OpenTelemetry's, not Modelplane's. The names are ours, because
+  the conventions cover what the gateway measures and nothing else in the set.
 - **No store in the control plane.** The control plane reconciles a fleet. The operator
   keeps whatever backend they already run.
 - **Egress only.** A workload cluster reaches out. Nothing reaches in.
