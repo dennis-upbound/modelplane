@@ -78,7 +78,7 @@ credential lives in one place instead of on every GPU cluster.
 ## Computing rates, quantiles, and ratios
 
 A collector transforms each measurement as it passes it on. It holds no history, so it
-produces no rates and no quantiles. Your backend does that. A fleet-wide p99, for example:
+produces no rates and no quantiles. Your backend does that. A fleet-wide p99:
 
 ```promql
 histogram_quantile(0.99, sum by (le) (
@@ -117,10 +117,10 @@ One engine needs a flag. SGLang publishes `/metrics` only when it runs with
 
 ## Why engine latency and gateway latency differ
 
-`modelplane_request_ttft_seconds` comes from the engine, and each engine buckets its
-histograms differently: vLLM resolves to a millisecond, SGLang to a hundred of them. A
-quantile across both is wrong rather than approximate, so use the engine series to compare
-an engine against itself, and the `frontend_` series for anything fleet-wide.
+`modelplane_request_ttft_seconds` comes from the engine, and engines bucket their
+histograms differently. vLLM resolves down to a millisecond. SGLang resolves to a hundred
+of them. A quantile across both is wrong, not approximate. Use the engine series to compare
+one engine against itself, and the `frontend_` series for anything fleet-wide.
 
 Some measurements don't translate at all. SGLang's inter-token latency isn't vLLM's time per
 output token, so neither is renamed onto a shared name. The gateway measures time per output
