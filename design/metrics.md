@@ -8,359 +8,305 @@
 
 Modelplane installs a Prometheus on every workload cluster and stops there. An operator
 writes their own `PodMonitor`, keeps it in sync as the serving shape changes, and reaches
-the store by `port-forward`. Every engine names its metrics differently, and every cluster
-answers only for itself.
+the store by `port-forward`. Every component names its metrics differently, and every
+cluster answers only for itself.
 
-This proposes that Modelplane decide which metrics a fleet needs, produce them on every
-cluster under one set of names, and roll them up into a Prometheus on the control plane.
-That Prometheus answers for the whole fleet:
-
-```promql
-histogram_quantile(0.99, sum by (le) (
-  rate(modelplane_time_to_first_token_seconds_bucket{model="Qwen/Qwen3-8B"}[5m])))
-```
-
-There is no new API. A supported engine needs no configuration. An engine Modelplane has
-never seen needs a `PrometheusRule`, which is how Prometheus already models this.
-
-This document is about metrics. Logs and traces are out of scope.
-
-## Background
-
-An inference deployment publishes numbers no other workload does. Time to first token is
-how long a user waits before anything appears. Inter-token latency is the gap between the
-words that follow. Both come from a queue in front of a GPU and a KV cache on it. When that
-cache fills, the engine evicts work and recomputes it, so latency moves in cliffs rather
-than slopes.
-
-Every engine publishes these numbers and every engine names them differently.
-`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` are the same
-measurement. So are `vllm:kv_cache_usage_perc` and `sglang:token_usage`. An operator
-running both reads two vocabularies and writes every dashboard twice.
-
-Modelplane makes that worse. `compose-serving-stack` installs a kube-prometheus-stack on
-each cluster with `PodMonitor` discovery open, and stops. Nothing is collected until an
-operator wires it, so a deployment nobody wrote a `PodMonitor` for stays silent, on the
-signal that would have explained it. Nothing reconciles the names, so one dashboard across
-two engines means recording rules on every cluster. Nothing leaves the cluster, so "how is
-this model doing everywhere" means visiting each one and merging by hand. The published
-[collecting-engine-metrics](../docs/content/guides/collecting-engine-metrics.md) guide is
-that workflow written down.
-
-## Goals
-
-- Modelplane decides what a fleet's metrics are, the way any project decides its own.
-- One endpoint answers for the fleet.
-- An engine Modelplane has never seen works without waiting for a release.
-- A workload cluster needs egress and nothing inbound.
-- No new API kinds.
-
-## Proposal
-
-### The metrics
-
-The set comes from what an operator has to answer, not from what an engine happens to
-publish. Sequence lengths are in it because latency rising from more requests and latency
-rising from longer requests look identical in a latency graph and want opposite responses.
-
-**Is a model serving well?**
-
-| Metric | Type | Unit |
-|---|---|---|
-| `modelplane_time_to_first_token_seconds` | histogram | seconds |
-| `modelplane_inter_token_latency_seconds` | histogram | seconds |
-| `modelplane_inference_duration_seconds` | histogram | seconds |
-| `modelplane_request_duration_seconds` | histogram | seconds |
-| `modelplane_input_tokens` | histogram | tokens |
-| `modelplane_output_tokens` | histogram | tokens |
-| `modelplane_requests_total{outcome}` | counter | requests |
-| `modelplane_tokens_total{kind}` | counter | tokens |
-
-**Is it saturated?**
-
-| Metric | Type | Unit |
-|---|---|---|
-| `modelplane_requests_running` | gauge | requests |
-| `modelplane_requests_waiting` | gauge | requests |
-| `modelplane_request_queue_seconds` | histogram | seconds |
-| `modelplane_kv_cache_utilization_ratio` | gauge | 0 to 1 |
-| `modelplane_prefix_cache_hits_total` | counter | hits |
-| `modelplane_prefix_cache_lookups_total` | counter | lookups |
-| `modelplane_router_queue_depth` | gauge | requests |
-
-**Is the fleet healthy, and what is it costing?**
-
-| Metric | Type | Unit |
-|---|---|---|
-| `modelplane_replicas_desired` | gauge | replicas |
-| `modelplane_replicas_ready` | gauge | replicas |
-| `modelplane_replicas_unschedulable` | gauge | replicas |
-| `modelplane_gpus_allocatable` | gauge | GPUs |
-| `modelplane_gpus_allocated` | gauge | GPUs |
-| `modelplane_stack_component_up{component}` | gauge | 0 or 1 |
-
-Every series carries `cluster`. A series about a deployment also carries `deployment`,
-`namespace`, `model` and `engine`. Under disaggregated serving it carries a `role` of
-`prefill` or `decode` too, because the two do different work and an average of them
-describes neither. `modelplane_gpus_allocatable` carries `cluster` alone, being a property
-of the nodes. No series names a pod: replicas are interchangeable, so they are summed. No
-series names a caller, which is unbounded by construction.
-
-Four choices in that list are worth stating.
-
-**Two durations**, because the gap between them is the diagnosis.
-`modelplane_inference_duration_seconds` is what the engine spent.
-`modelplane_request_duration_seconds` is what the caller waited, measured at the gateway.
-Fast inference and a slow request means routing, queueing or the network. One number alone
-cannot tell those apart.
-
-**Hit rate as two counters, not a ratio**, because a ratio cannot be re-aggregated and two
-counters can. Tokens per second is absent for a related reason. It means one user's rate to
-some readers and total throughput to others. So this publishes the counter, and a query
-says which one it wants.
-
-**`modelplane_replicas_unschedulable`**, because the gap between desired and ready is the
-failure a fleet hides best. A GPU pool that cannot satisfy a claim leaves every replica
-Pending while the cluster reports healthy. No engine reports it, because no engine started.
-
-**No GPU utilisation.** As the accelerator reports it, it says the card was not idle, which
-for inference is almost always true and almost never useful: the work is memory-bandwidth
-bound. Tokens per allocated GPU-second is the honest efficiency figure, and the fleet
-computes it from two series already here.
-
-### Where they come from
-
-**The engine** answers serving and saturation. vLLM publishes all of it. SGLang publishes
-the gauges and counters, but its latency histograms use bucket boundaries that do not merge
-with vLLM's, so those stay under SGLang's own names. Triton and TensorRT-LLM report through
-batch-manager statistics that need their own rules.
-
-**The gateway** answers what the caller experienced. Envoy fronts every request, so it
-measures the duration and the response class a client actually saw, which is where
-`modelplane_request_duration_seconds` and `modelplane_requests_total` come from.
-
-**The endpoint picker** publishes `llm_d_epp_*`, the source of
-`modelplane_router_queue_depth`. A router's queue is a different measurement from an
-engine's, so it is a different metric.
-
-**The substrate** answers whether the machinery works. `kube-state-metrics` turns readiness
-of the gateway, the LeaderWorkerSet or Grove controller, cert-manager and the DRA driver
-into `modelplane_stack_component_up`.
-
-**Modelplane itself** answers capacity, and it has to. Modelplane requests GPUs as DRA
-resource claims, so a GPU is a claim against a `ResourceSlice`, not an `nvidia.com/gpu`
-count on a node. The series `kube-state-metrics` publishes about pod requests describe
-neither the claim nor the workload. They carry `pod` and `namespace` and no `model`, so a
-fleet query grouped by model would find nothing to group. Modelplane made the placement and
-knows all of it, so a small exporter beside the Crossplane functions publishes the capacity
-and replica gauges from state those functions already reconcile. They carry the same labels
-as everything else, so they divide into the engine's counters on `model` and `deployment`.
-That is the one component this design adds. It suits these metrics: a cluster where nothing started is the cluster
-least able to report that nothing started.
-
-### Normalizing an engine
-
-Modelplane knows what vLLM calls each metric, so normalizing it is configuration rather
-than API. The per-cluster Prometheus Modelplane composes carries the relabel rules already,
-and an operator running a supported engine writes nothing.
-
-| Modelplane | vLLM |
-|---|---|
-| `modelplane_time_to_first_token_seconds` | `vllm:time_to_first_token_seconds` |
-| `modelplane_inter_token_latency_seconds` | `vllm:inter_token_latency_seconds` |
-| `modelplane_inference_duration_seconds` | `vllm:e2e_request_latency_seconds` |
-| `modelplane_request_queue_seconds` | `vllm:request_queue_time_seconds` |
-| `modelplane_requests_running` | `vllm:num_requests_running` |
-| `modelplane_requests_waiting` | `vllm:num_requests_waiting` |
-| `modelplane_kv_cache_utilization_ratio` | `vllm:kv_cache_usage_perc` |
-| `modelplane_prefix_cache_hits_total` | `vllm:prefix_cache_hits_total` |
-| `modelplane_prefix_cache_lookups_total` | `vllm:prefix_cache_queries_total` |
-| `modelplane_tokens_total{kind="input"}` | `vllm:prompt_tokens_total` |
-| `modelplane_tokens_total{kind="output"}` | `vllm:generation_tokens_total` |
-| `modelplane_input_tokens` | `vllm:request_prompt_tokens` |
-| `modelplane_output_tokens` | `vllm:request_generation_tokens` |
-
-A rename is a relabel on the metric name at scrape time, so one rule carries a histogram's
-`_bucket`, `_sum` and `_count` together and adds nothing to what the cluster stores.
-Nothing declares which engine a deployment runs, because the engine already says so: each
-one prefixes its metrics with its own name, `vllm:`, `sglang:`, `nv_trt_llm_`. A fork that
-kept vLLM's names is handled by vLLM's rules without knowing it is a fork.
-
-A histogram is renamed only when its bucket boundaries match Modelplane's, which are the
-ones the OpenTelemetry GenAI conventions define and vLLM already uses. A quantile over
-misaligned buckets is wrong rather than approximate. SGLang's time-to-first-token buckets
-match to 0.1 seconds and diverge above it, so its latency histograms keep their own names.
-An operator running SGLang loses those panels, which beats a fleet quantile that quietly
-averaged two bucket layouts.
-
-**An engine Modelplane has never seen is the case worth designing for**, because Modelplane
-runs any OpenAI-compatible server. That operator writes recording rules, in the
-`PrometheusRule` the cluster's Prometheus already selects:
+This proposes an OpenTelemetry collector on every inference cluster, normalizing what the
+stack emits onto one `modelplane_*` surface and pushing it to a collector on the control
+plane. That collector is the fleet's one egress point. It holds no store, so the control
+plane stays stateless, and it exports to whatever an operator already runs.
 
 ```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: PrometheusRule
-metadata:
-  name: my-engine
-  namespace: ml-team
-  labels:
-    modelplane.ai/metrics: normalize
-spec:
-  groups:
-  - name: my-engine
-    rules:
-    - record: modelplane_requests_running
-      expr: sum without (pod) (my_engine_running_requests)
-    - record: modelplane_kv_cache_utilization_ratio
-      expr: |
-        sum without (pod) (my_engine_kv_used_bytes)
-          / sum without (pod) (my_engine_kv_total_bytes)
-```
-
-The rule needs no labels of its own. Modelplane's scrape config attaches `cluster`,
-`deployment`, `namespace`, `model`, `engine` and `role` to every series it collects from a
-serving pod, and a recorded series inherits them. An engine whose metric names carry no
-prefix to identify it sets `type` on the engine, which is what Modelplane stamps into
-`engine`.
-
-### Rolling up to the fleet
-
-Two tiers, both Prometheus.
-
-**On each workload cluster**, a Prometheus scrapes the engines by the
-`modelplane.ai/serving` label Modelplane stamps, plus the pickers, the substrate and the
-GPU exporter. Its rules produce `modelplane_*`, and it remote-writes only those onward.
-Retention is short, because this tier transforms rather than stores.
-
-Each `modelplane_*` series is recorded as `sum without (pod)` of what was scraped, and the
-summed series is what travels. Dropping the label on the way out instead would leave
-several replicas' series identical, which the receiver rejects as duplicates rather than
-adding up.
-
-**On the control plane**, a Prometheus receives those writes and scrapes Modelplane's
-exporter. Between them it holds the fleet, and four questions only it can answer are each a
-rule over series every cluster now agrees on:
-
-```yaml
-- record: modelplane:slo_attainment:ratio5m
-  expr: |
-    sum by (model) (rate(modelplane_time_to_first_token_seconds_bucket{le="1.0"}[5m]))
-      / sum by (model) (rate(modelplane_time_to_first_token_seconds_count[5m]))
-
-- record: modelplane:slo_attainment:ratio1h
-  expr: |
-    sum by (model) (rate(modelplane_time_to_first_token_seconds_bucket{le="1.0"}[1h]))
-      / sum by (model) (rate(modelplane_time_to_first_token_seconds_count[1h]))
-
-- record: modelplane:gpu_allocation:ratio
-  expr: sum by (cluster) (modelplane_gpus_allocated)
-          / sum by (cluster) (modelplane_gpus_allocatable)
-
-- record: modelplane:tokens_per_gpu:rate5m
-  expr: sum by (model) (rate(modelplane_tokens_total{kind="output"}[5m]))
-          / sum by (model) (modelplane_gpus_allocated)
-
-- record: modelplane:gpu_hours:1h
-  expr: avg_over_time(sum by (cluster, deployment) (modelplane_gpus_allocated)[1h:])
-```
-
-None of these is a rename. Each needs a rate over a window, a division across two series or
-an integral, and the series they read come from clusters that do not know about each other.
-A recorded series is named `modelplane:thing:operation`, the Prometheus convention, so
-nothing a rule produced is mistaken for something a cluster collected.
-
-GPU-hours is the awkward one. Average allocation over an hour is GPU-hours for that hour,
-which is what the rule computes, and it is a windowed figure rather than a counter that
-only goes up. A monotonic total would need a component incrementing it, which this design
-does not add. A backend wanting a lifetime total sums the hourly series.
-
-Attainment is what an operator alerts on, recorded over two windows so a page means
-sustained and current degradation rather than either alone.
-
-`remote_write` is a push, so a workload cluster needs egress and nothing inbound. The
-control plane accepts those writes on one endpoint, and a cluster authenticates with a
-client certificate Modelplane issues and propagates the way `ModelCache` already propagates
-a HuggingFace token.
-
-This per-cluster Prometheus replaces the kube-prometheus-stack `compose-serving-stack`
-installs today. That is the one breaking change, so it lands separately: the new tier
-arrives alongside the old stack where an operator can compare them, and the removal
-follows.
-
-### What an operator reads
-
-The fleet Prometheus is queried like any other, and its series carry the labels that make
-them answerable:
-
-```
-modelplane_time_to_first_token_seconds_bucket{cluster="prod-us-east",
-  deployment="qwen3-8b", model="Qwen/Qwen3-8B", engine="vllm",
-  namespace="ml-team", le="0.25"} 1841
-```
-
-So a model's p99 across the fleet is one query, and adding `cluster` to the grouping breaks
-it out per cluster without changing its shape. Modelplane ships those queries as Grafana
-dashboards. An operator who wants the series somewhere else configures `remote_write` on
-that Prometheus, which is a Prometheus and needs nothing from us to forward.
-
-A platform team reads all of it. A `ModelDeployment`'s author reads their own model, which
-is a filter on the same dashboard. There is no second, author-facing store and no
-collection toggle: an author owns neither the store, its cost, nor its retention.
-
-An engine's own series stay in the cluster's Prometheus throughout. An operator who came
-for `vllm:*` still has them locally. Only `modelplane_*` travels.
-
-## Future improvements
-
-Logs and traces cross the same clusters and are out of scope. A gateway's usage records are
-a structured access log per request, and #77's traces follow a request through the picker
-into an engine. Both want their own design rather than a section in this one.
-
-## Alternatives considered
-
-**An OpenTelemetry collector instead of Prometheus.** A DaemonSet or Deployment on each
-cluster scrapes the engines, renames in a processor, and exports OTLP onward:
-
-```yaml
-receivers:
-  prometheus:
-    config:
-      scrape_configs:
-      - job_name: engines
-        kubernetes_sd_configs: [{role: pod}]
-processors:
-  transform:
-    metric_statements:
-    - set(name, "modelplane_time_to_first_token_seconds")
-        where name == "vllm:time_to_first_token_seconds"
 exporters:
   otlphttp:
     endpoint: https://otel.acme.example
 ```
 
-It carries metrics, logs and traces on one pipeline, exports to any OTLP backend, and runs
-no persistent store on a GPU cluster. It is not limited to renaming either: `interval`
-holds state over a window, `cumulativetodelta` converts across scrapes, and
-`metricsgeneration` divides one metric by another, which between them reach GPU-hours and
-the allocation ratio.
+The same pipeline carries logs and traces when those land. Nothing in it is specific to
+metrics except the receivers on one end.
 
-What they do not reach is an arbitrary expression over series from every cluster. A
-collector pipeline sees only its own cluster, and `histogram_quantile` over a merged bucket
-set is PromQL. Building the fleet tier this way means writing each fleet question as a
-processor graph, so a new question becomes a collector release rather than a recording
-rule. A collector downstream of the fleet Prometheus still reaches an OTLP backend, which
-is the better place for it.
+This document is about metrics. Logs and traces are named where they share a mechanism and
+designed elsewhere.
+
+## Background
+
+An inference deployment publishes numbers no other workload does. Time to first token is
+how long a user waits before anything appears. Time per output token is the speed of what
+follows. Both come from a queue in front of a GPU and a KV cache on it. When that cache
+fills, the engine evicts work and recomputes it, so latency moves in cliffs rather than
+slopes.
+
+Engines disagree about these numbers in three ways, and only the first is a naming problem.
+`vllm:time_to_first_token_seconds` and `sglang:time_to_first_token_seconds` are the same
+measurement under different names. SGLang's `inter_token_latency` and vLLM's time per
+output token are *different measurements* under similar names, so renaming one to the other
+produces a wrong answer rather than a merged one. And their histogram buckets diverge: vLLM
+resolves down to a millisecond, SGLang to a hundred of them, so a quantile computed across
+both is wrong rather than approximate.
+
+The front door does not have these problems. Envoy AI Gateway measures every request it
+proxies and publishes the result under the OpenTelemetry GenAI conventions:
+`gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token`, request
+duration and token usage, each labelled with the model. One component, one vocabulary, one
+bucket layout, for whatever engine is behind it. It measures time per output token for
+engines that do not report it themselves.
+
+Modelplane collects none of this. `compose-serving-stack` installs a kube-prometheus-stack
+on each cluster with `PodMonitor` discovery open, and stops. Nothing is collected until an
+operator wires it, so a deployment nobody wrote a `PodMonitor` for stays silent, on the
+signal that would have explained it. Nothing reconciles the names. Nothing leaves the
+cluster, so "how is this model doing everywhere" means visiting each one and merging by
+hand. The published
+[collecting-engine-metrics](../docs/content/guides/collecting-engine-metrics.md) guide is
+that workflow written down.
+
+## Requirements
+
+**One namespace.** Every metric the fleet exposes lives under `modelplane_*` and carries the
+same labels, whatever component produced it. A dashboard names a metric once and does not
+care which engine, gateway or exporter answered.
+
+**Popular engines work out of the box.** vLLM and SGLang need no configuration. So does the
+gateway, the picker, DCGM and the rest of what Modelplane installs, because Modelplane
+installs them and knows what they emit.
+
+**Every engine works at all.** Modelplane runs any OpenAI-compatible server, so an engine it
+has never seen produces the fleet's top-line metrics with no configuration, and its own
+metrics with configuration but without waiting for a Modelplane release.
+
+**Vendor-neutral, and aligned with OpenTelemetry.** The wire format, the conventions and the
+configuration language are the OSS project's rather than ours, and the operator chooses the
+backend. Modelplane picks no query language for them and runs no store on their behalf.
+
+**Stateless in the control plane.** The control plane reconciles a fleet. It does not hold a
+telemetry store to size, retain and back up.
+
+**Egress only, and no new API kinds.** A workload cluster reaches out and nothing reaches
+in. Configuration goes in objects that already exist.
+
+**One pipeline.** Metrics land first, but logs and traces reuse the same collectors, the
+same egress point and the same credential rather than each arriving with its own.
+
+## Proposal
+
+### The metrics
+
+The set comes from what an operator has to answer. Latency appears twice on purpose: once
+as the caller experienced it and once as the engine did. The gap between them is routing,
+queueing and network, and one number alone cannot separate those from a slow model.
+
+**Is a model serving well?** From the gateway, for any engine.
+
+| Metric | Type | Unit |
+|---|---|---|
+| `modelplane_frontend_request_duration_seconds` | histogram | seconds |
+| `modelplane_frontend_ttft_seconds` | histogram | seconds |
+| `modelplane_frontend_tpot_seconds` | histogram | seconds |
+| `modelplane_requests_total{status}` | counter | requests |
+| `modelplane_tokens_total{direction}` | counter | tokens |
+
+**Why is it serving that way?** From the engine.
+
+| Metric | Type | Unit |
+|---|---|---|
+| `modelplane_request_ttft_seconds` | histogram | seconds |
+| `modelplane_request_duration_seconds` | histogram | seconds |
+| `modelplane_request_queue_seconds` | histogram | seconds |
+| `modelplane_request_input_tokens` | histogram | tokens |
+| `modelplane_request_output_tokens` | histogram | tokens |
+| `modelplane_requests_running` | gauge | requests |
+| `modelplane_requests_waiting` | gauge | requests |
+| `modelplane_kv_cache_utilization_ratio` | gauge | 0 to 1 |
+| `modelplane_requests_preempted_total` | counter | requests |
+| `modelplane_route_decision_seconds` | histogram | seconds |
+
+**Is the fleet healthy, and what is it costing?** From the GPUs and from Modelplane.
+
+| Metric | Type | Unit |
+|---|---|---|
+| `modelplane_gpu_memory_used_bytes` | gauge | bytes |
+| `modelplane_gpu_compute_active_ratio` | gauge | 0 to 1 |
+| `modelplane_energy_joules_total` | counter | joules |
+| `modelplane_replicas_desired` | gauge | replicas |
+| `modelplane_replicas_ready` | gauge | replicas |
+| `modelplane_replica_gpus` | gauge | GPUs |
+| `modelplane_gpu_seconds_total` | counter | GPU-seconds |
+| `modelplane_cluster_gpus_allocatable` | gauge | GPUs |
+| `modelplane_cluster_connected` | gauge | 0 or 1 |
+
+Every series carries `cluster`. A series about a deployment also carries `deployment`,
+`namespace`, `model` and `engine`. Under disaggregated serving it carries a `role` of
+`prefill` or `decode` too, because the two do different work and an average of them
+describes neither. No series names a pod: replicas are interchangeable, so they are summed
+before export. No series names a caller, which is unbounded by construction.
+
+Two absences are deliberate. There is no tokens-per-second metric, because it means one
+user's rate to some readers and total throughput to others; this publishes the counter and
+lets a query say which it wants. And no GPU utilisation as the accelerator reports it,
+which for inference says only that the card was not idle: the work is memory-bandwidth
+bound, so `modelplane_gpu_compute_active_ratio` and the memory figures separate a busy GPU
+from an efficient one.
+
+### Where they come from
+
+**The gateway** answers what the caller experienced, in GenAI vocabulary, for any engine
+behind it. This is the SLO surface. Because it is one component, its histograms share one
+bucket layout, and a fleet quantile over them is sound.
+
+**The engine** answers why. vLLM and SGLang both publish queue depth, running and waiting
+counts, KV utilisation and preemptions as gauges and counters, which aggregate cleanly.
+Their latency histograms come across too, under `modelplane_request_*`, but they are
+per-engine diagnostics rather than the fleet's SLO, because their buckets do not merge.
+
+**The endpoint picker** publishes `llm_d_epp_*`, the source of
+`modelplane_route_decision_seconds`. A router's queue is a different measurement from an
+engine's, so it stays a different metric.
+
+**The GPUs** answer the physical picture. DCGM reports memory, compute activity, power and
+energy per device.
+
+**Modelplane itself** answers what nothing else can. Under DRA a GPU is a claim against
+a `ResourceSlice`, and no exporter publishes those, so allocatable capacity has no
+source.
+DCGM labels a GPU with its UUID and host and nothing about the workload, so no join
+attributes a GPU to a replica. Nothing times a replica from created to serving, and only
+Modelplane knows whether it can still reach a cluster. Modelplane made every one of those
+decisions, so a small exporter beside the Crossplane functions publishes
+`modelplane_replica_gpus`, `modelplane_gpu_seconds_total`,
+`modelplane_cluster_gpus_allocatable`, `modelplane_cluster_connected` and the replica
+counts, labelled like everything else. That is the one component this design adds.
+
+### Normalizing
+
+Normalization is collector configuration, not API. A `transform` processor renames what the
+stack emits, and Modelplane ships the statements for the components it installs:
+
+```yaml
+processors:
+  transform/modelplane:
+    metric_statements:
+    - context: metric
+      statements:
+      - set(name, "modelplane_frontend_ttft_seconds")
+          where name == "gen_ai_server_time_to_first_token"
+      - set(name, "modelplane_request_queue_seconds")
+          where name == "vllm:request_queue_time_seconds"
+      - set(name, "modelplane_request_queue_seconds")
+          where name == "sglang:queue_time_seconds"
+```
+
+OTTL is the stable, well-documented part of the collector, and renaming, scaling a unit and
+setting a label are what it is for. Each engine prefixes its metrics with its own name, so
+nothing declares which engine a deployment runs. A fork that kept vLLM's names is handled by
+vLLM's statements without knowing it is a fork.
+
+Renaming is only safe where the measurements agree. SGLang's `inter_token_latency` is not
+vLLM's time per output token, so neither is renamed onto a shared name; the gateway supplies
+that measurement for both. A metric absent on an engine stays absent rather than being
+approximated by a neighbour.
+
+**An engine Modelplane has never seen is the case worth designing for**, because Modelplane
+runs any OpenAI-compatible server. Its top-line latency and token counts already arrive from
+the gateway, which does not know or care what the engine is. To normalize the engine's own
+metrics as well, an operator adds OTTL statements of the same shape, in a ConfigMap the
+collector merges. That is the break-glass path, and it is the collector's own configuration
+language rather than a Modelplane wrapper around it.
+
+### Rolling up
+
+Two collectors, and neither stores anything.
+
+**On each inference cluster**, a collector scrapes the gateway, the engines, the picker,
+DCGM and `kube-state-metrics` through the Prometheus receiver, renames what it scraped,
+drops pod labels after summing across replicas, and exports OTLP to the control plane. It needs
+egress and nothing inbound.
+
+**On the control plane**, a collector receives from every cluster, stamps the fleet's
+labels, adds Modelplane's own exporter and Crossplane's runtime metrics, and exports
+onward. It is the fleet's single egress point:
+
+```yaml
+exporters:
+  otlphttp:
+    endpoint: https://otel.acme.example
+  prometheusremotewrite:
+    endpoint: https://prom.acme.example/api/v1/write
+```
+
+A pass-through tier has to earn its place, and this one earns it four ways. A cluster
+with no route to the operator's backend still reaches the control plane. A credential for
+that backend lives in one place instead of on every GPU cluster. Changing where the
+fleet's telemetry goes is one edit. And Modelplane's own metrics, which are control-plane
+metrics, join the fleet's there rather than needing a path of their own.
+
+A cluster authenticates to it with a client certificate Modelplane issues and propagates the
+way `ModelCache` already propagates a HuggingFace token.
+
+This replaces the kube-prometheus-stack `compose-serving-stack` installs today. That is the
+one breaking change, so it lands separately: the collector arrives alongside the old stack
+where an operator can compare them, and the removal follows.
+
+### What the backend computes
+
+A collector transforms each measurement as it passes. It holds no history, so it produces no
+rate, no quantile and no ratio between series that arrived from different clusters. Those
+are real answers an operator wants, and under this design the backend produces them:
+
+| Question | Computed as |
+|---|---|
+| Are we meeting the latency target? | `histogram_quantile` over the gateway's TTFT buckets |
+| What is it costing? | `modelplane_gpu_seconds_total`, `modelplane_energy_joules_total` |
+| Is it efficient? | tokens over GPU-seconds, tokens over joules |
+| Is capacity used? | allocated over `modelplane_cluster_gpus_allocatable` |
+| Is a GPU idle but allocated? | allocation joined against compute-active below a threshold |
+
+Modelplane ships these as queries and dashboards rather than as recorded series. An operator
+who wants them precomputed points the `prometheusremotewrite` exporter at a Prometheus and
+writes recording rules there, which is the advanced path and needs nothing from Modelplane.
+
+The cost is real and worth stating plainly. An operator running no backend gets a normalized
+fleet-wide metric stream and no fleet SLO series. Two collector processors would narrow that
+gap, `interval` for windowed aggregation and `metricsgeneration` for arithmetic between two
+metrics, and this design uses neither: both are alpha, `interval` is lossy for gauges, and
+`metricsgeneration` matches data points by position rather than by label unless a
+feature gate is enabled.
+
+## Future improvements
+
+Logs and traces reuse all of this. vLLM already exports OTLP traces, #77's traces follow a
+request through the picker into an engine, and a gateway's usage records are a structured
+access log the `filelog` receiver reads. Each needs a receiver and a decision about
+sampling or retention. None needs another collector, another egress point, or another
+credential, which is the argument for building the pipeline on OpenTelemetry rather than on
+a metrics protocol.
+
+vLLM has an open proposal to adopt the GenAI conventions and another to export OTLP
+directly. If either lands, the statements for vLLM shrink or disappear.
+
+## Alternatives considered
+
+**Prometheus on every cluster, remote-writing to a Prometheus on the control plane.** The
+derivations above stop being the backend's problem and become recording rules Modelplane
+ships and an operator can read. Fleet quantiles, GPU-hours and efficiency ratios arrive as
+series rather than as queries someone has to run, and every one of them works the day the
+fleet is installed with no backend at all. Prometheus is also what the components already
+speak, so nothing converts.
+
+It loses on what the control plane becomes. A Prometheus on the control plane is a stateful
+store to run, size and back up, on a cluster whose job is reconciliation. It commits the
+project to one query language and one wire format in the layer an operator is most likely to
+already have opinions about. And it answers only metrics: the traces in #77 and the
+gateway's usage logs would each need a second path, built separately, with their own egress
+and their own credential. Recording rules are a real loss, taken deliberately, and the
+`prometheusremotewrite` exporter leaves that door open for anyone who wants them.
 
 **Modelplane kinds for mapping and forwarding.** A cluster-scoped `MetricMapping` naming
 what each engine calls each metric, and a `TelemetryDestination` naming where the fleet's
 series go. The mapping states an engine's names once and renders into every cluster running
-it. A `PrometheusRule` restates them per cluster instead. The mapping also gives Modelplane
-somewhere to report that nothing matched. The destination gives forwarding a schema instead
-of asking an operator to edit a resource Crossplane composes.
+it. The destination gives forwarding a schema instead of asking an operator to edit
+generated configuration.
 
-Both lose to what they wrap. Prometheus already models each half, in `PrometheusRule` and
-in `remoteWrite`, with auth, TLS, queue tuning and relabeling a narrower field will never
-match, and a team running Prometheus knows them. The mapping's per-cluster burden falls
-only on an operator running an engine Modelplane does not ship rules for, who has taken on
-more than that by running it. A kind is permanent: either can be added later over a metric
-surface that would not change, and neither could be removed.
+Both lose to what they wrap. The collector already has a configuration language for exactly
+this, and a Modelplane kind over the top of OTTL would express less than OTTL does while
+being one more thing to learn and to version. A kind is permanent: either can be added later
+over a metric surface that would not change, and neither could be removed.
