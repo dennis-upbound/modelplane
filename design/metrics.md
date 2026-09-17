@@ -60,7 +60,8 @@ that workflow written down.
 ### The metrics
 
 The set comes from what an operator has to answer, not from what an engine happens to
-publish.
+publish. Sequence lengths are in it because latency rising from more requests and latency
+rising from longer requests look identical in a latency graph and want opposite responses.
 
 **Is a model serving well?**
 
@@ -135,7 +136,8 @@ with vLLM's, so those stay under SGLang's own names. Triton and TensorRT-LLM rep
 batch-manager statistics that need their own rules.
 
 **The gateway** answers what the caller experienced. Envoy fronts every request, so it
-measures the duration and response class a client actually saw.
+measures the duration and the response class a client actually saw, which is where
+`modelplane_request_duration_seconds` and `modelplane_requests_total` come from.
 
 **The endpoint picker** publishes `llm_d_epp_*`, the source of
 `modelplane_router_queue_depth`. A router's queue is a different measurement from an
@@ -174,6 +176,8 @@ and an operator running a supported engine writes nothing.
 | `modelplane_prefix_cache_lookups_total` | `vllm:prefix_cache_queries_total` |
 | `modelplane_tokens_total{kind="input"}` | `vllm:prompt_tokens_total` |
 | `modelplane_tokens_total{kind="output"}` | `vllm:generation_tokens_total` |
+| `modelplane_input_tokens` | `vllm:request_prompt_tokens` |
+| `modelplane_output_tokens` | `vllm:request_generation_tokens` |
 
 A rename is a relabel on the metric name at scrape time, so one rule carries a histogram's
 `_bucket`, `_sum` and `_count` together and adds nothing to what the cluster stores.
