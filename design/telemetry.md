@@ -6,26 +6,31 @@
 
 ## Summary
 
-Modelplane installs a Prometheus on every workload cluster and stops there. An operator
-writes their own `PodMonitor`, keeps it in sync as the serving shape changes, and reaches
-the store by `port-forward`. Every component names its metrics differently, and every
-cluster answers only for itself.
+What Modelplane offers today is rudimentary. It installs a Prometheus on every workload
+cluster and stops: an operator writes their own `PodMonitor`, keeps it in sync as the
+serving shape changes, and reaches the store by `port-forward`. Every component names its
+metrics differently, and every cluster answers only for itself.
 
-This proposes an OpenTelemetry collector on every inference cluster, normalizing what the
-stack emits onto one `modelplane_*` surface and pushing it to a collector on the control
-plane. That collector is the fleet's one egress point. It holds no store, so the control
-plane stays stateless, and it exports to whatever an operator already runs.
+This proposes the mechanism, and the telemetry that rides on it.
 
-What lands in that backend means one thing everywhere, whatever produced it:
+The mechanism is an OpenTelemetry collector on every inference cluster, exporting to one
+collector on the control plane. That collector is the fleet's single egress point and holds
+no store, so the control plane stays a reconciler and the operator keeps whatever backend
+they already run. Nothing in the pipeline is specific to metrics except the receivers at one
+end, so logs and traces reuse it instead of each arriving with a path of its own.
+
+The telemetry is a normalized `modelplane_*` surface, collected with no configuration for
+the engines people actually run and for everything Modelplane installs around them. An
+operator gets a fleet worth of it on the day they install it, and what lands in their
+backend means one thing everywhere, whatever produced it:
 
 ```
 modelplane_frontend_ttft_seconds_bucket{cluster="prod-us-east", model="Qwen/Qwen3-8B",
   deployment="qwen3-8b", namespace="ml-team", le="0.25"} 1841
 ```
 
-Nothing in that pipeline is specific to metrics except the receivers on one end, which is
-why it is worth building once. Metrics land first and this document designs them. Logs and
-traces reuse what it builds, and get their own design when they land.
+Metrics land first, and this document designs them. Logs and traces get their own design
+when they land.
 
 ## Background
 
@@ -43,8 +48,8 @@ produces a wrong answer rather than a merged one. And their histogram buckets di
 resolves down to a millisecond, SGLang to a hundred of them, so a quantile computed across
 both is wrong rather than approximate.
 
-The front door does not have these problems. Envoy AI Gateway measures every request it
-proxies and publishes the result under the OpenTelemetry GenAI conventions:
+The front door escapes all three. Envoy AI Gateway measures every request it proxies and
+publishes the result under the OpenTelemetry GenAI conventions:
 `gen_ai.server.time_to_first_token`, `gen_ai.server.time_per_output_token`,
 `gen_ai.server.request.duration`, `gen_ai.client.operation.duration` and
 `gen_ai.client.token.usage`, each labelled with the model. The request count comes from the
@@ -52,12 +57,12 @@ duration histogram's `_count` series, split by outcome. One component, one vocab
 bucket layout, for whatever engine is behind it. It measures time per output token for
 engines that do not report it themselves.
 
-Modelplane collects none of this. `compose-serving-stack` installs a kube-prometheus-stack
-on each cluster with `PodMonitor` discovery open, and stops. Nothing is collected until an
-operator wires it. A deployment with no `PodMonitor` emits nothing at all, including the
-signal that would have explained why it failed. Nothing reconciles the names. Nothing
-leaves the cluster, so "how is this model doing everywhere" means visiting each one and
-merging by hand. The published
+Modelplane collects none of it. `compose-serving-stack` installs a kube-prometheus-stack on
+each cluster with `PodMonitor` discovery open, and stops there. Until an operator wires up a
+`PodMonitor`, a deployment emits nothing at all, including the signal that would have
+explained why it failed. Names go unreconciled, so anyone wanting one dashboard across two
+engines writes it twice. And none of it leaves the cluster, so answering "how is this model
+doing everywhere" means visiting each cluster and merging by hand. The published
 [collecting-engine-metrics](../docs/content/guides/collecting-engine-metrics.md) guide is
 that workflow written down.
 
@@ -171,34 +176,34 @@ same way for every engine, and it sees requests an engine rejected or never rece
 engine's own counters stay under the engine's names, where they are still readable and
 cannot double the fleet's total.
 
-Two absences are deliberate. There is no tokens-per-second metric, because it means one
-user's rate to some readers and total throughput to others; this publishes the counter and
-lets a query say which it wants. And no GPU utilisation as the accelerator reports it,
-which for inference says only that the card was not idle: the work is memory-bandwidth
-bound, so `modelplane_gpu_compute_active_ratio` and the memory figures separate a busy GPU
-from an efficient one.
+Tokens per second is absent on purpose. It means one user's rate to some readers and the
+service's total throughput to others, so this publishes the counter and lets a query say
+which it wants. GPU utilisation as the accelerator reports it is absent for a better reason:
+for inference it says only that the card was not idle, which is almost always true, because
+the work is memory-bandwidth bound. `modelplane_gpu_compute_active_ratio` and the memory
+figures separate a busy GPU from an efficient one.
 
 ### Where they come from
 
-**The gateway** answers what the caller experienced, in GenAI vocabulary, for any engine
-behind it. This is the SLO surface. Because it is one component, its histograms share one
-bucket layout, and a fleet quantile over them is sound.
+**The gateway** measures what the caller experienced, in GenAI vocabulary, for whatever
+engine sits behind it. Being one component, its histograms share a bucket layout, so a fleet
+quantile over them is sound. That is why the SLO metrics come from here.
 
-**The engine** answers why. vLLM and SGLang both publish queue depth, running and waiting
-counts, KV utilisation and preemptions as gauges and counters, which aggregate cleanly.
-Their latency histograms come across too, under `modelplane_request_*`, but they are
-per-engine diagnostics and not the fleet's SLO, because their buckets do not merge.
+**The engine** explains what the gateway measured. vLLM and SGLang both publish queue depth,
+running and waiting counts, KV utilisation and preemptions as gauges and counters, which
+aggregate cleanly. Their latency histograms come across too, under `modelplane_request_*`,
+though those stay per-engine diagnostics, since their buckets do not merge.
 
 **The endpoint picker** publishes `llm_d_epp_*`, the source of
 `modelplane_route_decision_seconds`. That is the time the picker spent choosing a backend,
 which inflates the gateway's time to first token without appearing anywhere in the engine's
 own numbers.
 
-**The GPUs** answer the physical picture. DCGM reports memory, compute activity, power and
+**The GPUs** are read through DCGM, which reports memory, compute activity, power and
 energy per device.
 
-**Modelplane itself** answers what nothing else can. Under DRA, a driver advertises its
-devices as `ResourceSlices` and a workload requests them through a `ResourceClaim`. No
+**Modelplane** supplies the rest, because nothing else can. Under DRA, a driver advertises
+its devices as `ResourceSlices` and a workload requests them through a `ResourceClaim`. No
 exporter turns those into an allocatable count, so capacity has no series until something
 reads the slices. DCGM labels a GPU with its UUID and its host and nothing about the
 workload, so nothing joins a GPU to a replica. Nothing times a replica from created to
@@ -211,8 +216,9 @@ Modelplane writes; both collectors are upstream.
 
 ### Normalizing
 
-Normalization is collector configuration, not API. A `transform` processor renames what the
-stack emits, and Modelplane ships the statements for the components it installs:
+Modelplane normalizes in the collector's own configuration, so there is nothing to add to
+the API. A `transform` processor renames what the stack emits, and Modelplane provides the
+statements for every component it installs:
 
 ```yaml
 processors:
@@ -269,7 +275,8 @@ Modelplane wrapper around it.
 
 ### Rolling up
 
-Two collectors, and neither stores anything.
+Collection is two hops: a collector on each inference cluster, and one on the control plane
+that every cluster reports to.
 
 **On each inference cluster**, a collector scrapes the gateway, the engines, the picker and
 DCGM, renames what it scraped, merges each deployment's replicas into one series, stamps
@@ -332,8 +339,8 @@ Modelplane ships these as queries and dashboards, not as recorded series. An ope
 who wants them precomputed points the `prometheusremotewrite` exporter at a Prometheus and
 writes recording rules there, which is the advanced path and needs nothing from Modelplane.
 
-The cost is real and worth stating plainly. An operator running no backend gets a normalized
-fleet-wide metric stream and no fleet SLO series. Two collector processors would narrow that
+An operator running no backend gets a normalized fleet-wide metric stream and no fleet SLO
+series. Two collector processors would narrow that
 gap, `interval` for windowed aggregation and `metricsgeneration` for arithmetic between two
 metrics, and this design uses neither: both are alpha, `interval` is lossy for gauges, and
 `metricsgeneration` matches data points by position rather than by label unless a
@@ -361,7 +368,7 @@ series, not as queries someone has to run, and every one of them works the day t
 fleet is installed with no backend at all. Prometheus is also what the components already
 speak, so nothing converts.
 
-It loses on what the control plane becomes. A Prometheus on the control plane is a
+The cost lands on the control plane. A Prometheus there is a
 stateful store to run, size and back up, on a cluster whose job is reconciliation. It
 commits the project to one query language and one wire format in the layer an operator is
 most likely to already have opinions about. And it answers only metrics: the per-request
@@ -376,7 +383,7 @@ series go. The mapping states an engine's names once and renders into every clus
 it. The destination gives forwarding a schema instead of asking an operator to edit
 generated configuration.
 
-Both lose to what they wrap. The collector already has a configuration language for exactly
-this, and a Modelplane kind over the top of OTTL would express less than OTTL does while
-being one more thing to learn and to version. A kind is permanent: either can be added later
+Each would express less than the thing it wraps. The collector already has a configuration
+language for exactly this, so a Modelplane kind laid over OTTL buys nothing and adds
+something more to learn and to version. A kind is permanent: either can be added later
 over a metric surface that would not change, and neither could be removed.
