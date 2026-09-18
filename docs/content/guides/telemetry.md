@@ -69,9 +69,28 @@ spec:
       endpoint: https://otel.example.internal
 ```
 
-`spec.exporters` is the OpenTelemetry collector's own exporters block, so anything the
-collector supports works, with its usual auth, TLS, and retry settings. If you run
-Prometheus, export to that instead and query the fleet there:
+`spec.exporters` is the OpenTelemetry collector's own exporters block, so any exporter the
+collector provides works here, with its usual TLS and retry settings.
+
+Put credentials in a Secret and name it with `secretRef`. Modelplane mounts its keys into
+the collector as environment variables, so your config refers to `${env:OTLP_TOKEN}` and the
+token never appears in `kubectl get -o yaml`:
+
+```yaml
+spec:
+  secretRef:
+    name: telemetry-credentials
+  extensions:
+    bearertokenauth:
+      token: ${env:OTLP_TOKEN}
+  exporters:
+    otlphttp:
+      endpoint: https://otel.example.internal
+      auth:
+        authenticator: bearertokenauth
+```
+
+If you run Prometheus, export to that instead and query the fleet there:
 
 ```yaml
 spec:

@@ -226,6 +226,11 @@ kind: TelemetryDestination
 metadata:
   name: default
 spec:
+  secretRef:
+    name: telemetry-credentials     # keys become env vars in the collector
+  extensions:
+    bearertokenauth:
+      token: ${env:OTLP_TOKEN}
   exporters:
     otlphttp:
       endpoint: https://otel.acme.example
@@ -235,12 +240,18 @@ spec:
       endpoint: https://prom.acme.example/api/v1/write
 ```
 
-`spec.exporters` is the collector's exporters block, passed through unread. Modelplane
-validates that it parses and reports whether the destination is accepting writes; it does
-not model what an exporter is. So anything the collector supports works, with its auth, TLS,
-retry and queue settings intact. A field-by-field schema would have had to restate all of
-that or cap it. This one keeps working when the collector gains an exporter Modelplane has
-never heard of.
+`spec.exporters` and `spec.extensions` are the collector's own blocks, passed through
+unread. Modelplane validates that they parse and reports whether the destination is accepting
+writes; it does not model what an exporter is. So any exporter the collector provides works,
+with its TLS, retry and queue settings intact, and so does any authenticator:
+bearer token, basic auth, OIDC, AWS SigV4. A field-by-field schema would have had to restate
+all of that or cap it. This one keeps working when the collector gains an exporter
+Modelplane has never heard of.
+
+Credentials stay out of the object. `secretRef` names a Secret in Modelplane's namespace.
+Modelplane mounts its keys into the collector as environment variables, so the configuration
+references `${env:OTLP_TOKEN}` and the token itself never appears in an XR or in
+`kubectl get -o yaml` output.
 
 That is the same bargain as `MetricMapping`. Both kinds are typed, named homes for a piece
 of collector configuration, and neither interprets what it holds.
@@ -477,10 +488,20 @@ knows.
 
 Two labels have closed value sets: `status` on `modelplane_requests_total` is `ok`,
 `client_error` or `server_error`, and `direction` on `modelplane_tokens_total` is `input` or
-`output`. Neither carries a raw status code, which would be cardinality with no reader.
+`output`.
 
-No series names a pod: replicas are interchangeable, so they are merged before export. No
-series names a caller, which is unbounded by construction.
+Cardinality is bounded by construction, and deliberately. Every label above is something
+Modelplane created, so the series count is the number of deployments times the clusters they
+run on, times two where a deployment is disaggregated. It does not grow with traffic, with
+callers, or with time. Three labels that would have broken that are absent: `pod`, which a
+rolling update mints afresh on every deploy and which a billing backend counts as active for
+fifteen to thirty minutes after it dies; `caller`, which is unbounded by definition; and the
+raw HTTP status code, which is why `status` carries three values instead of forty.
+
+Dropping them is the per-cluster collector's job rather than the backend's, because a series
+that never leaves the cluster costs nothing to store and nothing to ingest. A histogram is
+the one thing here that multiplies, by its bucket count, which is why the set carries as few
+of them as the questions allow.
 
 `modelplane_replica_gpu` is how a GPU reaches a workload. DCGM knows a GPU's UUID and its
 host and nothing else, so it cannot answer a question about a deployment on its own.
