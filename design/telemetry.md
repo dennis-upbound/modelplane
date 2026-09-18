@@ -148,17 +148,24 @@ collector, and supplies container restart counts.
 inference. Those two are most of a cold start, and a `ModelCache` exists to shorten them, so
 a fleet deciding whether to scale onto a cold cluster is reading these numbers.
 
-**Modelplane** supplies what none of them can, and there are four such gaps. Under DRA a
-driver advertises its devices as `ResourceSlices`, and no exporter turns those into an
-allocatable count, so capacity has no series at all. DCGM labels a GPU with its UUID and its
-host and nothing about the workload, so nothing joins a GPU to a replica. Nothing times a
-replica from created to serving, or says whether its weights were staged before it started.
-And only the control plane knows whether it can still reach a cluster.
+**Modelplane's own resources** answer what none of them can. Under DRA a driver advertises
+its devices as `ResourceSlices`, and no exporter turns those into an allocatable count, so
+capacity has no series at all. DCGM labels a GPU with its UUID and its host and nothing
+about the workload, so nothing joins a GPU to a replica. Nothing times a replica from
+created to serving. And only the control plane knows whether it can still reach a cluster.
 
-Modelplane either made those decisions or holds the object that answers them. So an exporter
-beside the composition functions reads the `ResourceSlices` and the replicas' claims, and
-publishes every capacity and cost series in the appendix. It is the only component here
-Modelplane writes; both collectors are upstream.
+Every one of those answers is already a field on an object Modelplane reconciles, so
+nothing has to be written to observe them. `resource-state-metrics` turns custom resource
+fields into series from a `ResourceMetricsMonitor`, and the control-plane collector
+scrapes it. A `ModelReplica` carries the GPUs it holds, the devices its claim resolved to,
+and when it was allocated and when it became ready; an `InferenceCluster` carries
+reachability and the allocatable count read off the slices.
+
+What `resource-state-metrics` will not do is accumulate. It reports what an object says now,
+so there is no GPU-seconds counter. Modelplane records the allocation timestamp instead,
+and the backend multiplies elapsed time by GPUs, which is where every other rate and ratio
+in this design is computed anyway. So the design adds no component at
+all: two collectors and one exporter, all upstream, all configured rather than written.
 
 ### Normalizing
 
@@ -185,6 +192,13 @@ setting a label are what it is for. Each engine prefixes its metrics with its ow
 nothing declares which engine a deployment runs. A fork that kept vLLM's names is handled by
 vLLM's statements without knowing it is a fork.
 
+Only `modelplane_*` leaves a cluster. A series the statements did not rename is a series
+whose meaning Modelplane cannot vouch for across engines, and the cardinality argument below
+applies to it in full, so the cluster collector drops it after the `transform` stage. An
+operator who wants an engine's raw names too sets `passthrough: true` on the
+`MetricMapping`, which is the toggle for someone debugging one engine rather than watching a
+fleet.
+
 Renaming is only safe where the measurements agree. SGLang's `inter_token_latency` is not
 vLLM's time per output token, so neither is renamed onto a shared name; the gateway supplies
 that measurement for both. A metric absent on an engine stays absent, never
@@ -201,10 +215,12 @@ gateway and its sidecar, the engines, the picker, DCGM, the controllers through
 replicas into one series, stamps `cluster`, and exports OTLP to the control plane. It needs
 egress and nothing inbound.
 
-Targets come from the OpenTelemetry Operator's target allocator with
-`prometheusCR.enabled`, reading `PodMonitor` objects Modelplane composes. Its selectors
-match labels Modelplane stamps, because an unrestricted selector lets anyone who can create
-a monitor point the collector at a target of their choosing.
+Targets come from the receiver's own Kubernetes service discovery, matching the
+`modelplane.ai/serving` label Modelplane stamps and selecting the port by name. No
+`PodMonitor` and no Prometheus operator: the CRD was a consequence of having chosen
+Prometheus, and choosing a collector instead removes it from the path. Discovery is a scrape
+config in the collector's configuration, which Modelplane composes with everything else in
+it.
 
 The Prometheus receiver puts each pod's identity in resource attributes, which a metric
 processor cannot see. So `groupbyattrs` removes those attributes and merges the resources,
@@ -212,10 +228,10 @@ and `aggregate_on_attributes` then combines the data points. Order matters, and 
 function: counters and counts are summed, while a ratio is averaged, since four replicas
 each at 0.5 are not a cache two hundred percent full.
 
-**On the control plane**, a collector receives from every cluster, scrapes Modelplane's own
-exporter and Crossplane's runtime metrics, and exports onward. It sees one merged stream, so
-it adds nothing that varies by cluster; `cluster` is already on every series. It is the
-fleet's single egress point.
+**On the control plane**, a collector receives from every cluster, scrapes
+`resource-state-metrics` and Crossplane's runtime metrics, and exports onward. It sees one
+merged stream, so it adds nothing that varies by cluster; `cluster` is already on every
+series. It is the fleet's single egress point.
 
 Where it exports to is the one thing an operator has to write, and a
 `TelemetryDestination` is where they write it:
@@ -267,8 +283,8 @@ way `ModelCache` already propagates a HuggingFace token.
 
 This replaces the kube-prometheus-stack `compose-serving-stack` installs today, which is
 the one breaking change. It lands on its own with a release note. A hand-written
-`PodMonitor` is still read by the target allocator, so anyone who wrote one keeps their
-targets; what goes away is the in-cluster store they were querying.
+`PodMonitor` stops being read by anything, quietly, so the note has to say that the store
+and the CRD are both going and where the series go instead.
 
 ### What the backend computes
 
@@ -279,8 +295,8 @@ are real answers an operator wants, and under this design the backend produces t
 | Question | Computed as |
 |---|---|
 | Are we meeting the latency target? | `histogram_quantile` over the gateway's TTFT buckets |
-| What is it costing? | `modelplane_gpu_seconds_total`, `modelplane_energy_joules_total` |
-| Is it efficient? | tokens over GPU-seconds, tokens over joules |
+| What is it costing? | GPUs times elapsed since `..._allocated_time_seconds`, and joules |
+| Is it efficient? | tokens over those GPU-seconds, tokens over joules |
 | Is capacity used? | `modelplane_replica_gpus` summed, over `modelplane_cluster_gpus_allocatable` |
 | Is a GPU idle but allocated? | allocation joined against compute-active below a threshold |
 
@@ -382,8 +398,9 @@ plane that cannot host a collector should do.
 
 It gives up four things. A cluster with no route to the backend loses its telemetry rather
 than reaching the control plane instead. The backend's credential goes onto every GPU
-cluster. Repointing the fleet becomes a per-cluster edit. And Modelplane's own exporter
-publishes control-plane metrics, which would need a path of their own.
+cluster. Repointing the fleet becomes a per-cluster edit. And the control plane's own
+series, the ones `resource-state-metrics` reads off Modelplane's resources, would need a
+path of their own.
 
 **ConfigMaps instead of kinds.** Both `MetricMapping` and `TelemetryDestination` hold
 collector configuration and neither reads it, so a ConfigMap would carry the same bytes and
@@ -452,26 +469,25 @@ separate those from a slow model.
 | `modelplane_gpu_compute_active_ratio` | gauge (0 to 1) | DCGM |
 | `modelplane_gpu_memory_bandwidth_ratio` | gauge (0 to 1) | DCGM |
 | `modelplane_energy_joules_total` | counter | DCGM, scaled from millijoules |
-| `modelplane_replica_gpus` | gauge | Modelplane |
-| `modelplane_replica_gpu{gpu_uuid}` | gauge (0 or 1) | Modelplane |
-| `modelplane_gpu_seconds_total` | counter | Modelplane |
-| `modelplane_cluster_gpus_allocatable` | gauge | Modelplane, from `ResourceSlices` |
+| `modelplane_replica_gpus` | gauge | `ModelReplica` via RSM |
+| `modelplane_replica_gpu{gpu_uuid}` | gauge (0 or 1) | `ModelReplica` via RSM |
+| `modelplane_replica_allocated_time_seconds` | gauge | `ModelReplica` via RSM |
+| `modelplane_cluster_gpus_allocatable` | gauge | `InferenceCluster` via RSM |
 
 **Whether the machinery works.**
 
 | Metric | Type | Source |
 |---|---|---|
-| `modelplane_replicas_desired` | gauge | Modelplane |
-| `modelplane_replicas_ready` | gauge | Modelplane |
-| `modelplane_replica_ready_seconds` | histogram | Modelplane |
+| `modelplane_replicas_desired` | gauge | `ModelDeployment` via RSM |
+| `modelplane_replicas_ready` | gauge | `ModelDeployment` via RSM |
+| `modelplane_replica_ready_duration_seconds` | gauge | `ModelReplica` via RSM |
+| `modelplane_replica_cache_hit` | gauge (0 or 1) | `ModelReplica` via RSM |
 | `modelplane_replica_staging_seconds` | histogram | ModelExpress |
 | `modelplane_replica_warmup_seconds` | histogram | ModelExpress |
-| `modelplane_modelcache_hits_total` | counter | Modelplane |
-| `modelplane_modelcache_misses_total` | counter | Modelplane |
 | `modelplane_gang_incomplete` | gauge | LWS or Grove status |
 | `modelplane_dra_allocation_errors_total` | counter | DRA driver |
 | `modelplane_engine_restarts_total` | counter | kube-state-metrics |
-| `modelplane_cluster_connected` | gauge (0 or 1) | Modelplane |
+| `modelplane_cluster_connected` | gauge (0 or 1) | `InferenceCluster` via RSM |
 
 **When the hardware is the problem.** A bad link or a throttling card explains a latency
 regression that load alone does not, and on a multi-node gang one bad link degrades the
