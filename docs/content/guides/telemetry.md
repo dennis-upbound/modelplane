@@ -99,6 +99,11 @@ spec:
       endpoint: https://prom.example.internal/api/v1/write
 ```
 
+Until you create one, Modelplane composes no collectors: nothing here stores anything, so
+collecting with nowhere to send it would spend GPU-cluster memory on samples nobody reads.
+Creating a destination turns collection on everywhere at once, and there's no per-deployment
+opt-out.
+
 Your clusters reach the control plane, and only the control plane reaches your backend. A
 cluster with no route to your observability stack still reports, and the backend's
 credential lives in one place instead of on every GPU cluster.

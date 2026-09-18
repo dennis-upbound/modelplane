@@ -241,7 +241,7 @@ spec:
 ```
 
 `spec.exporters` and `spec.extensions` are the collector's own blocks, passed through
-unread. Modelplane validates that they parse and reports whether the destination is accepting
+unread. Modelplane validates that they parse and reports whether the destination accepts
 writes; it does not model what an exporter is. So any exporter the collector provides works,
 with its TLS, retry and queue settings intact, and so does any authenticator:
 bearer token, basic auth, OIDC, AWS SigV4. A field-by-field schema would have had to restate
@@ -252,6 +252,12 @@ Credentials stay out of the object. `secretRef` names a Secret in Modelplane's n
 Modelplane mounts its keys into the collector as environment variables, so the configuration
 references `${env:OTLP_TOKEN}` and the token itself never appears in an XR or in
 `kubectl get -o yaml` output.
+
+No destination, no collectors. Neither tier stores anything, so collecting with nowhere to
+export is GPU-cluster memory and CPU spent on samples nobody will ever read. A fleet with no
+`TelemetryDestination` composes no collectors at all, and writing one turns collection on
+everywhere at once. That is the only switch: there is no per-deployment opt-out, because a
+`ModelDeployment`'s author owns neither the destination nor its bill.
 
 That is the same bargain as `MetricMapping`. Both kinds are typed, named homes for a piece
 of collector configuration, and neither interprets what it holds.
