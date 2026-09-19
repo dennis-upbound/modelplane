@@ -164,7 +164,7 @@ def _claim_template(count: int, *, replica: str = "r", engine: str = "main", rol
     return {
         "apiVersion": "resource.k8s.io/v1",
         "kind": "ResourceClaimTemplate",
-        "metadata": {"name": resource.child_name(replica, engine, role, "devices"), "namespace": "default"},
+        "metadata": {"name": resource.child_name(replica, engine, role, "devices"), "namespace": "mp-ml-team"},
         "spec": {
             "spec": {
                 "devices": {
@@ -201,7 +201,7 @@ _NATIVE_WANT = {
     "model-serving-main": {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": _WORKLOAD_NAME, "namespace": "default"},
+        "metadata": {"name": _WORKLOAD_NAME, "namespace": "mp-ml-team"},
         "spec": {
             "replicas": 1,
             "selector": {"matchLabels": {_WORKLOAD: _WORKLOAD_NAME}},
@@ -273,7 +273,7 @@ def _pcs(leader_container: dict, worker_container: dict, *, worker_replicas: int
     return {
         "apiVersion": "grove.io/v1alpha1",
         "kind": "PodCliqueSet",
-        "metadata": {"name": _GROVE_PCS_NAME, "namespace": "default"},
+        "metadata": {"name": _GROVE_PCS_NAME, "namespace": "mp-ml-team"},
         "spec": {
             "replicas": 1,
             "template": {
@@ -656,7 +656,7 @@ class TestLLMDBackend(unittest.TestCase):
         manifest = self._lws(engine, replica)
         self.assertEqual(manifest["apiVersion"], "leaderworkerset.x-k8s.io/v1")
         self.assertEqual(manifest["kind"], "LeaderWorkerSet")
-        self.assertEqual(manifest["metadata"], {"name": _WORKLOAD_NAME, "namespace": "default"})
+        self.assertEqual(manifest["metadata"], {"name": _WORKLOAD_NAME, "namespace": "mp-ml-team"})
         self.assertEqual(manifest["spec"]["replicas"], 2)
         # Gang size is the leader plus the worker's node count.
         self.assertEqual(manifest["spec"]["leaderWorkerTemplate"]["size"], 4)
