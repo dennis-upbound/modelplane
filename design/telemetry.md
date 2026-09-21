@@ -46,8 +46,8 @@ operator writes one object saying where it all goes, and what lands there means 
 everywhere, whatever produced it:
 
 ```
-modelplane_frontend_ttft_seconds_bucket{cluster="prod-us-east", model="Qwen/Qwen3-8B",
-  deployment="qwen3-8b", namespace="ml-team", le="0.25"} 1841
+modelplane_frontend_ttft_seconds_bucket{cluster="prod-us-east", service="ml-team/assistant",
+  model="Qwen/Qwen3-8B", deployment="qwen3-8b", namespace="ml-team", le="0.25"} 1841
 ```
 
 Metrics land first, and this document designs them. Logs and traces get their own design
@@ -110,9 +110,15 @@ this themselves. Its histograms share one bucket layout, because there is only o
 What each component emits is verified against a live deployment running vLLM, Envoy AI
 Gateway, the llm-d picker and DCGM, rather than read off documentation.
 
-**The gateway** measures what the caller experienced, in GenAI vocabulary, for whatever
-engine sits behind it. It is one component, so its histograms share a bucket layout and a
-fleet quantile over them is sound. The SLO metrics come from here for that reason.
+**The fleet gateway** measures what the caller experienced, in GenAI vocabulary, for
+whatever engine sits behind it. It is one component, so its histograms share a bucket layout
+and a fleet quantile over them is sound. The SLO metrics come from here for that reason.
+
+It has to be the fleet gateway and not the cluster one. A request reaches the fleet gateway
+first and is authenticated, routed and translated there, so a cluster gateway's view begins
+after most of what the front door costs. A fleet gateway runs only on the clusters an
+`InferenceGateway` names, so `modelplane_frontend_*` comes from those and no others. Every
+cluster still reports everything below.
 
 Two things about scraping it. The GenAI metrics sit on the ext-proc sidecar's admin port, so
 the gateway needs a target of its own rather than riding the proxy's. And time to first
@@ -433,11 +439,11 @@ separate those from a slow model.
 
 | Metric | Type | Source |
 |---|---|---|
-| `modelplane_frontend_request_duration_seconds` | histogram | gateway |
-| `modelplane_frontend_ttft_seconds` | histogram | gateway, streaming only |
-| `modelplane_frontend_tpot_seconds` | histogram | gateway |
-| `modelplane_requests_total{status}` | counter | gateway |
-| `modelplane_tokens_total{direction}` | counter | gateway |
+| `modelplane_frontend_request_duration_seconds` | histogram | fleet gateway |
+| `modelplane_frontend_ttft_seconds` | histogram | fleet gateway, streaming only |
+| `modelplane_frontend_tpot_seconds` | histogram | fleet gateway |
+| `modelplane_requests_total{status}` | counter | fleet gateway |
+| `modelplane_tokens_total{direction}` | counter | fleet gateway |
 | `modelplane_requests_throttled_total` | counter | Envoy rate limits |
 
 **Why it served that way.**
@@ -501,7 +507,12 @@ whole engine. Some of these need the exporter's optional collectors enabled.
 | `modelplane_gpu_interconnect_errors_total{link}` | counter | DCGM, off by default |
 
 Every series carries `cluster`, stamped by the collector that scraped it. A series about a
-deployment also carries `deployment`, `namespace` and `model`. `engine` goes only on
+deployment also carries `deployment`, `namespace` and `model`. `model` is the name the
+component knew: at the fleet gateway that is the `ModelService` a caller asked for, and at
+an engine it is the model actually served, which a gateway rewrites per backend and which
+differs whenever a request fails over to a provider. A frontend series therefore carries
+`service` as well, so a reader can tell the thing asked for from the thing that answered.
+`engine` goes only on
 series an engine produced, because it is read from the engine's own metric prefix and the
 gateway does not know what served a request. Under disaggregated serving an engine series
 carries a `role` of `prefill` or `decode`, because the two do different work and an average
