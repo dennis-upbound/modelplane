@@ -230,6 +230,11 @@ rule evaluation per metric over series your backend already holds, so it costs f
 collecting everything twice. It covers the names in the table above, and it's meant to be
 deleted once your panels use the new ones.
 
-For a raw series with no `modelplane_*` name at all, set `passthrough: true` on that
-engine's `MetricMapping` instead and its own names stay readable on the cluster.
+For a raw series with no `modelplane_*` name at all, set `passthrough: true` on a
+`MetricMapping` for that engine and its own names stay readable on the cluster. vLLM and
+SGLang have no mapping of their own, so write one carrying just the flag: a mapping for an
+engine Modelplane already knows adds to the built-in statements rather than replacing them.
+
+These series are still merged across replicas, so they keep `model_name` and your old
+grouping works, but they carry no pod label.
 <!-- vale write-good.Passive = YES -->

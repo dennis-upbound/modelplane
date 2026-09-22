@@ -174,6 +174,18 @@ scrapes it. A `ModelReplica` carries the GPUs it holds, the devices its claim re
 and when it was allocated and when it became ready; an `InferenceCluster` carries
 reachability and the allocatable count read off the slices.
 
+One definition these rest on. The unit is a DRA device, which is whatever the driver
+publishes in a `ResourceSlice`: a whole card usually, and a MIG instance where MIG is in
+use, so a partitioned A100 advertises seven. Both sides of the allocation ratio count the
+same thing, so that figure stays right however the card is cut.
+
+Cost does not follow. Seven device-hours on one partitioned card are one card-hour, and
+anything pricing a device-hour as a card-hour overstates a MIG fleet sevenfold.
+`modelplane_replica_gpu` therefore keys on the physical GPU's UUID rather than the device's,
+so a replica holding a partition is attributed to the card it was cut from and the card is
+counted once. Whether a driver publishes that parent UUID on a partitioned device is the
+one thing here that has to be confirmed per driver rather than assumed.
+
 What `resource-state-metrics` will not do is accumulate. It reports what an object says now,
 so there is no GPU-seconds counter. Modelplane records the allocation timestamp instead,
 and the backend multiplies elapsed time by GPUs, which is where every other rate and ratio
@@ -208,9 +220,15 @@ vLLM's statements without knowing it is a fork.
 Only `modelplane_*` leaves a cluster. A series the statements did not rename is a series
 whose meaning Modelplane cannot vouch for across engines, and the cardinality argument below
 applies to it in full, so the cluster collector drops it after the `transform` stage. An
-operator who wants an engine's raw names too sets `passthrough: true` on the
-`MetricMapping`, which is the toggle for someone debugging one engine rather than watching a
+operator who wants an engine's raw names too sets `passthrough: true` on a `MetricMapping`
+for that engine, which is the toggle for someone debugging one engine rather than watching a
 fleet.
+
+A passed-through series is merged across replicas like any other. It keeps the labels the
+engine gave it, so `model_name` survives and a dashboard written against `vllm:*` still
+groups the way it did, but it carries no pod identity: the cardinality argument below is
+about what a series costs, not about what it is called, so exempting these would exempt the
+ones there are most of.
 
 Two labels invite a join that is wrong. vLLM labels its series `model_name`, meaning the
 LLM. DCGM labels its series `modelName`, meaning the card, as in "NVIDIA RTX PRO 6000". One
@@ -433,7 +451,12 @@ status:
 ```
 
 Modelplane does not interpret `statements`. It renders them into each collector's
-`transform` processor beside its own, and reports how many clusters took them. The kind is
+`transform` processor beside its own, and reports how many clusters took them. A mapping
+naming an engine Modelplane already ships statements for is additive rather than a
+replacement: its statements run after the built-in ones, and its flags apply. That is what
+makes `passthrough` reachable for vLLM, which has no mapping of its own and is the engine
+most people migrate from. Turning it on there is a two-line object carrying no statements at
+all. The kind is
 an envelope and a way to reach every cluster, not a language. What an operator writes is the
 collector's own configuration, documented upstream, and identical in form to what Modelplane
 writes for vLLM.
