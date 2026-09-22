@@ -164,7 +164,58 @@ token for both.
 
 [Collecting engine metrics]({{< ref "guides/collecting-engine-metrics.md" >}}) had you write
 a `PodMonitor` and reach the in-cluster Prometheus over a `port-forward`. Both are gone, and
-this page replaces that one. Delete the `PodMonitor`: once the Prometheus operator is no
-longer installed it stops working, and it stops working quietly. Queries you ran against
-that Prometheus move to your backend.
+this page replaces that one. Three steps, and two of them fail quietly if you skip them.
+
+**Keep your Prometheus, and point a destination at it.** Collection becomes a push, so your
+store stops scraping and starts receiving. Same Prometheus, same retention, same Grafana:
+
+```yaml
+spec:
+  exporters:
+    prometheusremotewrite:
+      endpoint: http://prometheus.monitoring.svc:9090/api/v1/write
+```
+
+**Delete the monitors you wrote.** A `PodMonitor` or `ScrapeConfig` pointed at your engines
+keeps working against your own Prometheus, so nothing appears to break and you collect
+everything twice, under `vllm:*` and under `modelplane_*`, paying for both. One written
+against Modelplane's Prometheus stops being read by anything, because the operator goes with
+the stack.
+
+**Rewrite your dashboard queries.** Names change, and so do three labels: `model_name`
+becomes `model`, pod labels are gone because replicas are summed before they leave the
+cluster, and every series now carries `cluster`.
+
+| Was | Is |
+| --- | --- |
+| `vllm:time_to_first_token_seconds` | `modelplane_request_ttft_seconds` |
+| `vllm:e2e_request_latency_seconds` | `modelplane_request_duration_seconds` |
+| `vllm:request_queue_time_seconds` | `modelplane_request_queue_seconds` |
+| `vllm:request_prefill_time_seconds` | `modelplane_request_prefill_seconds` |
+| `vllm:request_decode_time_seconds` | `modelplane_request_decode_seconds` |
+| `vllm:num_requests_running` | `modelplane_requests_running` |
+| `vllm:num_requests_waiting` | `modelplane_requests_waiting` |
+| `vllm:kv_cache_usage_perc` | `modelplane_kv_cache_utilization_ratio` |
+| `vllm:num_preemptions_total` | `modelplane_requests_preempted_total` |
+| `vllm:prefix_cache_hits_total` | `modelplane_prefix_cache_hits_total` |
+| `vllm:prompt_tokens_total` | `modelplane_tokens_total{direction="input"}` |
+| `vllm:generation_tokens_total` | `modelplane_tokens_total{direction="output"}` |
+| `vllm:request_success_total{finished_reason}` | `modelplane_responses_total{reason}` |
+| `DCGM_FI_DEV_FB_USED` | `modelplane_gpu_memory_used_bytes` |
+| `DCGM_FI_DEV_GPU_TEMP` | `modelplane_gpu_temperature_celsius` |
+| `DCGM_FI_DEV_POWER_USAGE` | `modelplane_gpu_power_watts` |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | `modelplane_gpu_tensor_active_ratio` |
+| `envoy_cluster_upstream_rq_time` | `modelplane_frontend_request_duration_seconds` |
+| `envoy_cluster_upstream_rq_xx` | `modelplane_requests_total{status}` |
+
+Two have no direct replacement. `vllm:inter_token_latency_seconds` isn't renamed, because
+SGLang publishes a metric of the same name measuring something else; use
+`modelplane_frontend_tpot_seconds`, which the gateway measures the same way for every
+engine. `DCGM_FI_DEV_GPU_UTIL` isn't renamed either, because it only tells you the card
+wasn't idle; use `modelplane_gpu_compute_active_ratio` and
+`modelplane_gpu_tensor_active_ratio`.
+
+To run both vocabularies while you rewrite panels, set `passthrough: true` on the engine's
+`MetricMapping` and the raw `vllm:*` series stay readable on the cluster. Turn it off when
+you're done.
 <!-- vale write-good.Passive = YES -->

@@ -305,10 +305,64 @@ of collector configuration, and neither interprets what it holds.
 A cluster authenticates to it with a client certificate Modelplane issues and propagates the
 way `ModelCache` already propagates a HuggingFace token.
 
-This replaces the kube-prometheus-stack `compose-serving-stack` installs today, which is
-the one breaking change. It lands on its own with a release note. A hand-written
-`PodMonitor` stops being read by anything, quietly, so the note has to say that the store
-and the CRD are both going and where the series go instead.
+### Migrating off the Prometheus stack
+
+This replaces the kube-prometheus-stack `compose-serving-stack` installs today, which is the
+one breaking change, so it lands on its own. Anyone already reading these metrics has three
+things to do, and the release note has to say all three, because two of them fail quietly.
+
+**Point a destination at the Prometheus you already run.** Collection becomes a push, so the
+store stops scraping and starts receiving. Nothing else about it changes: same Prometheus,
+same retention, same Grafana in front of it.
+
+```yaml
+spec:
+  exporters:
+    prometheusremotewrite:
+      endpoint: http://prometheus.monitoring.svc:9090/api/v1/write
+```
+
+**Delete the monitors you hand-wrote.** A `PodMonitor` or `ScrapeConfig` aimed at the
+engines keeps working against your own Prometheus, so nothing breaks and you collect
+everything twice, once under `vllm:*` and once under `modelplane_*`, and pay for both. The
+Prometheus operator goes with the stack, so a monitor written against Modelplane's own
+Prometheus instead stops being read by anything at all, silently.
+
+**Rewrite the queries.** This is the visible half. Every panel changes name, and three
+labels change with it: `model_name` becomes `model`, pod labels are gone because replicas
+are summed before export, and `cluster` is now on every series.
+
+| Was | Is |
+|---|---|
+| `vllm:time_to_first_token_seconds` | `modelplane_request_ttft_seconds` |
+| `vllm:e2e_request_latency_seconds` | `modelplane_request_duration_seconds` |
+| `vllm:request_queue_time_seconds` | `modelplane_request_queue_seconds` |
+| `vllm:request_prefill_time_seconds` | `modelplane_request_prefill_seconds` |
+| `vllm:request_decode_time_seconds` | `modelplane_request_decode_seconds` |
+| `vllm:num_requests_running` / `_waiting` | `modelplane_requests_running` / `_waiting` |
+| `vllm:kv_cache_usage_perc` | `modelplane_kv_cache_utilization_ratio` |
+| `vllm:num_preemptions_total` | `modelplane_requests_preempted_total` |
+| `vllm:prefix_cache_hits_total` | `modelplane_prefix_cache_hits_total` |
+| `vllm:prompt_tokens_total` | `modelplane_tokens_total{direction="input"}` |
+| `vllm:generation_tokens_total` | `modelplane_tokens_total{direction="output"}` |
+| `vllm:request_success_total{finished_reason}` | `modelplane_responses_total{reason}` |
+| `DCGM_FI_DEV_FB_USED` | `modelplane_gpu_memory_used_bytes` |
+| `DCGM_FI_DEV_GPU_TEMP` | `modelplane_gpu_temperature_celsius` |
+| `DCGM_FI_DEV_POWER_USAGE` | `modelplane_gpu_power_watts` |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | `modelplane_gpu_tensor_active_ratio` |
+| `envoy_cluster_upstream_rq_time` | `modelplane_frontend_request_duration_seconds` |
+| `envoy_cluster_upstream_rq_xx` | `modelplane_requests_total{status}` |
+
+Two panels have no replacement and the note should say so rather than let someone find out.
+`vllm:inter_token_latency_seconds` is not renamed, because SGLang publishes a metric of the
+same name measuring something else; the nearest equivalent is
+`modelplane_frontend_tpot_seconds`, measured at the gateway for every engine.
+`DCGM_FI_DEV_GPU_UTIL` is not renamed either: it reports that the card was not idle, which
+for inference is almost always true, and `modelplane_gpu_compute_active_ratio` and
+`modelplane_gpu_tensor_active_ratio` are what replace it.
+
+An engine's raw series are still readable on the cluster while `passthrough` is set on its
+`MetricMapping`, which is the way to run both vocabularies during a migration and then stop.
 
 ### What the backend computes
 
@@ -495,6 +549,7 @@ separate those from a slow model.
 | `modelplane_gpu_compute_active_ratio` | gauge (0 to 1) | GPU exporter |
 | `modelplane_gpu_tensor_active_ratio` | gauge (0 to 1) | GPU exporter |
 | `modelplane_gpu_memory_bandwidth_ratio` | gauge (0 to 1) | GPU exporter |
+| `modelplane_gpu_power_watts` | gauge | GPU exporter |
 | `modelplane_energy_joules_total` | counter | GPU exporter, scaled to joules |
 | `modelplane_replica_gpus` | gauge | `ModelReplica` via RSM |
 | `modelplane_replica_gpu{gpu_uuid}` | gauge (0 or 1) | `ModelReplica` via RSM |
