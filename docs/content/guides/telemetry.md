@@ -38,7 +38,8 @@ Every series carries `cluster`. A series about a deployment also carries `deploy
 | `modelplane_frontend_request_duration_seconds` | What the caller waited, end to end |
 | `modelplane_request_queue_seconds` | How long a request waited before the engine started |
 | `modelplane_requests_waiting` | Queue depth per engine |
-| `modelplane_kv_cache_utilization_ratio` | KV-cache occupancy, 0 to 1 |
+| `modelplane_kv_cache_utilization_ratio` | KV-cache occupancy, averaged over replicas |
+| `modelplane_kv_cache_utilization_ratio_max` | KV-cache occupancy of the busiest replica |
 | `modelplane_tokens_total` | Tokens in and out, by `direction` |
 | `modelplane_replica_gpus` | GPUs a replica holds |
 | `modelplane_gpu_seconds_total` | GPU-time bound to serving |
@@ -47,6 +48,11 @@ Latency appears twice on purpose. The `frontend_` series are what your caller ex
 measured at the gateway. The engine's own series are what the engine spent. When the
 frontend number is slow and the engine number isn't, the problem is routing, queueing, or
 the network rather than the model.
+
+Saturation gauges come as a pair. The average is what you plan capacity against; the `_max`
+is what you alert on, because three replicas at 0.3 and one at 0.99 average to something
+comfortable while the fourth evicts and recomputes. A high `_max` beside
+`modelplane_requests_preempted_total` climbing is one replica thrashing.
 
 <!-- vale Google.Acronyms = NO -->
 No series names a pod. Replicas are interchangeable, so they're summed before the metrics

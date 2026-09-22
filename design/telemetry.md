@@ -270,6 +270,20 @@ and `aggregate_on_attributes` then combines the data points. Order matters, and 
 function: counters and counts are summed, while a ratio is averaged, since four replicas
 each at 0.5 are not a cache two hundred percent full.
 
+An average alone would hide the replica that matters. Three replicas at 0.3 and one at 0.99
+average to 0.47, which reads as comfortable while the fourth evicts and recomputes, and a KV
+cache filling is the thing this whole surface exists to catch. So a saturation gauge is
+merged twice, mean and max, and the pair says different things: the mean is what a capacity
+plan reads, the max is what an alert fires on. `modelplane_kv_cache_utilization_ratio_max`
+at 0.99 beside `modelplane_requests_preempted_total` climbing is one replica thrashing, and
+neither series alone says so.
+
+Keeping a replica identity instead would also answer it, and unlike `pod` it is bounded,
+since a deployment caps at ten. It loses anyway: it multiplies every series by the replica
+count to answer what one extra series answers, a replica name still churns when a deployment
+scales, and the question is almost never which replica but whether any. The one time it is
+which, the engine's own metrics are still on the cluster.
+
 **On the control plane**, a collector receives from every cluster, scrapes
 `resource-state-metrics` and Crossplane's runtime metrics, and exports onward. It sees one
 merged stream, so it adds nothing that varies by cluster; `cluster` is already on every
@@ -573,7 +587,9 @@ separate those from a slow model.
 | `modelplane_request_output_tokens` | histogram | engine |
 | `modelplane_requests_running` | gauge | engine |
 | `modelplane_requests_waiting` | gauge | engine |
-| `modelplane_kv_cache_utilization_ratio` | gauge (0 to 1) | engine |
+| `modelplane_kv_cache_utilization_ratio` | gauge (0 to 1) | engine, mean over replicas |
+| `modelplane_kv_cache_utilization_ratio_max` | gauge (0 to 1) | engine, max over replicas |
+| `modelplane_requests_waiting_max` | gauge | engine, max over replicas |
 | `modelplane_requests_preempted_total` | counter | engine |
 | `modelplane_tokens_recomputed_total` | counter | engine, where reported |
 | `modelplane_responses_total{reason}` | counter | engine |
