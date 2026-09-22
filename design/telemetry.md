@@ -137,11 +137,18 @@ though those stay per-engine diagnostics, since their buckets do not merge.
 which inflates the gateway's time to first token without appearing anywhere in the engine's
 own numbers.
 
-**The GPUs** are read through DCGM, which reports memory, compute activity, bandwidth,
-power and energy per device, and the fault taxonomy behind a drain: temperature, throttling,
-ECC and interconnect errors. The last two need collectors that DCGM leaves off by default,
-and Modelplane enables them, because on a multi-node gang one bad NVLink degrades an engine
-that otherwise looks healthy.
+**The GPUs** are read through their vendor's exporter: DCGM on NVIDIA, the Device Metrics
+Exporter on AMD. Either reports memory, compute activity, power and energy per device, and
+the fault taxonomy behind a drain: temperature, throttling and, on NVIDIA, ECC and
+interconnect errors. Those last two need collectors DCGM leaves off by default, and
+Modelplane enables them, because on a multi-node gang one bad NVLink degrades an engine that
+otherwise looks healthy.
+
+Which exporter runs is the serving stack's decision, made per accelerator vendor alongside
+the driver and DRA plugin. What does not change is the name: `modelplane_gpu_*` means the
+same thing whichever exporter produced it, which is the whole reason a vendor-neutral
+surface is worth the renaming. A cluster whose vendor has no exporter reports no GPU series
+and every other series unchanged.
 
 **The substrate** reports whether the machinery works. The gang controller, LeaderWorkerSet
 or Grove, carries completeness in its status. That is the only place a half-placed gang
@@ -205,6 +212,13 @@ operator who wants an engine's raw names too sets `passthrough: true` on the
 `MetricMapping`, which is the toggle for someone debugging one engine rather than watching a
 fleet.
 
+Two labels invite a join that is wrong. vLLM labels its series `model_name`, meaning the
+LLM. DCGM labels its series `modelName`, meaning the card, as in "NVIDIA RTX PRO 6000". One
+underscore and one capital apart, and joining them silently pairs every model with every GPU
+type. Normalizing both onto `model` would make that collision permanent, so the GPU series
+keep the device identity they came with and reach a workload through
+`modelplane_replica_gpu` instead.
+
 Renaming is only safe where the measurements agree. SGLang's `inter_token_latency` is not
 vLLM's time per output token, so neither is renamed onto a shared name; the gateway supplies
 that measurement for both. A metric absent on an engine stays absent, never
@@ -222,7 +236,11 @@ replicas into one series, stamps `cluster`, and exports OTLP to the control plan
 egress and nothing inbound.
 
 Targets come from the receiver's own Kubernetes service discovery, matching the
-`modelplane.ai/serving` label Modelplane stamps and selecting the port by name. No
+`modelplane.ai/serving` label Modelplane stamps and selecting the port by name. That
+requires Modelplane to name it: an engine container's port is unnamed by default, and
+selecting an unnamed port by name matches nothing and says nothing. Matching by number
+would be worse on a disaggregated pod, where the sidecar holds 8000 and the decode engine
+has moved to 8001, so the scrape would find the sidecar and report it as the engine. No
 `PodMonitor` and no Prometheus operator: the CRD was a consequence of having chosen
 Prometheus, and choosing a collector instead removes it from the path. Discovery is a scrape
 config in the collector's configuration, which Modelplane composes with everything else in
@@ -463,6 +481,8 @@ separate those from a slow model.
 | `modelplane_kv_cache_utilization_ratio` | gauge (0 to 1) | engine |
 | `modelplane_requests_preempted_total` | counter | engine |
 | `modelplane_tokens_recomputed_total` | counter | engine, where reported |
+| `modelplane_responses_total{reason}` | counter | engine |
+| `modelplane_tool_call_parses_total{outcome}` | counter | engine, where reported |
 | `modelplane_route_decision_seconds` | histogram | picker |
 | `modelplane_route_requests_total{decision}` | counter | picker |
 | `modelplane_route_pd_pairings_total{status}` | counter | picker, disaggregated only |
@@ -471,10 +491,11 @@ separate those from a slow model.
 
 | Metric | Type | Source |
 |---|---|---|
-| `modelplane_gpu_memory_used_bytes` | gauge | DCGM |
-| `modelplane_gpu_compute_active_ratio` | gauge (0 to 1) | DCGM |
-| `modelplane_gpu_memory_bandwidth_ratio` | gauge (0 to 1) | DCGM |
-| `modelplane_energy_joules_total` | counter | DCGM, scaled from millijoules |
+| `modelplane_gpu_memory_used_bytes` | gauge | GPU exporter |
+| `modelplane_gpu_compute_active_ratio` | gauge (0 to 1) | GPU exporter |
+| `modelplane_gpu_tensor_active_ratio` | gauge (0 to 1) | GPU exporter |
+| `modelplane_gpu_memory_bandwidth_ratio` | gauge (0 to 1) | GPU exporter |
+| `modelplane_energy_joules_total` | counter | GPU exporter, scaled to joules |
 | `modelplane_replica_gpus` | gauge | `ModelReplica` via RSM |
 | `modelplane_replica_gpu{gpu_uuid}` | gauge (0 or 1) | `ModelReplica` via RSM |
 | `modelplane_replica_allocated_time_seconds` | gauge | `ModelReplica` via RSM |
@@ -501,8 +522,8 @@ whole engine. Some of these need the exporter's optional collectors enabled.
 
 | Metric | Type | Source |
 |---|---|---|
-| `modelplane_gpu_temperature_celsius` | gauge | DCGM |
-| `modelplane_gpu_thermal_throttle_seconds_total` | counter | DCGM |
+| `modelplane_gpu_temperature_celsius` | gauge | GPU exporter |
+| `modelplane_gpu_thermal_throttle_seconds_total` | counter | GPU exporter |
 | `modelplane_gpu_ecc_errors_total{type}` | counter | DCGM, off by default |
 | `modelplane_gpu_interconnect_errors_total{link}` | counter | DCGM, off by default |
 
@@ -541,6 +562,18 @@ host and nothing else, so it cannot answer a question about a deployment on its 
 Modelplane placed the replica and holds its DRA claim, so it publishes one series per
 GPU-to-replica binding, and a backend joins DCGM's figures through it. Every cost and
 efficiency question in this design is that join.
+
+`modelplane_responses_total{reason}` is the one that catches a truncation. `reason` is how
+generation ended, `stop` or `length` or `tool_calls`, and a response cut off at the token
+cap reports `length` while still returning 200 with a well-formed body. Every layer above
+reads that as success. A timeout severing a stream produces the same shape from the other
+direction: a 200, valid output, and no terminal event. So the rate of `length` against the
+rest is the signal, and it is not derivable from a status code anywhere.
+
+`modelplane_tool_call_parses_total{outcome}` is there because a tool-call parser fails the
+same quiet way. It returns text with the call left unparsed inside it rather than an error,
+so an agentic caller sees a model that stopped calling tools and the serving side sees
+nothing at all.
 
 The gateway and the engines both count requests and tokens, and only the gateway's counts
 are renamed onto `modelplane_requests_total` and `modelplane_tokens_total`. It counts the
