@@ -215,7 +215,21 @@ engine. `DCGM_FI_DEV_GPU_UTIL` isn't renamed either, because it only tells you t
 wasn't idle; use `modelplane_gpu_compute_active_ratio` and
 `modelplane_gpu_tensor_active_ratio`.
 
-To run both vocabularies while you rewrite panels, set `passthrough: true` on the engine's
-`MetricMapping` and the raw `vllm:*` series stay readable on the cluster. Turn it off when
-you're done.
+You can also skip the rewrite for now. Modelplane provides compatibility recording rules
+that rebuild the old names from the new ones, so your existing dashboards keep working
+untouched:
+
+```yaml
+- record: vllm:time_to_first_token_seconds_bucket
+  expr: label_replace(modelplane_request_ttft_seconds_bucket,
+          "model_name", "$1", "model", "(.*)")
+```
+
+Load it into the Prometheus you already run and nothing on a dashboard changes. It's one
+rule evaluation per metric over series your backend already holds, so it costs far less than
+collecting everything twice. It covers the names in the table above, and it's meant to be
+deleted once your panels use the new ones.
+
+For a raw series with no `modelplane_*` name at all, set `passthrough: true` on that
+engine's `MetricMapping` instead and its own names stay readable on the cluster.
 <!-- vale write-good.Passive = YES -->

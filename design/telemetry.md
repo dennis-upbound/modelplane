@@ -361,8 +361,26 @@ same name measuring something else; the nearest equivalent is
 for inference is almost always true, and `modelplane_gpu_compute_active_ratio` and
 `modelplane_gpu_tensor_active_ratio` are what replace it.
 
-An engine's raw series are still readable on the cluster while `passthrough` is set on its
-`MetricMapping`, which is the way to run both vocabularies during a migration and then stop.
+Rewriting is also avoidable for as long as it needs to be. Modelplane provides compatibility
+recording rules that rebuild the old names from the new ones, so existing dashboards
+keep working untouched while they get rewritten:
+
+```yaml
+- record: vllm:time_to_first_token_seconds_bucket
+  expr: label_replace(modelplane_request_ttft_seconds_bucket,
+          "model_name", "$1", "model", "(.*)")
+```
+
+An operator drops that into the Prometheus they already run and nothing on a dashboard
+changes. It is cheaper than the alternative it replaces: collecting the raw series too would
+double what crosses the wire and what the backend stores, where this is one rule evaluation
+over series already there. It covers only the names in the table, since a rule
+can only re-derive what something still produces, and it is meant to be deleted. Modelplane
+provides it as a separate file for exactly that reason.
+
+`passthrough` on a `MetricMapping` is the other half, for the panels this cannot reach: a
+raw series that never had a `modelplane_*` equivalent, on one engine, while somebody works
+out what it should become.
 
 ### What the backend computes
 
