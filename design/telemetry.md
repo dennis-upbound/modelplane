@@ -334,6 +334,33 @@ everywhere at once. That is the only switch: there is no per-deployment opt-out,
 That is the same bargain as `MetricMapping`. Both kinds are typed, named homes for a piece
 of collector configuration, and neither interprets what it holds.
 
+Somewhere else may already run the fleet collector, and then Modelplane must not run a
+second one. A managed control plane is the case: the platform operating it already has a
+collector, an address and a credential, and hands them over rather than taking a
+destination. `collector: External` says so.
+
+```yaml
+spec:
+  collector: External          # compose none; someone else operates it
+  exporters:
+    otlp:
+      endpoint: telemetry.example.internal:4317
+      auth:
+        authenticator: bearertokenauth
+```
+
+Each inference cluster then exports to that endpoint directly, and the control plane
+composes nothing. Everything above it is unchanged: same scrape, same statements, same
+merge, same names. What is given up is the hop's four benefits, and whoever imposed the
+endpoint has usually provided them already.
+
+This is also the answer to whether a destination needs to be a kind when the platform
+already has one of its own. It does, because the endpoint and its credential have to live
+somewhere on the control plane either way, and `collector: External` is what lets that
+somewhere be filled in by the platform rather than chosen by the operator. One object covers
+both, rather than a kind for the case where you choose and configuration for the case where
+you do not.
+
 A cluster authenticates to it with a client certificate Modelplane issues and propagates the
 way `ModelCache` already propagates a HuggingFace token.
 
