@@ -57,6 +57,7 @@
         "compose-inference-cluster"
         "compose-inference-gateway"
         "compose-metric-mapping"
+        "compose-telemetry-destination"
         "compose-nebius-cluster"
         "compose-serving-stack"
         "compose-vultr-cluster"

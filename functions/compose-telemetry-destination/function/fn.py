@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compose a MetricMapping.
+"""Compose a TelemetryDestination.
 
-MetricMapping is a data resource: the metrics collector reads every
-MetricMapping to normalize a component's Prometheus metrics onto the
-modelplane_* surface. It has no composed children. This function just
-marks the XR Ready.
+TelemetryDestination is a data resource: it carries the collector's exporters
+and extensions verbatim, and compose-serving-stack renders them into the
+collector it composes. It has no composed children of its own. This function
+just marks the XR Ready.
 """
 
 import grpc

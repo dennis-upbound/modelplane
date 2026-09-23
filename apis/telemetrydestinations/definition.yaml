@@ -1,0 +1,97 @@
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: telemetrydestinations.modelplane.ai
+spec:
+  group: modelplane.ai
+  names:
+    categories: [crossplane, modelplane]
+    kind: TelemetryDestination
+    plural: telemetrydestinations
+    shortNames: [td]
+  scope: Cluster
+  versions:
+  - name: v1alpha1
+    served: true
+    referenceable: true
+    additionalPrinterColumns:
+    - name: COLLECTOR
+      type: string
+      jsonPath: .spec.collector
+    - name: AGE
+      type: date
+      jsonPath: .metadata.creationTimestamp
+    schema:
+      openAPIV3Schema:
+        type: object
+        required: [spec]
+        properties:
+          spec:
+            type: object
+            required: [exporters]
+            description: >-
+              Where the fleet's telemetry goes. Modelplane composes no
+              collectors until a TelemetryDestination exists: neither tier
+              stores anything, so collecting with nowhere to export would
+              spend GPU-cluster memory on samples nobody reads. Creating one
+              turns collection on everywhere at once.
+
+              There is no per-deployment opt-out. A ModelDeployment's author
+              owns neither the destination nor its bill.
+            properties:
+              collector:
+                type: string
+                default: Composed
+                enum: [Composed, External]
+                description: >-
+                  Whether Modelplane runs the fleet collector. Composed (the
+                  default) puts one on the control plane, and every inference
+                  cluster exports to it. External composes none, for a
+                  platform that already operates one: each inference cluster
+                  then exports to the endpoint below directly.
+
+                  External gives up the single egress point, one place to
+                  change the destination, and the control plane's own series
+                  reaching the fleet without a path of their own. Whoever
+                  imposed the endpoint has usually provided them already.
+              exporters:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+                description: >-
+                  The OpenTelemetry collector's exporters block, passed
+                  through unread. Modelplane validates that it parses and
+                  reports whether the destination accepts writes; it does not
+                  model what an exporter is.
+
+                  So any exporter the collector provides works, with its TLS,
+                  retry and queue settings intact, and a destination keeps
+                  working when the collector gains an exporter Modelplane has
+                  never heard of.
+              extensions:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+                description: >-
+                  The collector's extensions block, passed through unread,
+                  for the authenticator an exporter references. Bearer token,
+                  basic auth, OIDC and SigV4 all work, because none of them
+                  is modelled here.
+              secretRef:
+                type: object
+                required: [name]
+                description: >-
+                  A Secret whose keys Modelplane mounts into the collector as
+                  environment variables, so configuration above refers to
+                  ${env:TOKEN} and the credential itself never appears in this
+                  object or in kubectl output.
+                properties:
+                  name:
+                    type: string
+                    maxLength: 253
+                    description: Name of the Secret, in Modelplane's namespace.
+          status:
+            type: object
+            properties:
+              conditions:
+                type: array
+                items:
+                  type: object

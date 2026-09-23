@@ -14,6 +14,13 @@ spec:
   - name: v1alpha1
     served: true
     referenceable: true
+    additionalPrinterColumns:
+    - name: CLUSTERS
+      type: integer
+      jsonPath: .status.clusters
+    - name: AGE
+      type: date
+      jsonPath: .metadata.creationTimestamp
     schema:
       openAPIV3Schema:
         type: object
@@ -22,45 +29,54 @@ spec:
           spec:
             type: object
             description: >-
-              How to normalize one component's Prometheus metrics onto the
-              modelplane_* surface. The metrics collector reads every
-              MetricMapping and renders the matching rename and label rules
-              into its config. Modelplane ships a MetricMapping per common
-              engine; a platform team applies one more for a new or forked
-              engine.
+              How one component's metrics become part of the modelplane_*
+              surface. Modelplane renders every MetricMapping into each
+              inference cluster's collector, so a mapping is written once on
+              the control plane and reaches the whole fleet.
+
+              A mapping naming a component Modelplane already provides
+              statements for is additive: its statements run after the
+              built-in ones and its flags apply. That is how passthrough is
+              turned on for an engine that needs no statements of its own.
             properties:
-              selector:
-                type: object
+              statements:
+                type: array
                 description: >-
-                  Selects the pods this mapping applies to, by label. An
-                  engine mapping matches the engine-type label
-                  (modelplane.ai/engine); a scheduler mapping matches the
-                  scheduler's pods.
-                properties:
-                  matchLabels:
-                    type: object
-                    additionalProperties:
-                      type: string
-              rename:
-                type: object
-                description: >-
-                  Source metric name to its modelplane_* name, e.g.
-                  vllm:time_to_first_token_seconds becomes
-                  modelplane_time_to_first_token.
-                additionalProperties:
+                  OTTL statements, rendered into the collector's transform
+                  processor beside Modelplane's own. Modelplane does not
+                  interpret them: what you write here is the collector's own
+                  configuration language, documented by OpenTelemetry, and it
+                  is the same thing Modelplane writes for vLLM.
+
+                  Statements select through their own where clauses, so
+                  nothing declares which engine a deployment runs.
+                items:
                   type: string
-              labels:
-                type: object
-                description: Label rewrites applied to the matched series.
-                properties:
-                  add:
-                    type: object
-                    description: Labels to add to every matched series.
-                    additionalProperties:
-                      type: string
+                  maxLength: 2048
+                maxItems: 128
+              passthrough:
+                type: boolean
+                default: false
+                description: >-
+                  Send this component's own metric names onward as well as the
+                  modelplane_* ones they become.
+
+                  Off by default, because a series the statements did not
+                  rename is one whose meaning Modelplane cannot vouch for
+                  across engines, and it costs the same to carry as one that
+                  was renamed. On, for reading an engine's raw names during a
+                  migration or while debugging that engine.
+
+                  A passed-through series is still merged across a
+                  deployment's replicas, so it keeps the labels the engine
+                  gave it and carries no pod identity.
           status:
             type: object
             properties:
+              clusters:
+                type: integer
+                description: >-
+                  How many inference clusters have taken these statements.
               conditions:
                 type: array
                 items:

@@ -77,6 +77,10 @@ spec:
       pathPrefix: _output/functions/compose-metric-mapping
   - source: Tarball
     tarball:
+      name: compose-telemetry-destination
+      pathPrefix: _output/functions/compose-telemetry-destination
+  - source: Tarball
+    tarball:
       name: compose-usages
       pathPrefix: _output/functions/compose-usages
   - source: Tarball
