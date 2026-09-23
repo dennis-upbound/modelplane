@@ -24,6 +24,7 @@ import grpc
 from crossplane.function import logging, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from crossplane.function.proto.v1 import run_function_pb2_grpc as grpcv1
+from models.ai.modelplane.telemetrydestination import v1alpha1
 
 
 class FunctionRunner(grpcv1.FunctionRunnerServiceServicer):
@@ -42,6 +43,7 @@ class FunctionRunner(grpcv1.FunctionRunnerServiceServicer):
 
         rsp = response.to(req)
 
+        resource.update_status(rsp.desired.composite, v1alpha1.Status())
         response.set_conditions(rsp, resource.Condition(typ="Accepted", status="True", reason="Available"))
         rsp.desired.composite.ready = fnv1.READY_TRUE
 
