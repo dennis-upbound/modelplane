@@ -320,10 +320,16 @@ bearer token, basic auth, OIDC, AWS SigV4. A field-by-field schema would have ha
 all of that or cap it. This one keeps working when the collector gains an exporter
 Modelplane has never heard of.
 
-Credentials stay out of the object. `secretRef` names a Secret in Modelplane's namespace.
-Modelplane mounts its keys into the collector as environment variables, so the configuration
-references `${env:OTLP_TOKEN}` and the token itself never appears in an XR or in
-`kubectl get -o yaml` output.
+Credentials stay out of the object. `secretRef` names a Secret in Modelplane's namespace,
+and Modelplane mounts its keys into the collector both ways: as environment variables, so
+configuration can reference `${env:OTLP_TOKEN}`, and as files under a known directory.
+Either way the credential never appears in an XR or in `kubectl get -o yaml` output.
+
+The file matters for a credential that rotates. An environment variable is fixed for the
+life of a process, so a rotated token needs the collector restarted to be read, and a
+destination whose credential expires on a schedule would drop telemetry every time. A
+mounted file is refreshed in place, and an authenticator that reads one picks the new
+credential up without a restart.
 
 No destination, no collectors. Neither tier stores anything, so collecting with nowhere to
 export is GPU-cluster memory and CPU spent on samples nobody will ever read. A fleet with no
