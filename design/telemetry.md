@@ -155,7 +155,9 @@ or Grove, carries completeness in its status. That is the only place a half-plac
 shows up: the leader is running, so every per-pod view looks fine while the workers never
 scheduled. The DRA driver counts allocation failures, which is why a replica stays Pending.
 `kube-state-metrics` reads both controller statuses through its custom-resource-state
-collector, and supplies container restart counts.
+collector, and counts container restarts, which is the one thing here neither an engine nor
+Modelplane can report: an engine that crashed cannot say it crashed, and the control plane
+sees a replica that is Ready again.
 
 **ModelExpress** times staging a model onto a cluster and the engine's warmup to first
 inference. Those two are most of a cold start, and a `ModelCache` exists to shorten them, so
@@ -656,7 +658,7 @@ separate those from a slow model.
 | `modelplane_replica_cache_hit` | gauge (0 or 1) | `ModelReplica` via RSM |
 | `modelplane_replica_staging_seconds` | histogram | ModelExpress |
 | `modelplane_replica_warmup_seconds` | histogram | ModelExpress |
-| `modelplane_gang_incomplete` | gauge | LWS or Grove status |
+| `modelplane_gang_incomplete` | gauge | LWS or Grove status via KSM |
 | `modelplane_dra_allocation_errors_total` | counter | DRA driver |
 | `modelplane_engine_restarts_total` | counter | kube-state-metrics |
 | `modelplane_cluster_connected` | gauge (0 or 1) | `InferenceCluster` via RSM |

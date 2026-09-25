@@ -21,8 +21,6 @@ EKSCluster
 ServingStack
 ModelCache
 ModelCaches
-MetricMapping
-MetricMappings
 ModelDeployment
 ModelDeployments
 ModelEndpoint
@@ -31,8 +29,6 @@ ModelReplica
 ModelReplicas
 ModelService
 ModelServices
-TelemetryDestination
-TelemetryDestinations
 
 # Spec fields and config keys
 clusterSelector
@@ -577,14 +573,3 @@ DGX
 BasePOD
 SuperPOD
 Run:ai
-OTLP
-OpenTelemetry
-Grafana
-quantile
-quantiles
-precompute
-top-line
-p99
-OTTL
-per-deployment
-opt-out
