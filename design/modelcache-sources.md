@@ -7,20 +7,26 @@
 
 ## 1. Introduction
 
-A `ModelCache` reads a model from one place. It is HuggingFace. The cache
-writes the model to a volume on each cluster that it matches. A pod that uses
-the model calculates the name of that volume.
+A `ModelCache` does three things, and each one causes a problem.
 
-Each of these three statements causes a problem.
+**It reads a model from HuggingFace, and from nowhere else.** A customer who
+keeps models in a private registry must send them to HuggingFace first. A
+customer whose weights are on a disk already has no way to say so.
 
-A customer who keeps models in a private registry must send the model to
-HuggingFace first. If the weights are already on a disk, there is no way to
-tell Modelplane this. The calculation of the volume name is correct for one
-source only. Two functions hold a copy of it.
+**It stages what it reads onto a ReadWriteMany volume on each matched
+cluster.** A read from that volume can be slower than no cache at all. The
+volume does not take the size the user asked for on every cloud, and it can
+fail on its own. Section 4.2 gives the reports.
 
-This document adds two sources and one status field. The status field tells a
-consumer how to read the model on one cluster, so the consumer does not
-calculate it.
+**It publishes a phase, and a consumer calculates the name of the volume.** The
+calculation is correct for one source, and two functions hold a copy of it.
+Nothing tells a consumer whether the artifact is readable yet, so an engine
+starts before the cache is staged and reads the model a second time.
+
+This document makes two changes. `spec.source` gets two more values, and one of
+them removes the volume rather than filling it. Each cluster entry gets a
+`mount` field that says how to read the artifact there. A consumer copies that
+answer instead of calculating one. Where there is no answer to copy, it waits.
 
 ## 2. Terms
 
@@ -147,8 +153,10 @@ The design has two parts.
 2. Each cluster entry gets a `mount` field. The field holds the volumes, the
    volume mounts and the environment variables that a consumer adds to a pod.
 
-The first part lets a user name an artifact where it is. The second part lets a
-consumer read that artifact without knowledge of the source.
+The first part lets a user name an artifact where it is. For an `OCI` source it
+also removes the volume from the path, with the cost and the failure mode that
+section 4.2 gives. The second part lets a consumer read the artifact without
+knowledge of the source, and tells it when it must wait.
 
 ### 5.2 The source field
 
