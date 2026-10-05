@@ -7,21 +7,20 @@
 
 ## 1. Introduction
 
-A `ModelCache` does three things, and each one causes a problem.
+A `ModelCache` reads from HuggingFace and nowhere else. A customer whose models
+are in Artifact Registry or ECR must send them to HuggingFace first. A customer
+whose weights are on a disk already has no way to say so.
 
-**It reads a model from HuggingFace, and from nowhere else.** A customer who
-keeps models in a private registry must send them to HuggingFace first. A
-customer whose weights are on a disk already has no way to say so.
+What it reads, it stages onto a ReadWriteMany volume on each matched cluster.
+A read from that volume can be slower than no cache at all. The volume ignores
+the size the user asked for on some clouds, and it fails on its own. Section
+4.2 gives the reports.
 
-**It stages what it reads onto a ReadWriteMany volume on each matched
-cluster.** A read from that volume can be slower than no cache at all. The
-volume does not take the size the user asked for on every cloud, and it can
-fail on its own. Section 4.2 gives the reports.
-
-**It publishes a phase, and a consumer calculates the name of the volume.** The
-calculation is correct for one source, and two functions hold a copy of it.
-Nothing tells a consumer whether the artifact is readable yet, so an engine
-starts before the cache is staged and reads the model a second time.
+The cache then publishes a phase, and a consumer calculates the name of the
+volume. That calculation is correct for one source, and two functions hold a
+copy of it. Nothing tells the consumer whether the artifact is readable, so an
+engine starts while the cache is still staging and reads the model a second
+time.
 
 This document makes two changes. `spec.source` gets two more values, and one of
 them removes the volume rather than filling it. Each cluster entry gets a
@@ -146,17 +145,15 @@ each cluster publishes removes the first and helps with the third.
 
 ### 5.1 Overview
 
-The design has two parts.
+`spec.source` gets two more values. `OCI` names a reference in a registry, and
+`Existing` names a claim that the customer filled. A user can then name an
+artifact where it is. An `OCI` source also takes the volume out of the path,
+with the cost and the failure mode that section 4.2 gives.
 
-1. `spec.source` gets two more values. `OCI` names a reference in a registry.
-   `Existing` names a claim that the customer filled.
-2. Each cluster entry gets a `mount` field. The field holds the volumes, the
-   volume mounts and the environment variables that a consumer adds to a pod.
-
-The first part lets a user name an artifact where it is. For an `OCI` source it
-also removes the volume from the path, with the cost and the failure mode that
-section 4.2 gives. The second part lets a consumer read the artifact without
-knowledge of the source, and tells it when it must wait.
+Each cluster entry gets a `mount` field, holding the volumes, the volume mounts
+and the environment variables that a consumer adds to a pod. The consumer reads
+the artifact without knowledge of the source, and learns from the same field
+when it must wait.
 
 ### 5.2 The source field
 
