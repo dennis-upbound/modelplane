@@ -40,6 +40,9 @@ This document uses these terms. Use each term only as this table tells.
 | stage | to copy an artifact to a volume that Modelplane makes |
 | mount | to make an artifact readable in a pod |
 | resolve | to read the manifest of a reference and find which kind of artifact it is |
+| collector | the OpenTelemetry collector that Modelplane composes onto each inference cluster |
+| cold pull | a read of the artifact onto a node that does not hold it |
+| warm pull | a read of the artifact onto a node that holds it already |
 
 ## 3. Scope
 
@@ -255,7 +258,79 @@ readable.
 tell that a cluster inside that set has not completed its staging. The contract
 tells this.
 
-## 6. Limitations
+## 6. Telemetry
+
+A `ModelCache` publishes no metric today. The surface in
+[design/telemetry.md](./telemetry.md) names one, `modelplane_replica_cache_hit`,
+and that metric reports only whether a replica used a cache.
+
+The faults in section 4.4 show the cost. The cache in
+[#494](https://github.com/modelplaneai/modelplane/issues/494) reported
+`Hydrating` for 40 minutes, and no series recorded it. The engine in
+[#495](https://github.com/modelplaneai/modelplane/issues/495) read the model
+twice, and the second read appeared in one engine log and nowhere else.
+
+### 6.1 How long a pod waits for the artifact
+
+This design says that an `OCI` source is faster than a volume. The study in
+section 4.2 gives 11.7 seconds for a warm pull and 40.7 minutes over object
+storage. Modelplane publishes no series that measures either number.
+
+Two metrics make the claim readable on a running fleet.
+
+```
+modelplane_model_pull_seconds        histogram
+modelplane_model_pull_bytes_total    counter
+```
+
+Each carries three labels beyond the identity that every Modelplane series
+has:
+
+| label | values | what it separates |
+|---|---|---|
+| `source` | `HuggingFace`, `OCI`, `Existing` | one source from another |
+| `mechanism` | `image`, `csi`, `volume` | the kubelet from the driver |
+| `cached` | `true`, `false` | a warm pull from a cold one |
+
+The `cached` label is the one that matters. A warm pull and a cold pull differ
+by two orders of magnitude, so one histogram that holds both reports a number
+that describes neither.
+
+The data exists on each node. The kubelet times an image pull, and the driver
+times a model artifact. Neither is a pod, so the collector cannot read them
+with the scrape jobs that it has: each job uses `role: pod`. A node-level
+target is new work in `compose-serving-stack`, and it is the work that makes
+this design measurable.
+
+### 6.2 What state each cache is in
+
+Four metrics report the cache itself.
+
+```
+modelplane_cache_cluster_ready       gauge, one for each cache and cluster
+modelplane_cache_ready_seconds       histogram, created until readable
+modelplane_cache_staged_bytes        gauge
+modelplane_cache_size_bytes          gauge
+```
+
+`modelplane_cache_cluster_ready` carries the phase as a label, so a cache that
+stays in one phase is visible as a series that does not change. The pair of
+byte counts gives the progress that
+[#495](https://github.com/modelplaneai/modelplane/issues/495) had to read from
+a file listing.
+
+**These four are blocked by
+[#476](https://github.com/modelplaneai/modelplane/issues/476).** Each one reads
+`status.clusters[]`, which lives on the control plane, and Modelplane composes
+a collector onto each inference cluster only. Nothing on the control plane
+collects or exports. #476 holds that work, and these metrics are part of it.
+
+The contract in section 5.4 makes them possible. Before it, the state of a
+cache on one cluster was a phase and a message. After it, each entry says
+whether the artifact is readable and why it is not, which is what a metric
+needs to report.
+
+## 7. Limitations
 
 **A cache reports what it can examine.** Resolution of the reference finds a
 repository that is not there, a credential that does not work, and an artifact
@@ -277,9 +352,9 @@ registry authentication is static configuration. The kubelet authenticates to
 ECR, Artifact Registry and ACR with the identity of the node. A fleet that
 publishes container images pays neither cost.
 
-## 7. Decisions
+## 8. Decisions
 
-### 7.1 Publish a contract, do not add a child resource
+### 8.1 Publish a contract, do not add a child resource
 
 [#210](https://github.com/modelplaneai/modelplane/issues/210) asks for a
 `ModelCacheHydration` child for each cluster, and
@@ -292,21 +367,21 @@ field for the `OCI` and `Existing` sources, and nothing more. The complaint
 under the proposal is the organization of one function. A refactor corrects
 that, and it adds no API to maintain.
 
-### 7.2 Use one `OCI` value, not one value for each kind of artifact
+### 8.2 Use one `OCI` value, not one value for each kind of artifact
 
 A user who writes a reference frequently does not know if the publisher made a
 container image or a model artifact. Modelplane resolves the reference and
 finds this. Two enum values would move that work to the user and would give a
 `Failed` entry when the user makes an incorrect choice.
 
-### 7.3 Install the driver on each cluster
+### 8.3 Install the driver on each cluster
 
 A composition function sees one cluster. It does not see the caches of the
 fleet. It cannot know in advance if a model artifact comes to this cluster. A
 DaemonSet that does no work uses few resources, where a missing DaemonSet gives
 a pod that does not start.
 
-### 7.4 Use the driver on CRI-O
+### 8.4 Use the driver on CRI-O
 
 CRI-O mounts model artifacts with no driver from v1.33. The function is behind
 the flag `--oci-artifact-mount-support`, and OpenShift disables it by default.
@@ -316,7 +391,7 @@ to test. Modelplane also provisions no OpenShift clusters. The driver
 stops being necessary everywhere on the day that containerd adds the same
 function.
 
-## 8. Subsequent work
+## 9. Subsequent work
 
 **Materialization on the node.** An init container that copies the artifact to
 the node, with a `hostPath` volume. This removes the limit that NFS puts on a
