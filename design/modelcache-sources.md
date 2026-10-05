@@ -14,13 +14,13 @@ the model calculates the name of that volume.
 Each of these three statements causes a problem.
 
 A customer who keeps models in a private registry must send the model to
-HuggingFace first. A customer who has the model on a disk has no way to tell
-Modelplane this. And the calculation of the volume name is correct for one
+HuggingFace first. If the weights are already on a disk, there is no way to
+tell Modelplane this. The calculation of the volume name is correct for one
 source only. Two functions hold a copy of it.
 
 This document adds two sources and one status field. The status field tells a
-consumer how to read the model on one cluster. The consumer does not calculate
-it.
+consumer how to read the model on one cluster, so the consumer does not
+calculate it.
 
 ## 2. Terms
 
@@ -41,7 +41,6 @@ other words are ASD-STE100 words. Use each term only as this table tells.
 | to stage | TV | to copy an artifact to a volume that Modelplane makes |
 | to mount | TV | to make an artifact readable in a pod |
 | to resolve | TV | to read the manifest of a reference and find which kind of artifact it is |
-| to fan out | TV | to do the same work on each cluster that the `clusterSelector` matches |
 
 ## 3. Scope
 
@@ -64,17 +63,31 @@ This design does not do these tasks:
 
 ### 4.1 The cache reads from one place
 
-`spec.source` has one value. It is `HuggingFace`. A customer whose models are
-in Artifact Registry or ECR must send the model to HuggingFace to use
-Modelplane. A customer whose fleet has no connection to the internet cannot
-tell Modelplane that the model is on a disk.
+`spec.source` has one value, and that value is `HuggingFace`. A customer whose
+models are in Artifact Registry or ECR must send them to HuggingFace to use
+Modelplane. A fleet with no connection to the internet has no way to say that
+the model is on a disk already.
 
 ### 4.2 The volume is a ReadWriteMany volume
 
-A gang of more than one node must read the artifact at the same time. Thus the
-volume is a ReadWriteMany volume. This selects Filestore on GKE and EFS on EKS.
+More than one node of a gang reads the artifact together. Only a ReadWriteMany
+volume permits this. The requirement selects Filestore on GKE and
+EFS on EKS.
 [modelcache.md](./modelcache.md) tells the reader that these volumes can make a
 cache slower than no cache.
+
+Three reports give the cost of that choice.
+[#204](https://github.com/modelplaneai/modelplane/issues/204) measures a slow
+load from an EFS-backed cache.
+[#414](https://github.com/modelplaneai/modelplane/issues/414) shows that
+`sizeGiB` has no effect below 1 TiB on GKE, because the managed storage class
+is Filestore Enterprise.
+[#383](https://github.com/modelplaneai/modelplane/issues/383) asks for the
+measurement that a ReadWriteMany backend must satisfy. That measurement does
+not exist.
+
+An `OCI` source has none of these properties. The kubelet reads the artifact
+from the image store of the node.
 
 ### 4.3 The cache does not tell a consumer how to read the artifact
 
@@ -106,6 +119,12 @@ cache publishes a phase for each cluster, and no function reads it.
 that stayed Pending. The cloud replaced the node that the scheduler chose. The
 volume kept the name of the node that went away. The cache never staged, and
 the status gave the reason `Hydrating` for 40 minutes.
+
+This class of fault is not new.
+[#221](https://github.com/modelplaneai/modelplane/issues/221) is the same shape
+on GKE: the cache volume never bound, because the Filestore CSI driver was not
+enabled on the cluster. Each source that stages to a volume has this failure
+mode. A source that mounts from a registry does not.
 
 **The user cannot see the cause.**
 [#498](https://github.com/modelplaneai/modelplane/issues/498) shows that the
@@ -146,8 +165,8 @@ spec:
 The kubelet does all the work that an `OCI` source needs. It pulls the
 reference when the pod starts. It mounts the filesystem read-only. It gives the
 second pod on that node the bytes that the first pod pulled. Modelplane makes
-no object for each cluster. Thus the source costs one field, not a second
-staging procedure.
+no object for each cluster. The source costs one field, not a second staging
+procedure.
 
 Use a digest. A tag is resolved again at each pod start. If a person moves the
 tag, the subsequent pod serves different weights.
@@ -191,8 +210,11 @@ pod does not learn the source.
 
 ### 5.5 What each cluster reports
 
-A cluster entry gives three answers: if the artifact is readable on this
-cluster, how to read it, and why not if it is not readable.
+A cluster entry gives these answers:
+
+- if the artifact is readable on this cluster
+- how to read it
+- why it is not readable, when it is not
 
 `InferenceCluster.status.cache` gets a boolean `imageVolumes`. It tells if the
 cluster can mount an image volume. The field follows `storageClassName`, which
@@ -253,16 +275,17 @@ thing to install and to upgrade. The project is young, and it had no commit
 after March 2026. Modelplane installs it on each cluster, because a composition
 function sees one cluster and cannot know which artifacts come to it. Its
 registry authentication is static configuration. The kubelet authenticates to
-ECR, Artifact Registry and ACR with the identity of the node. Thus a fleet that
+ECR, Artifact Registry and ACR with the identity of the node. A fleet that
 publishes container images pays neither cost.
 
 ## 7. Decisions
 
 ### 7.1 Publish a contract, do not add a child resource
 
-[#362](https://github.com/modelplaneai/modelplane/pull/362) proposes a
-`ModelCacheHydration` child. I wrote that proposal, and this document replaces
-it.
+[#210](https://github.com/modelplaneai/modelplane/issues/210) asks for a
+`ModelCacheHydration` child for each cluster, and
+[#362](https://github.com/modelplaneai/modelplane/pull/362) proposes one. I
+wrote that proposal, and this document replaces it.
 
 The contract needs one place for each cluster. The field `status.clusters[]` is
 that place, and it is there now. A child resource would compose one status
@@ -280,17 +303,19 @@ finds this. Two enum values would move that work to the user and would give a
 ### 7.3 Install the driver on each cluster
 
 A composition function sees one cluster. It does not see the caches of the
-fleet. Thus it cannot know in advance if a model artifact comes to this
-cluster. A DaemonSet that does no work uses few resources. A missing DaemonSet
-gives a pod that does not start.
+fleet. It cannot know in advance if a model artifact comes to this cluster. A
+DaemonSet that does no work uses few resources, where a missing DaemonSet gives
+a pod that does not start.
 
 ### 7.4 Use the driver on CRI-O
 
-CRI-O mounts model artifacts with no driver from v1.33. An OpenShift cluster
-could use one path for both kinds of artifact. This design does not do that.
-The second path costs one more thing for a cluster to report and one more
-branch to test. Modelplane does not provision OpenShift clusters. When
-containerd adds the same function, the driver stops being necessary anywhere.
+CRI-O mounts model artifacts with no driver from v1.33. The function is behind
+the flag `--oci-artifact-mount-support`, and OpenShift disables it by default.
+An OpenShift cluster could use one path for both kinds of artifact, but this
+design does not do that. A second path costs one more thing for a cluster to report and one more branch
+to test. Modelplane also provisions no OpenShift clusters. The driver
+stops being necessary everywhere on the day that containerd adds the same
+function.
 
 ## 8. Subsequent work
 
