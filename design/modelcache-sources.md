@@ -24,23 +24,22 @@ calculate it.
 
 ## 2. Terms
 
-This document uses these technical nouns (TN) and technical verbs (TV). All
-other words are ASD-STE100 words. Use each term only as this table tells.
+This document uses these terms. Use each term only as this table tells.
 
-| term | type | meaning in this document |
-|---|---|---|
-| artifact | TN | the bytes of one model, in a registry or on a volume |
-| cache | TN | one `ModelCache` object |
-| source | TN | the value of `spec.source`: `HuggingFace`, `OCI` or `Existing` |
-| consumer | TN | a function that adds the artifact to a pod, today `compose-model-replica` |
-| cluster entry | TN | one item of `status.clusters[]`, for one inference cluster |
-| mount contract | TN | the `mount` field of a cluster entry |
-| image volume | TN | a volume that the kubelet makes from a container image |
-| model artifact | TN | an OCI artifact that obeys the [model spec](https://modelpack.org/) |
-| driver | TN | the [model CSI driver](https://github.com/modelpack/model-csi-driver) |
-| to stage | TV | to copy an artifact to a volume that Modelplane makes |
-| to mount | TV | to make an artifact readable in a pod |
-| to resolve | TV | to read the manifest of a reference and find which kind of artifact it is |
+| term | meaning in this document |
+|---|---|
+| artifact | the bytes of one model, in a registry or on a volume |
+| cache | one `ModelCache` object |
+| source | the value of `spec.source`: `HuggingFace`, `OCI` or `Existing` |
+| consumer | a function that adds the artifact to a pod, today `compose-model-replica` |
+| cluster entry | one item of `status.clusters[]`, for one inference cluster |
+| mount contract | the `mount` field of a cluster entry |
+| image volume | a volume that the kubelet makes from a container image |
+| model artifact | an OCI artifact that obeys the [model spec](https://modelpack.org/) |
+| driver | the [model CSI driver](https://github.com/modelpack/model-csi-driver) |
+| stage | to copy an artifact to a volume that Modelplane makes |
+| mount | to make an artifact readable in a pod |
+| resolve | to read the manifest of a reference and find which kind of artifact it is |
 
 ## 3. Scope
 
