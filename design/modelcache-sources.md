@@ -352,6 +352,19 @@ registry authentication is static configuration. The kubelet authenticates to
 ECR, Artifact Registry and ACR with the identity of the node. A fleet that
 publishes container images pays neither cost.
 
+**The driver must outlive the pods that mount through it.** A CSI driver is
+necessary to unmount a volume, not only to mount one. If the driver goes while
+a pod still holds a model artifact, that pod cannot release the volume and
+stays in Terminating.
+
+[#499](https://github.com/modelplaneai/modelplane/issues/499) is this fault
+with a different driver. Deleting an `InferenceCluster` removed the NVIDIA DRA
+driver before the engine pods finished, so the pods could not release their
+GPUs. The cluster stayed in Deleting for 35 minutes with an idle 8-GPU node.
+Modelplane composes no ordering between the serving stack and the workloads of
+a `ModelReplica`, so this design adds a second component with the same
+exposure. The correction belongs to #499, and this design does not add one.
+
 ## 8. Decisions
 
 ### 8.1 Publish a contract, do not add a child resource
