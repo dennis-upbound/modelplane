@@ -211,9 +211,9 @@ mount:
   env: []            # corev1.EnvVar: name, value
 ```
 
-The consumer copies these three lists into the pod. It does not read them. The
-function that knows the source writes the contract. The function that makes the
-pod does not learn the source.
+The consumer copies these three lists into the pod. It does not learn the source
+from them. The function that knows the source writes the contract. The function
+that makes the pod does not learn the source.
 
 ### 5.5 What each cluster reports
 
@@ -277,8 +277,9 @@ twice, and the second read appeared in one engine log and nowhere else.
 
 ### 6.1 How long a pod waits for the artifact
 
-This design says that an `OCI` source is faster than a volume. The study in
-section 4.2 gives 11.7 seconds for a warm pull and 40.7 minutes over object
+This design says that an `OCI` source is faster than a volume. A study of OCI
+model delivery ([arXiv:2607.16596](https://arxiv.org/abs/2607.16596)) gives 11.7
+seconds for a warm pull and 40.7 minutes for a re-download over object
 storage. Modelplane publishes no series that measures either number.
 
 Two metrics make the claim readable on a running fleet.
@@ -404,7 +405,8 @@ a pod that does not start.
 CRI-O mounts model artifacts with no driver from v1.33. The function is behind
 the flag `--oci-artifact-mount-support`, and OpenShift disables it by default.
 An OpenShift cluster could use one path for both kinds of artifact, but this
-design does not do that. A second path costs one more thing for a cluster to report and one more branch
+design does not do that. A second path costs one more thing for a cluster to
+report and one more branch
 to test. Modelplane also provisions no OpenShift clusters. The driver
 stops being necessary everywhere on the day that containerd adds the same
 function.
