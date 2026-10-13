@@ -148,6 +148,31 @@ spec:
                               Unified serves prefill and decode on one engine.
                               PrefillDecode splits them across two engines, each marking
                               its phase as Prefill or Decode.
+                          endpointPicker:
+                            type: object
+                            description: >-
+                              The endpoint picker that routes requests to the engines,
+                              under either mode. Omitted means Modelplane's picker with its
+                              default configuration for the mode. Modelplane composes the
+                              picker's pool, Service and RBAC around it.
+                            x-kubernetes-validations:
+                            - rule: "!has(self.config) || has(self.image)"
+                              message: "image is required when config is set, because a picker configuration is written for one picker release"
+                            properties:
+                              image:
+                                type: string
+                                minLength: 1
+                                description: >-
+                                  The endpoint picker image. Omitted means the image this
+                                  Modelplane release uses.
+                              config:
+                                type: object
+                                x-kubernetes-preserve-unknown-fields: true
+                                description: >-
+                                  The picker's configuration, such as an llm-d
+                                  EndpointPickerConfig, passed to the picker without
+                                  Modelplane reading it. It replaces Modelplane's default
+                                  configuration whole.
                       tolerations:
                         type: array
                         description: >-
@@ -453,16 +478,22 @@ spec:
                                           containers:
                                             type: array
                                             minItems: 1
-                                            maxItems: 1
+                                            maxItems: 8
                                             description: >-
-                                              Containers for the engine pod. v0.1 supports
-                                              a single container, which must be named
-                                              "engine" (the inference engine). Sidecar /
-                                              multi-container support is tracked
-                                              separately.
+                                              Containers for the engine pod. Exactly one is named "engine",
+                                              the inference engine. The others run beside it, such as a
+                                              routing sidecar. Modelplane adds device claims, MODELPLANE_
+                                              environment, ModelCache mounts, /dev/shm and the readiness
+                                              probe to the engine container only.
                                             x-kubernetes-validations:
                                             - rule: "self.exists_one(c, c.name == 'engine')"
-                                              message: "the single container must be named 'engine'"
+                                              message: "exactly one container must be named 'engine'"
+                                            - rule: "self.all(c, self.exists_one(d, d.name == c.name))"
+                                              message: "container names must be unique"
+                                            - rule: "self.all(c, c.name == 'engine' || !has(c.ports) || c.ports.all(p, !has(p.name) || p.name != 'http'))"
+                                              message: "only the engine container may declare a port named 'http'"
+                                            - rule: "size(self) == 1 || self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http'))"
+                                              message: "the engine container must declare its 'http' port when the pod has more than one container"
                                             items:
                                               type: object
                                               required: [name, image]
@@ -567,6 +598,27 @@ spec:
                                                                 type: string
                                                               apiVersion:
                                                                 type: string
+                                                ports:
+                                                  type: array
+                                                  maxItems: 8
+                                                  description: >-
+                                                    Ports the container listens on. The engine container's
+                                                    port named "http" is where Modelplane probes the engine
+                                                    and scrapes its metrics. Without one, the engine serves
+                                                    on 8000. Only the engine container may name a port
+                                                    "http".
+                                                  items:
+                                                    type: object
+                                                    required: [containerPort]
+                                                    properties:
+                                                      name:
+                                                        type: string
+                                                        minLength: 1
+                                                        maxLength: 15
+                                                      containerPort:
+                                                        type: integer
+                                                        minimum: 1
+                                                        maximum: 65535
                                           imagePullSecrets:
                                             type: array
                                             description: >-
