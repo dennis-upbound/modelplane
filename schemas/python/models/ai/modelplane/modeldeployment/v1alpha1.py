@@ -141,7 +141,7 @@ class Container(BaseModel):
     """
     Container image.
     """
-    name: constr(min_length=1)
+    name: constr(min_length=1, max_length=63)
     """
     Container name. The container named "engine" is the inference engine.
     """

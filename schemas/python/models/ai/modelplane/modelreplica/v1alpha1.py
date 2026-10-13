@@ -111,7 +111,7 @@ class Container(BaseModel):
     command: list[str] | None = None
     env: list[EnvItem] | None = None
     image: constr(min_length=1)
-    name: constr(min_length=1)
+    name: constr(min_length=1, max_length=63)
     ports: list[Port] | None = Field(None, max_length=8)
 
 

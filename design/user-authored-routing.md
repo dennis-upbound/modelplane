@@ -152,21 +152,31 @@ isn't Ready.
 I propose we adopt #108. A member's template can list containers beside
 `engine`:
 
-- Exactly one container is named `engine`.
+- Exactly one container is named `engine`, and container names are unique.
+- A container beside `engine` takes the same fields as `engine`: `image`,
+  `command`, `args`, `env`, and `ports`.
 - Modelplane changes only `engine`. It adds device claims, `MODELPLANE_`
   environment, ModelCache mounts, `/dev/shm`, and the readiness probe.
-- A container can declare `ports`. Only `engine` can declare a port called
-  `http`. Modelplane probes this port, and the collector scrapes engine metrics
-  from it.
-- If a pod has more than one container, `engine` must declare its `http` port.
 - Each member has its own template. The user chooses which pods of a gang get a
   container.
 
-Port 8000 in a serving pod receives requests, as today. In a decode pod, the
-sidecar listens on 8000.
+Port 8000 in a serving pod receives requests, as today. The engine's `http` port
+is where Modelplane probes the engine and the collector scrapes its metrics:
 
-Modelplane doesn't inject the sidecar or `VLLM_NIXL_SIDE_CHANNEL_HOST`. A decode
-pod without a sidecar serves every request without prefill.
+- Only `engine` can declare a port called `http`.
+- If the engine is the only container, it serves on 8000, so its `http` port is
+  8000.
+- If the pod has more than one container, `engine` must declare its `http` port.
+  Another container can then take 8000.
+- Only serving pods get the probe and the `http` port. A gang's workers serve no
+  requests.
+
+Only `engine` gets a readiness probe. The pod's readiness follows the engine.
+
+In a `PrefillDecode` decode pod, the sidecar is the container on 8000.
+Modelplane doesn't inject the sidecar or `VLLM_NIXL_SIDE_CHANNEL_HOST`. With the
+llm-d router, a decode pod without the sidecar serves every request without
+prefill.
 
 Other per-pod helpers can use the same mechanism. #500 needs a session-affine
 proxy, such as `sglang-router`, in front of an engine whose data-parallel ranks
@@ -358,6 +368,11 @@ template:
 The Kimi-K2 recipe changes to this form.
 
 ## Future improvements
+
+**More container fields.** A container beside the engine takes the same fields
+as the engine. A namespace whose LimitRange or quota requires resource limits
+needs `resources` on every container. The API can add `resources` to all
+containers at once.
 
 **Shared picker configurations.** Deployments that use the same engine repeat
 the same picker configuration. If recipes show this, a cluster-scoped resource
