@@ -1,429 +1,362 @@
 # ModelCache sources and the mount contract
 
-**Status:** draft
-**Date:** 2026-10-05
+**Status:** Draft
+**Date:** October 2026
 **Author:** Dennis Ramdass
-**Supersedes:** [#362](https://github.com/modelplaneai/modelplane/pull/362)
+**Issues:** [#512](https://github.com/modelplaneai/modelplane/issues/512), [#495](https://github.com/modelplaneai/modelplane/issues/495), [#210](https://github.com/modelplaneai/modelplane/issues/210)
 
-## 1. Introduction
+## Summary
 
-A `ModelCache` reads from HuggingFace and nowhere else. A customer whose models
-are in Artifact Registry or ECR must send them to HuggingFace first. A customer
-whose weights are on a disk already has no way to say so.
+A `ModelCache` reads only from HuggingFace, and it stages what it reads onto a
+ReadWriteMany volume on each cluster. That volume can be slower than no cache,
+and it can fail on its own. A consumer works out the volume's name itself, and
+it doesn't wait for the cache. An engine can start before the weights are
+there, and download them a second time.
 
-What it reads, it stages onto a ReadWriteMany volume on each matched cluster.
-A read from that volume can be slower than no cache at all. The volume ignores
-the size the user asked for on some clouds, and it fails on its own. Section
-4.2 gives the reports.
+I propose two changes:
 
-The cache then publishes a phase, and a consumer calculates the name of the
-volume. That calculation is correct for one source, and two functions hold a
-copy of it. An engine can start while the cache is still staging, because the
-cache does not report whether the artifact is readable. The engine then reads
-the model a second time.
+- `spec.source` gets two values. `OCI` reads the model from a registry with no
+  volume. `Existing` mounts a claim the user already filled.
+- Each cluster entry in `status.clusters[]` gets a `mount` field. It says how to
+  read the model on that cluster. A consumer copies it into the pod, and waits
+  until it's there.
 
-This document makes two changes. `spec.source` gets two more values, and one of
-them removes the volume rather than filling it. Each cluster entry gets a
-`mount` field that says how to read the artifact there. A consumer copies that
-answer instead of calculating one. Where there is no answer to copy, it waits.
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelCache
+metadata:
+  name: qwen3-8b
+  namespace: ml-team
+spec:
+  source: OCI
+  oci:
+    ref: us-docker.pkg.dev/ml-team/models/qwen3-8b@sha256:<digest>
+```
 
-## 2. Terms
+## Background
 
-This document uses these terms. Use each term only as this table tells.
+### One source
 
-| term | meaning in this document |
+`spec.source` has one value, `HuggingFace`. This forces two kinds of user to
+work around Modelplane:
+
+- A user whose models are in a registry, like Artifact Registry or ECR, must
+  copy them to HuggingFace first.
+- A user whose weights are already on a volume can't say so. A fleet with no
+  internet connection has no other option.
+
+### The ReadWriteMany volume
+
+Every pod of a multi-node gang reads the same weights, so the volume must be
+ReadWriteMany. On GKE that's Filestore, and on EKS it's EFS. These reports show
+the cost:
+
+| Issue | What it shows |
 |---|---|
-| artifact | the bytes of one model, in a registry or on a volume |
-| cache | one `ModelCache` object |
-| source | the value of `spec.source`: `HuggingFace`, `OCI` or `Existing` |
-| consumer | a function that adds the artifact to a pod, today `compose-model-replica` |
-| cluster entry | one item of `status.clusters[]`, for one inference cluster |
-| mount contract | the `mount` field of a cluster entry |
-| image volume | a volume that the kubelet makes from a container image |
-| model artifact | an OCI artifact that obeys the [model spec](https://modelpack.org/) |
-| driver | the [model CSI driver](https://github.com/modelpack/model-csi-driver) |
-| stage | to copy an artifact to a volume that Modelplane makes |
-| mount | to make an artifact readable in a pod |
-| resolve | to read the manifest of a reference and find which kind of artifact it is |
-| collector | the OpenTelemetry collector that Modelplane composes onto each inference cluster |
-| cold pull | a read of the artifact onto a node that does not have it |
-| warm pull | a read of the artifact onto a node that has it already |
+| [#204](https://github.com/modelplaneai/modelplane/issues/204) | A slow load from an EFS-backed cache. |
+| [#414](https://github.com/modelplaneai/modelplane/issues/414) | `sizeGiB` has no effect below 1 TiB on GKE, because the storage class is Filestore Enterprise. |
+| [#383](https://github.com/modelplaneai/modelplane/issues/383) | No measurement says what a ReadWriteMany backend must deliver. |
+| [#494](https://github.com/modelplaneai/modelplane/issues/494) | A volume was Pending after the cloud replaced its node. The cache said `Hydrating` for 40 minutes. |
+| [#221](https://github.com/modelplaneai/modelplane/issues/221) | A volume never bound, because the cluster didn't enable the Filestore CSI driver. |
 
-## 3. Scope
+An `OCI` source has none of these problems. The kubelet reads the model from the
+node's image store.
 
-This design must do these four tasks:
+### Consumers
 
-1. Read an artifact from an OCI registry, with no copy to a volume first.
-2. Mount a volume that the customer filled.
-3. Tell each consumer how to read the artifact on its own cluster.
-4. Tell the user why a cluster cannot read the artifact.
+A cluster entry has a `phase` and a `message`, but not the volume's name.
+`compose-model-replica` computes the name in `cache_pvc_name`, and
+`compose-model-cache` keeps a second copy of the same code. The name is only
+right for a `HuggingFace` source.
 
-This design does not do these tasks:
+The consumer also doesn't check whether the model is readable.
+`compose-model-deployment` checks that a cluster has a storage class, not that
+the cache staged onto it. This causes these faults:
 
-- It does not identify a cache by the digest of the artifact. The name stays the
-  name that the user wrote.
-- It does not find two caches that contain the same weights.
-- It does not make a model catalog.
-- It does not copy an artifact from one cluster to a different cluster.
+- [#495](https://github.com/modelplaneai/modelplane/issues/495): an engine
+  started while its 464 GB cache was staging. It downloaded the model again, in
+  parallel.
+- [#498](https://github.com/modelplaneai/modelplane/issues/498): a deployment's
+  status doesn't say why a model doesn't serve. The faults above each needed a
+  person with access to the workload cluster.
 
-## 4. Background
+## Goals
 
-### 4.1 The cache reads from one place
+**Read the model where it is.** A user can serve a model from an OCI registry or
+from a volume they filled.
 
-`spec.source` has one value, and that value is `HuggingFace`. A customer whose
-models are in Artifact Registry or ECR must send them to HuggingFace to use
-Modelplane. A fleet with no connection to the internet has no way to say that
-the model is on a disk already.
+**Don't stage what a node can pull.** An `OCI` source doesn't use a Modelplane
+volume.
 
-### 4.2 The volume is a ReadWriteMany volume
+**Give each cluster one answer.** A cluster entry says how to read the model
+there, and the consumer copies that answer instead of computing it.
 
-More than one node of a gang reads the artifact together. Only a ReadWriteMany
-volume permits this. The requirement selects Filestore on GKE and
-EFS on EKS.
-[modelcache.md](./modelcache.md) tells the reader that these volumes can make a
-cache slower than no cache.
+**Wait for the model.** An engine doesn't start before its model is readable.
 
-These reports give the cost of that choice.
-[#204](https://github.com/modelplaneai/modelplane/issues/204) measures a slow
-load from an EFS-backed cache.
-[#414](https://github.com/modelplaneai/modelplane/issues/414) shows that
-`sizeGiB` has no effect below 1 TiB on GKE, because the managed storage class
-is Filestore Enterprise.
-[#383](https://github.com/modelplaneai/modelplane/issues/383) asks for the
-measurement that a ReadWriteMany backend must satisfy. That measurement does
-not exist.
+**Say why a cluster can't read the model.** The cluster entry gives the reason.
 
-An `OCI` source has none of these properties. The kubelet reads the artifact
-from the image store of the node.
+This design doesn't cover:
 
-### 4.3 The cache does not tell a consumer how to read the artifact
+- Identifying a cache by the model's digest. The cache's name stays the name the
+  user wrote.
+- Finding two caches with the same model.
+- Copying a model from one cluster to another.
 
-A cluster entry has `phase` and `message`. It does not have the name of the
-volume. The consumer calculates the name in `cache_pvc_name`. The function
-`compose-model-cache` keeps a second copy of the same calculation. A comment
-tells the reader to change both.
+## Proposal
 
-This calculation is correct for a `HuggingFace` source. It is correct for no
-other source.
-
-### 4.4 Faults that the current design permits
-
-Reports from benchmark work show the effect.
-
-**The engine does not wait for the artifact.**
-[#495](https://github.com/modelplaneai/modelplane/issues/495) shows an engine
-that started while the cache was still staging. The engine downloaded the same
-model again, in parallel with the staging. Both downloads of the 464 GB model
-completed in the same second.
-
-The code does not stop this. The function `compose-model-deployment` reads
-`status.cache.storageClassName` from the cluster. This value tells that the
-cluster has storage. It does not tell that the artifact is on the storage. The
-cache publishes a phase for each cluster, and no function reads it.
-
-**A volume can stop the cache.**
-[#494](https://github.com/modelplaneai/modelplane/issues/494) shows a volume
-that stayed Pending. The cloud replaced the node that the scheduler chose. The
-volume kept the name of the node that the cloud removed. The cache never staged, and
-the status gave the reason `Hydrating` for 40 minutes.
-
-This class of fault is not new.
-[#221](https://github.com/modelplaneai/modelplane/issues/221) is the same shape
-on GKE: the cache volume never bound, because the Filestore CSI driver was not
-enabled on the cluster. Each source that stages to a volume has this failure
-mode. A source that mounts from a registry does not.
-
-**The user cannot see the cause.**
-[#498](https://github.com/modelplaneai/modelplane/issues/498) shows that the
-status of a deployment does not tell why a model does not serve. Both faults
-above needed a person with access to the workload cluster.
-
-A source that does not use a volume removes the second fault. A contract that
-each cluster publishes removes the first and helps with the third.
-
-## 5. Design
-
-### 5.1 Overview
-
-`spec.source` gets two more values. `OCI` gives a reference in a registry, and
-`Existing` gives a claim that the customer filled. A user can then point
-Modelplane at an artifact where it is. An `OCI` source also takes the volume out of the path,
-with the cost and the failure mode that section 4.2 gives.
-
-Each cluster entry gets a `mount` field, holding the volumes, the volume mounts
-and the environment variables that a consumer adds to a pod. The consumer reads
-the artifact without knowledge of the source, and learns from the same field
-when it must wait.
-
-### 5.2 The source field
+### Sources
 
 ```yaml
 spec:
-  source:                    # enum: HuggingFace, OCI, Existing
-  huggingFace: {}            # no change
+  source: OCI          # HuggingFace, OCI, or Existing
+  huggingFace: {}      # unchanged
   oci:
-    ref:                     # a tag or a digest
-    subPath:                 # the directory that holds the weights
+    ref: ""            # a tag or a digest
+    subPath: ""        # the directory that holds the weights
   existing:
-    claimName:               # a claim that is bound on each matched cluster
-    subPath:
+    claimName: ""      # a claim bound on each matched cluster
+    subPath: ""
 ```
 
-The kubelet does all the work that an `OCI` source needs. It pulls the
-reference when the pod starts. It mounts the filesystem read-only. It gives the
-second pod on that node the bytes that the first pod pulled. Modelplane makes
-no object for each cluster. The source costs one field, not a second staging
-procedure.
-
-Use a digest. A tag is resolved again at each pod start. If a person moves the
-tag, the subsequent pod serves different weights.
-
-An `OCI` source does not put a credential on the cache. The pod of the engine spends
-the credential, and that pod already takes `imagePullSecrets`. A `HuggingFace`
-source is different: a Job that Modelplane makes spends that token, and there
-is no pod of the user to hold it.
-
-The field `sizeGiB` applies to `HuggingFace` only. That source is the only
-source that puts bytes on a volume that Modelplane makes.
-
-### 5.3 Cluster requirements for each source
-
-| source | what the user names | what mounts it | what the cluster needs |
+| Source | The user gives | What mounts it | What the cluster needs |
 |---|---|---|---|
-| `HuggingFace` | a repository ID | a volume that Modelplane stages | a ReadWriteMany storage class |
-| `OCI` | a container image that holds the weights | the kubelet, as an image volume | Kubernetes 1.36 |
-| `OCI` | a model artifact | the driver | Kubernetes 1.25 |
-| `Existing` | a claim that the user filled | the kubelet, as a claim | the claim bound on the cluster |
+| `HuggingFace` | A repository ID | A volume that Modelplane stages | A ReadWriteMany storage class |
+| `OCI` | A container image that holds the weights | The kubelet, as an image volume | Kubernetes 1.36 |
+| `OCI` | A [model artifact](https://modelpack.org/) | The [model CSI driver](https://github.com/modelpack/model-csi-driver) | Kubernetes 1.25 |
+| `Existing` | A claim the user filled | The kubelet, as a claim | The claim, bound on the cluster |
 
-Modelplane resolves the reference and finds which kind of artifact it has. The
-user names a tag and does no more. An artifact of a third kind gives a `Failed`
-cluster entry with the content of the manifest in the message.
+For an `OCI` source:
 
-### 5.4 The mount contract
+- Modelplane reads the reference's manifest to find which kind of artifact it
+  is. The user doesn't say. Any other kind of artifact fails the cluster entry,
+  and the message gives the manifest's media type.
+- The kubelet pulls the reference when the pod starts, and shares the pulled
+  bytes with later pods on the node. Modelplane composes nothing on the cluster
+  for the cache.
+- The user should use a digest. The kubelet resolves a tag at each pod start, so
+  a moved tag serves different weights.
+- The cache has no credential. The engine pod pulls the artifact, and it already
+  takes `imagePullSecrets`.
 
-Each cluster entry gets this field. Each part is a subset of the Kubernetes
-type of the same name.
+`sizeGiB` applies only to `HuggingFace`, the one source that stages onto a
+Modelplane volume.
+
+### The mount contract
+
+Each cluster entry gets a `mount` field. Each list is a subset of the
+Kubernetes type with the same name:
 
 ```yaml
 mount:
-  volumes: []        # corev1.Volume: persistentVolumeClaim, image or csi
+  volumes: []        # corev1.Volume: persistentVolumeClaim, image, or csi
   volumeMounts: []   # corev1.VolumeMount: name, mountPath, subPath, readOnly
   env: []            # corev1.EnvVar: name, value
 ```
 
-The consumer copies these three lists into the pod. It does not learn the source
-from them. The function that knows the source writes the contract. The function
-that makes the pod does not learn the source.
+`compose-model-cache` knows the source, so it writes the contract.
+`compose-model-replica` builds the pod, and it doesn't need to know the source.
+It follows these rules:
 
-### 5.5 Status for each cluster
+- It finds the entry for its own cluster.
+- It adds `env` before the user's environment. A user's variable with the same
+  name then takes effect. It adds `volumes` and `volumeMounts` as they are.
+- If a mount is read-only, it adds an `emptyDir` with a size limit and points
+  `HOME` at it. Engines write tokenizer, compile, and lock files next to the
+  weights. Without a size limit, a large compile cache can get the pod evicted.
+- If the cluster has no entry, or the entry has no `mount`, it sets a condition
+  and composes no workload. This fixes #495.
 
-A cluster entry gives these answers:
+### Cluster status
 
-- if the artifact is readable on this cluster
-- how to read it
-- why it is not readable, when it is not
+`InferenceCluster.status.cache` gets an `imageVolumes` boolean, next to
+`storageClassName`. It says whether the cluster can mount an image volume.
 
-`InferenceCluster.status.cache` gets a boolean `imageVolumes`. It tells if the
-cluster can mount an image volume. The field follows `storageClassName`, which
-is in the same status for the same reason.
+It only matters for container images. A model artifact uses the CSI driver on
+any version. A container image on a cluster below 1.36 fails the cluster entry,
+and the message gives the version. Clouds disagree on the version Modelplane
+provisions today:
 
-The boolean gates one kind of artifact, not the source. A model artifact uses
-the driver, and the version of Kubernetes does not change this. A container
-image on a cluster below 1.36 gives a `Failed` entry that gives the version.
+| Cloud | Kubernetes version |
+|---|---|
+| EKS, Vultr | 1.36 |
+| GKE (Regular channel) | 1.35 |
+| AKS, Nebius | 1.34 |
 
-The version check is necessary because the clouds do not agree. Modelplane
-defaults to 1.36 for EKS and Vultr. The Regular channel of GKE gives 1.35. AKS
-and Nebius give 1.34.
+Each cluster entry comes from that cluster's own observed resources. A failed
+cluster doesn't change another cluster's entry.
 
-One cluster that fails does not change a different cluster. Each entry comes
-from the observed resources of its own cluster.
+### Metrics
 
-### 5.6 The contract for a consumer
+A `ModelCache` doesn't publish metrics today. In #494 the cache said `Hydrating`
+for 40 minutes, and no series recorded it. In #495 the second download showed
+up in one engine log and nowhere else.
 
-The consumer finds the entry for its own cluster. It puts the `env` list first
-and adds the two other lists. The `env` list is first because `native.py` puts
-the entries of Modelplane first. This order lets a variable of the user be the
-last word.
-
-The consumer acts on one field rather than copies it. Where a volume mount is
-read-only, the consumer adds an `emptyDir` and points `HOME` at it. Engines
-write tokenizer files, compile files and lock files beside the weights. `HOME`
-sends these files to the `emptyDir`. The `emptyDir` has a size limit, because a
-compile cache can be some gigabytes, and a volume with no limit removes the
-pod.
-
-**The consumer stops when the entry is not ready.** This is the correction for
-[#495](https://github.com/modelplaneai/modelplane/issues/495). If the cluster
-has no entry, or the entry has no `mount`, the consumer writes a condition and
-composes no workload. The engine does not start before the artifact is
-readable.
-
-[#186](https://github.com/modelplaneai/modelplane/issues/186) made
-`compose-model-deployment` intersect the two cluster selectors. Labels cannot
-tell that a cluster inside that set has not completed its staging. The contract
-tells this.
-
-## 6. Telemetry
-
-A `ModelCache` does not publish a metric today. The metric list in
-[design/telemetry.md](./telemetry.md) names one, `modelplane_replica_cache_hit`,
-and that metric reports only whether a replica used a cache.
-
-The faults in section 4.4 show the cost. The cache in
-[#494](https://github.com/modelplaneai/modelplane/issues/494) reported
-`Hydrating` for 40 minutes, and no series recorded it. The engine in
-[#495](https://github.com/modelplaneai/modelplane/issues/495) read the model
-twice, and the second read appeared in one engine log and nowhere else.
-
-### 6.1 How long a pod waits for the artifact
-
-This design says that an `OCI` source is faster than a volume. A study of OCI
-model delivery ([arXiv:2607.16596](https://arxiv.org/abs/2607.16596)) gives 11.7
-seconds for a warm pull and 40.7 minutes for a re-download over object
-storage. Modelplane does not publish a series that measures either number.
-
-These metrics make the claim readable on a running fleet.
+**Pull time.** A [study of OCI model
+delivery](https://arxiv.org/abs/2607.16596) measured 11.7 seconds for a warm
+pull and 40.7 minutes for a re-download from object storage. These metrics
+measure the same thing on a running fleet:
 
 ```
 modelplane_model_pull_seconds        histogram
 modelplane_model_pull_bytes_total    counter
 ```
 
-Each has these labels beyond the identity that every Modelplane series
-has:
-
-| label | values | what it separates |
+| Label | Values | What it separates |
 |---|---|---|
-| `source` | `HuggingFace`, `OCI`, `Existing` | one source from another |
-| `mechanism` | `image`, `csi`, `volume` | the kubelet from the driver |
-| `cached` | `true`, `false` | a warm pull from a cold one |
+| `source` | `HuggingFace`, `OCI`, `Existing` | One source from another |
+| `mechanism` | `image`, `csi`, `volume` | The kubelet from the CSI driver |
+| `cached` | `true`, `false` | A warm pull from a cold one |
 
-The `cached` label is the one that matters. A warm pull and a cold pull differ
-by two orders of magnitude, so one histogram that contains both gives a number
-that describes neither.
+`cached` matters most. A warm and a cold pull differ by two orders of
+magnitude, so one histogram that mixes them describes neither.
 
-The data exists on each node. The kubelet times an image pull, and the driver
-times a model artifact. Neither is a pod, so the collector cannot read them
-with the scrape jobs that it has: each job uses `role: pod`. A node-level
-target is new work in `compose-serving-stack`, and it is the work that makes
-this design measurable.
+The kubelet measures how long an image pull takes, and the CSI driver measures
+an artifact pull. Neither
+is a pod, and every scrape job in the collector uses `role: pod`. These metrics
+need a node-level scrape target in `compose-serving-stack`.
 
-### 6.2 What state each cache is in
-
-These metrics report the cache itself.
+**Cache state.** These metrics report each cache:
 
 ```
 modelplane_cache_cluster_ready       gauge, one for each cache and cluster
-modelplane_cache_ready_seconds       histogram, created until readable
+modelplane_cache_ready_seconds       histogram, from creation until readable
 modelplane_cache_staged_bytes        gauge
 modelplane_cache_size_bytes          gauge
 ```
 
-`modelplane_cache_cluster_ready` has the phase as a label, so a cache that
-stays in one phase is visible as a series that does not change. The pair of
-byte counts gives the progress that
-[#495](https://github.com/modelplaneai/modelplane/issues/495) had to read from
-a file listing.
+`modelplane_cache_cluster_ready` has the phase as a label, so a cache stuck in
+one phase shows up as a flat series. The staged and total byte gauges give the
+staging progress that #495 had to read from a file listing.
 
-**These four are blocked by
-[#476](https://github.com/modelplaneai/modelplane/issues/476).** Each one reads
-`status.clusters[]`, which lives on the control plane, and Modelplane composes
-a collector onto each inference cluster only. Nothing on the control plane
-collects or exports. #476 holds that work, and these metrics are part of it.
+They read `status.clusters[]`, which is on the control plane. Modelplane
+composes collectors only on inference clusters, so these metrics wait on #476.
 
-The contract in section 5.4 makes them possible. Before it, the state of a
-cache on one cluster was a phase and a message. After it, each entry says
-whether the artifact is readable and why it is not, which is what a metric
-needs to report.
+### Examples
 
-## 7. Limitations
+#### OCI
 
-**A cache reports what it can examine.** Resolution of the reference finds a
-repository that is not there, a credential that does not work, and an artifact
-of an unknown kind. Resolution does not find that the artifact holds a
-different model. It does not find that an `Existing` volume is not complete.
-Both of these give a Ready entry and fail when the engine starts.
+The `qwen3-8b` cache from the summary gives this cluster entry on a 1.36
+cluster:
 
-**An `OCI` mount uses the disk of the node.** The driver keeps artifacts under
-`/var/lib/model-csi`. An image volume goes to the image store, where the
-eviction limits of `imagefs` apply to it. The field `sizeGiB` does not control
-either one. A model larger than the disk of the node fails at pod start. Make
-the disk of the pool large enough for the largest model.
+```yaml
+status:
+  clusters:
+  - name: gke-us-central1
+    phase: Ready
+    mount:
+      volumes:
+      - name: model-cache
+        image:
+          reference: us-docker.pkg.dev/ml-team/models/qwen3-8b@sha256:<digest>
+          pullPolicy: IfNotPresent
+      volumeMounts:
+      - name: model-cache
+        mountPath: /mnt/models
+        readOnly: true
+      env: []
+```
 
-**The driver is one more component.** A DaemonSet in the path of a pull is a
-thing to install and to upgrade. The project is young, and it had no commit
-after March 2026. Modelplane installs it on each cluster, because a composition
-function sees one cluster and cannot know which artifacts come to it. Its
-registry authentication is static configuration. The kubelet authenticates to
-ECR, Artifact Registry and ACR with the identity of the node. A fleet that
-publishes container images pays neither cost.
+The mount is read-only. The consumer also adds an `emptyDir` for `HOME`.
 
-**The driver must run as long as the pods that mount through it.** A CSI driver is
-necessary to unmount a volume, not only to mount one. If the driver goes while
-a pod still has a model artifact mounted, that pod cannot release the volume
-and stays in the `Terminating` state.
+#### Existing
 
-[#499](https://github.com/modelplaneai/modelplane/issues/499) is this fault
-with a different driver. Deleting an `InferenceCluster` removed the NVIDIA DRA
-driver before the engine pods finished, so the pods could not release their
-GPUs. The cluster stayed in Deleting for 35 minutes with an idle 8-GPU node.
-Modelplane composes no ordering between the serving stack and the workloads of
-a `ModelReplica`, so this design adds a second component with the same
-exposure. The correction belongs to #499, and this design does not add one.
+```yaml
+apiVersion: modelplane.ai/v1alpha1
+kind: ModelCache
+metadata:
+  name: kimi-k2
+  namespace: ml-team
+spec:
+  source: Existing
+  existing:
+    claimName: kimi-k2-weights
+    subPath: Kimi-K2-Instruct
+```
 
-## 8. Decisions
+```yaml
+status:
+  clusters:
+  - name: nebius-eu-north1
+    phase: Ready
+    mount:
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: kimi-k2-weights
+      volumeMounts:
+      - name: model-cache
+        mountPath: /mnt/models
+        subPath: Kimi-K2-Instruct
+      env: []
+  - name: gke-us-central1
+    phase: Failed
+    message: persistentvolumeclaim "kimi-k2-weights" not found
+```
 
-### 8.1 Publish a contract, do not add a child resource
+The second cluster has no `mount`, so no replica of a deployment that uses this
+cache starts there.
 
-[#210](https://github.com/modelplaneai/modelplane/issues/210) asks for a
-`ModelCacheHydration` child for each cluster, and
-[#362](https://github.com/modelplaneai/modelplane/pull/362) proposes one. I
-wrote that proposal, and this document replaces it.
+### Limits
 
-The contract needs one place for each cluster. The field `status.clusters[]` is
-that place, and it is there now. A child resource would compose one status
-field for the `OCI` and `Existing` sources, and no other field. The complaint
-under the proposal is the organization of one function. A refactor corrects
-that, and it does not add an API to maintain.
+- **A Ready cache can still hold the wrong model.** Resolving the reference
+  finds a missing repository, a bad credential, or an unknown artifact kind. It
+  can't tell that the artifact is a different model, or that an `Existing`
+  volume is incomplete. Those fail when the engine starts.
+- **An `OCI` source uses the node's disk.** The CSI driver keeps artifacts under
+  `/var/lib/model-csi`. Image volumes go to the image store, under the kubelet's
+  `imagefs` eviction limits. `sizeGiB` controls neither. A pool's disk must fit
+  its largest model.
+- **The CSI driver is another component.** It's a DaemonSet to install and
+  upgrade on every cluster, and its registry credentials are static. The kubelet
+  uses the node's identity for ECR, Artifact Registry, and ACR. Container images
+  avoid both costs.
+- **The CSI driver must keep running until its pods stop.** A pod needs the
+  driver to unmount a model artifact. If the driver goes first, the pod stays
+  `Terminating`. #499 is the same fault with the NVIDIA DRA driver, and its fix
+  covers both.
 
-### 8.2 Use one `OCI` value, not one value for each kind of artifact
+## Future improvements
 
-A user who writes a reference frequently does not know if the publisher made a
-container image or a model artifact. Modelplane resolves the reference and
-finds this. Separate enum values would move that work to the user and would give a
-`Failed` entry when the user makes an incorrect choice.
+**Copy to the node.** An init container could copy the model to the node's disk
+through a `hostPath` volume. That avoids the NFS read for `HuggingFace`, but it
+puts each model on each node, so it needs size limits and eviction first.
 
-### 8.3 Install the driver on each cluster
+**Faster HuggingFace downloads.** The staging Job downloads over HTTPS, not
+through the container runtime. A proxy or a private CA needs environment,
+annotations, and volumes on that Job.
 
-A composition function sees one cluster. It does not see the caches of the
-fleet. It cannot know in advance if a model artifact comes to this cluster. An
-idle DaemonSet uses few resources, where a missing DaemonSet gives
-a pod that does not start.
+**Pod faults in the cluster entry.** #498 asks the control plane to show why a
+model doesn't serve. The contract covers the model not being readable. A
+container's exit code needs another data source.
 
-### 8.4 Use the driver on CRI-O
+## Alternatives considered
 
-CRI-O mounts model artifacts with no driver from v1.33. The function is behind
-the flag `--oci-artifact-mount-support`, and OpenShift disables it by default.
-An OpenShift cluster could use one path for both kinds of artifact, but this
-design does not do that. A second path costs one more thing for a cluster to
-report and one more branch
-to test. Modelplane also provisions no OpenShift clusters. The driver
-stops being necessary everywhere on the day that containerd adds the same
-function.
+### A child resource for each cluster
 
-## 9. Subsequent work
+#210 asks for a `ModelCacheHydration` child for each cluster, and #362
+proposed one. The contract needs one place for each cluster, and
+`status.clusters[]` already is that place. A child resource would contain one
+status field for `OCI` and `Existing` and nothing else. The real complaint
+behind #210 is how one function is organized, and a refactor fixes that
+without a new API.
 
-**Materialization on the node.** An init container that copies the artifact to
-the node, with a `hostPath` volume. This removes the limit that NFS puts on a
-`HuggingFace` read. It also puts each model on each node that can serve it, so
-it needs size limits and eviction first.
+### One enum value for each kind of artifact
 
-**Acceleration of the HuggingFace fetch.** The Job downloads with HTTPS, not
-through a container runtime. A proxy or a private CA needs environment,
-annotations and volumes on that Job.
+`OCIImage` and `OCIArtifact` would make the user say which kind the publisher
+made. Users often don't know. Modelplane can read the manifest and find out,
+and a wrong guess would only fail the cluster entry.
 
-**A cluster entry that gives the pod fault.**
-[#498](https://github.com/modelplaneai/modelplane/issues/498) asks for the
-cause of a fault on the control plane. The contract gives the first part: a
-cluster says that the artifact is not readable, and why. The exit code of a
-container needs a different source of data.
+### Install the CSI driver only where it's needed
+
+A composition function sees one cluster, not the fleet's caches, so it can't
+know whether a model artifact will come to that cluster. An idle DaemonSet uses
+few resources. A missing one means a pod that never starts. Modelplane installs
+it on every cluster.
+
+### CRI-O's built-in artifact mounts
+
+CRI-O mounts model artifacts with no driver from v1.33, behind
+`--oci-artifact-mount-support`, which OpenShift disables by default. A second
+mount path would add another thing for a cluster to report and another branch
+to test, and Modelplane provisions no OpenShift clusters. The driver stops
+being needed once containerd adds the same feature.
