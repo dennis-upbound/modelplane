@@ -46,24 +46,20 @@ tune it.
 ### What must match
 
 Prefill reads the prompt and makes the KV cache. Decode uses that cache to
-generate tokens. The engines move the cache between pods. The router tells them
-which request the cache belongs to. How it does this depends on the engine and
-its KV connector:
+generate tokens. The engines move the cache between pods, and the router tells
+them which request it belongs to.
 
-| Engine and connector | Fields the router sets | Decode without prefill | Sidecar `--kv-connector` |
-|---|---|---|---|
-| vLLM [`NixlConnector`](https://docs.vllm.ai/en/v0.31.0/features/nixl_connector_usage.html) | `kv_transfer_params` | Serves the request | `nixlv2` |
-| vLLM `MooncakeConnector` | `kv_transfer_params` with a rendezvous ID | Serves the request | `mooncake` |
-| [SGLang](https://docs.sglang.io/docs/advanced_features/pd_disaggregation), any transfer backend | `bootstrap_host`, `bootstrap_port`, `bootstrap_room` | [HTTP 400](https://github.com/sgl-project/sglang/blob/v0.5.21/python/sglang/srt/managers/scheduler.py#L2836-L2851) | `sglang` |
-| [TensorRT-LLM](https://nvidia.github.io/TensorRT-LLM/1.2.1/features/disagg-serving.html) | `disaggregated_params` | Serves the request | Not supported |
+The router must match the engines in two settings. The sidecar's
+[`--kv-connector`](https://github.com/llm-d/llm-d-router/blob/v0.9.0/docs/disaggregation.md)
+must match the engines' KV connector. The picker's decider chooses whether a
+request goes through prefill, and it must not skip prefill for an engine that
+can't decode alone.
 
-These router settings must match the engines:
-
-- The sidecar's
-  [`--kv-connector`](https://github.com/llm-d/llm-d-router/blob/v0.9.0/docs/disaggregation.md)
-  must match the engines' KV connector.
-- The picker's decider chooses whether a request goes through prefill. It must
-  not skip prefill for an engine that can't decode alone.
+| Engine and KV connector | Sidecar `--kv-connector` | Decider can skip prefill |
+|---|---|---|
+| vLLM [`NixlConnector`](https://docs.vllm.ai/en/v0.31.0/features/nixl_connector_usage.html) | `nixlv2` | Yes |
+| vLLM `MooncakeConnector` | `mooncake` | Yes |
+| [SGLang](https://docs.sglang.io/docs/advanced_features/pd_disaggregation), any transfer backend | `sglang` | No. Decode [rejects the request](https://github.com/sgl-project/sglang/blob/v0.5.21/python/sglang/srt/managers/scheduler.py#L2836-L2851) with HTTP 400. |
 
 ### What Modelplane composes today
 
@@ -82,11 +78,11 @@ This causes these problems:
 - Other engines don't work. SGLang needs a different decider, connector, and
   pod label.
 - Each new connector needs a Modelplane release.
-- Each router release can break Modelplane's configuration.
-  llm-d-router v0.11.0 deprecates the sidecar's `--vllm-port` flag and removes a
-  plugin Modelplane uses.
-- The user still has to know about the router. The Kimi-K2 recipe
-  moves its decode engine to port 8001, because the sidecar takes 8000.
+- Each router release can break Modelplane's configuration. llm-d-router
+  v0.11.0 deprecates the sidecar's `--vllm-port` flag and removes a plugin
+  Modelplane uses.
+- The user still has to know about the router. The Kimi-K2 recipe moves its
+  decode engine to port 8001, because the sidecar takes 8000.
 
 ### Other projects
 
@@ -122,33 +118,20 @@ This design doesn't cover:
 
 ## Proposal
 
-| Modelplane composes | The user writes |
+| Piece | Written by |
 |---|---|
-| The InferencePool, its selector, and the HTTPRoute | The picker's image and configuration |
-| The picker's Deployment, Service, and RBAC, and the flags that connect it to the InferencePool | The sidecar, as a container in the decode pod |
-| The `llm-d.ai/role` label, from each engine's `phase` | Engine environment for KV transfer |
-| A memory-backed `/dev/shm` in every engine container | Pod labels that the picker reads |
-
-Examples of what the user writes:
-
-- `VLLM_NIXL_SIDE_CHANNEL_HOST`: engine environment for vLLM with NIXL.
-- `llm-d.ai/engine-type: sglang`: a pod label for SGLang.
+| InferencePool and HTTPRoute | Modelplane |
+| Picker Deployment, Service, and RBAC, and the flags that connect it to the InferencePool | Modelplane |
+| `llm-d.ai/role` label | Modelplane, from each engine's `phase` |
+| Memory-backed `/dev/shm` | Modelplane, on every engine container |
+| Picker image and configuration | User, in `serving.endpointPicker` |
+| Sidecar | User, as a container in the decode pod |
+| KV transfer environment, such as `VLLM_NIXL_SIDE_CHANNEL_HOST` | User, in the engine container's `env` |
+| Labels the picker reads, such as `llm-d.ai/engine-type` | User, in the pod template's `labels` |
 
 ### The endpoint picker
 
 `serving.endpointPicker` is optional in both serving modes:
-
-```yaml
-serving:
-  mode: Unified
-  endpointPicker:
-    image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
-    config:
-      apiVersion: llm-d.ai/v1alpha1
-      kind: EndpointPickerConfig
-      plugins: [ ... ]
-      schedulingProfiles: [ ... ]
-```
 
 - `image` is the picker image. The default is the image Modelplane is released
   with.
@@ -185,13 +168,9 @@ sidecar listens on 8000.
 Modelplane doesn't inject the sidecar or `VLLM_NIXL_SIDE_CHANNEL_HOST`. A decode
 pod without a sidecar serves every request without prefill.
 
-Modelplane still gives every engine container a memory-backed `/dev/shm`. The
-template can't declare volumes, and NIXL and tensor parallel engines use shared
-memory.
-
-Other per-pod helpers can use the same mechanism. #500 needs a
-session-affine proxy in front of an engine whose data-parallel ranks share one
-pod. `sglang-router` is one such proxy.
+Other per-pod helpers can use the same mechanism. #500 needs a session-affine
+proxy, such as `sglang-router`, in front of an engine whose data-parallel ranks
+share one pod.
 
 ### Examples
 
@@ -378,15 +357,6 @@ template:
 
 The Kimi-K2 recipe changes to this form.
 
-### Changes to the base design
-
-The Serving section of [design.md](./design.md) changes:
-
-- The user can configure the endpoint picker through `serving.endpointPicker`.
-- Modelplane doesn't inject the sidecar.
-- A member's template can have containers beside `engine`. Modelplane changes
-  only `engine`.
-
 ## Future improvements
 
 **Shared picker configurations.** Deployments that use the same engine repeat
@@ -409,7 +379,6 @@ But Modelplane must maintain each value. Each of these would need a release:
 
 - vLLM with Mooncake.
 - SGLang with Mooncake.
-- TensorRT-LLM.
 - Each new connector the router adds.
 - Each router release that renames a flag.
 
@@ -451,13 +420,3 @@ It's a second way to write a container, for routing only. Modelplane would also
 have to choose which pods of a gang get the sidecar, but the member templates
 already say this. And llm-d is replacing the sidecar with a coordinator, which
 would leave the field with nothing to configure.
-
-### Routing presets
-
-KServe applies named configurations (LLMInferenceServiceConfig) based on the
-fields a service sets. The user overrides them field by field. An EngineProfile
-resource could do the same in Modelplane.
-
-Presets help when many deployments share a configuration. But a reader must
-follow a merge order to know what runs. If recipes need shared configurations,
-Modelplane can add them later (see Future improvements).
