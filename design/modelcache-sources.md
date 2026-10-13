@@ -8,11 +8,11 @@
 ## Summary
 
 A `ModelCache` reads only from HuggingFace, and it stages what it reads onto a
-ReadWriteMany claim on each cluster. That claim can be slower than no cache, and
-it can fail on its own. `compose-model-replica`, the function that mounts the
-cache into engine pods, works out the claim's name itself, and it doesn't wait
-for the cache. An engine can start before the weights are
-there, and download them a second time.
+ReadWriteMany claim on each cluster. On some clouds that claim is slow, costly
+at small sizes, or fails to bind. `compose-model-replica`, the function that
+mounts the cache into engine pods, works out the claim's name itself, and it
+doesn't wait for the cache. An engine can start before the weights are there,
+and download them a second time.
 
 I propose two changes:
 
@@ -120,37 +120,44 @@ spec:
   oci:
     ref: ""            # a tag or a digest
     subPath: ""        # the directory that holds the weights
-    imagePullSecrets: []  # secrets on each cluster, for a private registry
+    imagePullSecrets: []  # optional secrets on each cluster
   existing:
-    claimName: ""      # a claim bound on each matched cluster
+    claimName: ""      # a claim in the replica's namespace on each cluster
     subPath: ""
 ```
 
 | Source | The user gives | What mounts it | What the cluster needs |
 |---|---|---|---|
 | `HuggingFace` | A repository ID | A claim that Modelplane stages | A ReadWriteMany storage class |
-| `OCI` | A container image that holds the weights | An `image` volume | Kubernetes 1.36 |
+| `OCI` | A container image that holds the weights | An `image` volume | Kubernetes 1.35 or later, and containerd 2.1 or later or CRI-O |
 | `OCI` | A model artifact | A `csi` volume from the model CSI driver | The driver, which Modelplane installs on every cluster |
-| `Existing` | A claim the user filled | A `persistentVolumeClaim` volume | The claim, bound on the cluster |
+| `Existing` | A claim the user filled | A `persistentVolumeClaim` volume | The claim, bound on the cluster. A multi-node gang needs ReadWriteMany or ReadOnlyMany. |
 
 For an `OCI` source:
 
 - Modelplane reads the reference's manifest from each cluster to find which kind
   of artifact it is. The user doesn't say. Any other kind of artifact fails the
   cluster entry, and the message gives the manifest's media type.
-- Modelplane resolves a tag to its digest and writes the digest into `mount`. A
-  tag that moves later doesn't change what a running deployment serves.
-- A private registry needs `oci.imagePullSecrets`. Modelplane reads the manifest
-  with them, and `mount` lists them for the engine pod's pull.
+- - Modelplane resolves a tag to its digest once, stores the digest in the
+  cluster entry, and writes it into `mount`. It resolves again only when the
+  spec changes. Each cluster resolves a moving tag on its own, possibly to a
+  different digest. A digest in `ref` pins every cluster to one model.
+- `oci.imagePullSecrets` is optional. When the cache names them, `mount` lists
+  them for the engine pod. Without them, the kubelet pulls with the node's
+  credential provider.
 - The kubelet pulls the reference when the pod starts, and shares the pulled
   bytes with later pods on the node.
 
-`sizeGiB` applies only to `HuggingFace`, the one source that stages onto a
-Modelplane claim.
+For an `Existing` source, the claim must be in the namespace where the
+replica's pods run. A claim that isn't there yet leaves the cluster entry
+`Pending`, with a message.
 
-Modelplane installs the model CSI driver on every cluster. A composition
-function sees one cluster, not the fleet's caches, so it can't know whether a
-model artifact will come to that cluster.
+Only `HuggingFace` stages onto a Modelplane claim, so only `HuggingFace` uses
+`sizeGiB` and a cluster's `status.cache.storageClassName`. `compose-model-cache`
+and `compose-model-deployment` don't require a storage class for `OCI` and
+`Existing`.
+
+Modelplane installs the model CSI driver on every cluster.
 
 ### The mount contract
 
@@ -165,44 +172,47 @@ mount:
   imagePullSecrets: []  # corev1.LocalObjectReference
 ```
 
-The model is always at `/mnt/models`. `env` is empty for `OCI` and `Existing`. A
-`HuggingFace` entry sets `HF_HUB_CACHE`. The engine then finds the staged
-snapshot by repository ID.
+`OCI` and `Existing` put the model at `/mnt/models`, and `env` is empty. A
+`HuggingFace` entry puts the hub cache root at `/mnt/models` and sets
+`HF_HUB_CACHE`. The engine then finds the staged snapshot by repository ID.
 
 `compose-model-cache` knows the source, so it writes the contract. Each cluster
 entry comes from that cluster's own observed resources, so a failed cluster
 doesn't change another cluster's entry.
 
-`compose-model-replica` builds the pod, and it doesn't need to know the source.
-It follows these rules:
+`compose-model-replica` reads the `ModelCache` as a required resource, and
+builds the pod without knowing the source. It follows these rules:
 
 - It finds the entry for its own cluster.
 - It adds `imagePullSecrets` to the pod.
 - It adds `env` before the user's environment. A user's variable with the same
   name then takes effect. It adds `volumes` and `volumeMounts` as they are.
 - If a mount is read-only, it adds an `emptyDir` with a size limit and points
-  `HOME` at it. Engines write tokenizer, compile, and lock files next to the
-  weights. Without a size limit, a large compile cache can get the pod evicted.
+  `HOME` at it. Engines write compile and download caches under `HOME`, and the
+  size limit stops a large one from getting the pod evicted.
 - If the cluster has no entry, or the entry has no `mount`, it sets a condition
   and composes no workload. This fixes #495.
 
 ### Cluster status
 
 `InferenceCluster.status.cache` gets an `imageVolumes` boolean, next to
-`storageClassName`. Modelplane sets it from the cluster's Kubernetes version. It
-says whether the cluster can mount an image volume.
+`storageClassName`. Modelplane sets it from the cluster's observed server
+version and its nodes' container runtime. It says whether the cluster can mount
+an image volume.
 
 It only matters for container images. A model artifact uses the CSI driver on
-any version. A container image on a cluster below 1.36 fails the cluster entry,
-and the message gives the version. Of the clouds Modelplane provisions, only EKS
-and Vultr run 1.36 today.
+any version. A container image on a cluster that can't mount it fails the
+cluster entry, and the message gives the reason.
+
+ModelExpress applies only to `HuggingFace` caches. An `OCI` pull is already
+local to each node.
 
 ### Examples
 
 #### OCI
 
-The `qwen3-8b` cache from the summary gives this cluster entry on a 1.36
-cluster:
+The `qwen3-8b` cache from the summary gives this cluster entry on a cluster
+that can mount image volumes. An image volume is always read-only:
 
 ```yaml
 status:
@@ -251,11 +261,9 @@ status:
         mountPath: /mnt/models
         subPath: Kimi-K2-Instruct
   - name: gke-us-central1
-    phase: Failed
+    phase: Pending
     message: persistentvolumeclaim "kimi-k2-weights" not found
 ```
-
-The second cluster has no `mount`.
 
 ### Limits
 
@@ -269,27 +277,19 @@ The second cluster has no `mount`.
   its largest model.
 - **The CSI driver is another component.** It's a DaemonSet to install and
   upgrade on every cluster, and its registry credentials are static. The kubelet
-  uses the node's identity for ECR, Artifact Registry, and ACR. Container images
-  avoid both costs.
-- **The CSI driver must stop after its pods.** Otherwise a pod stays
-  `Terminating`, as in #499.
+  uses the node's identity for ECR, Artifact Registry, and ACR. The driver must
+  also stop after its pods, or a pod stays `Terminating`, as in #499. Container
+  images avoid these costs.
 
 ## Future improvements
 
 **Copy to the node.** An init container could copy the model to the node's disk
 through a `hostPath` volume. That avoids the ReadWriteMany read for
-`HuggingFace`, but it
-puts each model on each node, so it needs size limits and eviction first.
+`HuggingFace`, but it puts each model on each node, so it needs size limits and
+eviction first.
 
-**HuggingFace through a proxy.** The staging Job downloads over HTTPS, not
-through the container runtime. A proxy or a private CA needs environment,
-annotations, and volumes on that Job.
-
-**Cache metrics.** A `ModelCache` doesn't publish metrics. In #494 the cache
-said `Hydrating` for 40 minutes, and no series recorded it. Pull time, split by
-source and by warm or cold pull, and each cluster entry's phase would show both.
-Pull time needs a node-level scrape, because the kubelet and the CSI driver
-measure it. Cache state is on the control plane, so it waits on #476.
+**Cache metrics.** Pull time and each cluster entry's phase would have shown the
+stuck cache in #494. Cache state is on the control plane, so it waits on #476.
 
 **Pod faults in the cluster entry.** #498 asks the control plane to show why a
 model doesn't serve. The contract covers the model not being readable. A
@@ -300,8 +300,7 @@ container's exit code needs another data source.
 ### A child resource for each cluster
 
 #210 asks for a `ModelCacheHydration` child for each cluster. The contract
-needs one place for each cluster, and `status.clusters[]` already gives it. A
-child resource would contain only one status field for `OCI` and `Existing`.
+needs one place for each cluster, and `status.clusters[]` already gives it.
 
 ### One enum value for each kind of artifact
 
@@ -312,12 +311,11 @@ and a wrong guess would only fail the cluster entry.
 ### Install the CSI driver only where it's needed
 
 Installing the driver only on clusters that serve a model artifact would save an
-idle DaemonSet. But a composition function can't see which clusters those are,
-and a missing driver means a pod that never starts.
+idle DaemonSet. But a composition function sees one cluster, not the fleet's
+caches, and a missing driver means a pod that never starts.
 
 ### CRI-O's built-in artifact mounts
 
-CRI-O can mount model artifacts with no driver from v1.33, behind a flag.
-Modelplane provisions no CRI-O clusters, and a second mount path adds another
-branch to test. The driver stops
-being needed once containerd adds the same feature.
+CRI-O can mount OCI artifacts as image volumes, with no driver. Modelplane
+provisions no CRI-O clusters, and a second mount path adds another branch to
+test. The driver stops being needed once containerd adds the same feature.
