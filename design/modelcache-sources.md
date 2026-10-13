@@ -17,7 +17,7 @@ and download them a second time.
 I propose two changes:
 
 - `spec.source` gets two new values. `OCI` reads the model from a registry with
-  no claim. `Existing` mounts a claim the user already filled.
+  no claim. `PersistentVolumeClaim` mounts a claim the user already filled.
 - Each cluster entry in `status.clusters[]` gets a `mount` field. It says how to
   read the model on that cluster. `compose-model-replica` copies it into the
   pod, and waits until it's there.
@@ -115,13 +115,13 @@ This design doesn't cover:
 
 ```yaml
 spec:
-  source: OCI          # HuggingFace, OCI, or Existing
+  source: OCI          # HuggingFace, OCI, or PersistentVolumeClaim
   huggingFace: {}      # unchanged
   oci:
     ref: ""            # a tag or a digest
     subPath: ""        # the directory that holds the weights
-    imagePullSecrets: []  # optional secrets on each cluster
-  existing:
+    imagePullSecrets: []  # secrets on each cluster, for a private registry
+  persistentVolumeClaim:
     claimName: ""      # a claim in the replica's namespace on each cluster
     subPath: ""
 ```
@@ -131,31 +131,34 @@ spec:
 | `HuggingFace` | A repository ID | A claim that Modelplane stages | A ReadWriteMany storage class |
 | `OCI` | A container image that holds the weights | An `image` volume | Kubernetes 1.35 or later, and containerd 2.1 or later or CRI-O |
 | `OCI` | A model artifact | A `csi` volume from the model CSI driver | The driver, which Modelplane installs on every cluster |
-| `Existing` | A claim the user filled | A `persistentVolumeClaim` volume | The claim, bound on the cluster. A multi-node gang needs ReadWriteMany or ReadOnlyMany. |
+| `PersistentVolumeClaim` | A claim the user filled | A `persistentVolumeClaim` volume | The claim, bound on the cluster. A multi-node gang needs ReadWriteMany or ReadOnlyMany. |
 
 For an `OCI` source:
 
-- Modelplane reads the reference's manifest from each cluster to find which kind
-  of artifact it is. The user doesn't say. Any other kind of artifact fails the
-  cluster entry, and the message gives the manifest's media type.
-- - Modelplane resolves a tag to its digest once, stores the digest in the
-  cluster entry, and writes it into `mount`. It resolves again only when the
-  spec changes. Each cluster resolves a moving tag on its own, possibly to a
-  different digest. A digest in `ref` pins every cluster to one model.
-- `oci.imagePullSecrets` is optional. When the cache names them, `mount` lists
-  them for the engine pod. Without them, the kubelet pulls with the node's
-  credential provider.
+- On each cluster, a resolver Job reads the reference's manifest. The Job writes
+  the digest and the manifest's media type to a ConfigMap, and Modelplane
+  observes the ConfigMap, as it observes the HuggingFace staging Job.
+- The media type tells Modelplane which kind of artifact it is. The user doesn't
+  say. Any other kind of artifact fails the cluster entry, and the message gives
+  the media type.
+- Modelplane resolves a tag once and stores the digest in the cluster entry. It
+  writes the digest into `mount`, and resolves again only when the spec changes.
+  Each cluster resolves a moving tag on its own, possibly to a different digest.
+  A digest in `ref` pins every cluster to one model.
+- A private registry needs `oci.imagePullSecrets`. The resolver Job reads the
+  manifest with them, and `mount` lists them for the engine pod. A public
+  registry needs none.
 - The kubelet pulls the reference when the pod starts, and shares the pulled
   bytes with later pods on the node.
 
-For an `Existing` source, the claim must be in the namespace where the
-replica's pods run. A claim that isn't there yet leaves the cluster entry
+For a `PersistentVolumeClaim` source, the claim must be in the namespace where
+the replica's pods run. A claim that isn't there yet leaves the cluster entry
 `Pending`, with a message.
 
 Only `HuggingFace` stages onto a Modelplane claim, so only `HuggingFace` uses
 `sizeGiB` and a cluster's `status.cache.storageClassName`. `compose-model-cache`
 and `compose-model-deployment` don't require a storage class for `OCI` and
-`Existing`.
+`PersistentVolumeClaim`.
 
 Modelplane installs the model CSI driver on every cluster.
 
@@ -172,8 +175,8 @@ mount:
   imagePullSecrets: []  # corev1.LocalObjectReference
 ```
 
-`OCI` and `Existing` put the model at `/mnt/models`, and `env` is empty. A
-`HuggingFace` entry puts the hub cache root at `/mnt/models` and sets
+`OCI` and `PersistentVolumeClaim` put the model at `/mnt/models`, and `env` is
+empty. A `HuggingFace` entry puts the hub cache root at `/mnt/models` and sets
 `HF_HUB_CACHE`. The engine then finds the staged snapshot by repository ID.
 
 `compose-model-cache` knows the source, so it writes the contract. Each cluster
@@ -231,7 +234,7 @@ status:
         readOnly: true
 ```
 
-#### Existing
+#### PersistentVolumeClaim
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -240,8 +243,8 @@ metadata:
   name: kimi-k2
   namespace: ml-team
 spec:
-  source: Existing
-  existing:
+  source: PersistentVolumeClaim
+  persistentVolumeClaim:
     claimName: kimi-k2-weights
     subPath: Kimi-K2-Instruct
 ```
@@ -269,17 +272,20 @@ status:
 
 - **A Ready cache can still hold the wrong model.** Resolving the reference
   finds a missing repository, a bad pull secret, or an unknown artifact kind. It
-  can't tell that the artifact is a different model, or that an `Existing`
-  claim is incomplete. Those fail when the engine starts.
+  can't tell that the artifact is a different model, or that the claim behind a
+  `PersistentVolumeClaim` source is incomplete. Those fail when the engine
+  starts.
 - **An `OCI` source uses the node's disk.** The CSI driver keeps artifacts under
   `/var/lib/model-csi`. Image volumes go to the image store, under the kubelet's
   `imagefs` eviction limits. `sizeGiB` controls neither. A pool's disk must fit
   its largest model.
+- **A private registry needs a pull secret.** The resolver Job can't use the
+  node's identity, so a private ECR, Artifact Registry, or ACR repository needs
+  `oci.imagePullSecrets` too.
 - **The CSI driver is another component.** It's a DaemonSet to install and
-  upgrade on every cluster, and its registry credentials are static. The kubelet
-  uses the node's identity for ECR, Artifact Registry, and ACR. The driver must
-  also stop after its pods, or a pod stays `Terminating`, as in #499. Container
-  images avoid these costs.
+  upgrade on every cluster, and its registry credentials are static. The driver
+  must also stop after its pods, or a pod stays `Terminating`, as in #499.
+  Container images avoid these costs.
 
 ## Future improvements
 
