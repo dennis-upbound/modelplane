@@ -494,8 +494,8 @@ spec:
                                               message: "only the engine container may declare a port named 'http'"
                                             - rule: "size(self) == 1 || self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http'))"
                                               message: "the engine container must declare its 'http' port when the pod has more than one container"
-                                            - rule: "size(self) > 1 || self.all(c, !has(c.ports) || c.ports.all(p, !has(p.name) || p.name != 'http' || p.containerPort == 8000))"
-                                              message: "an engine with no other container in its pod serves on 8000, so its 'http' port must be 8000"
+                                            - rule: "!self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000)) || self.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000))"
+                                              message: "the pod receives requests on 8000, so when the engine's 'http' port isn't 8000 another container must declare containerPort 8000"
                                             items:
                                               type: object
                                               required: [name, image]
