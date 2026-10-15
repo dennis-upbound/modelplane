@@ -101,6 +101,21 @@ engines:
   phase: Decode
 ```
 
+By default, the cluster routes the pair. On today's clusters that routing is for
+vLLM with its `NixlConnector`. Modelplane adds llm-d's sidecar to each decode pod
+on port 8000, and sets the NIXL address on every engine. Your engines set the
+rest:
+
+- `--kv-transfer-config` with `"kv_connector":"NixlConnector"` on both engines,
+  with `kv_role` `kv_producer` on prefill and `kv_consumer` on decode.
+- `--port` on the decode engine, to a port other than 8000, such as 8001. The
+  sidecar takes 8000 and forwards to the port you set.
+
+The [Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) is a complete example. For
+SGLang, another KV connector, or your own picker configuration, set
+`serving.router` and write the routing yourself. See
+[Configure Routing]({{< ref "routing.md" >}}).
+
 Disaggregation pays off for large models under load with strict latency targets
 and long context. For small models or low traffic, the KV-transfer overhead
 outweighs the benefit, so unified serving is the default.
