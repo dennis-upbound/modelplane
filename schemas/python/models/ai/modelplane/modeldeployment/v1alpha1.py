@@ -243,7 +243,7 @@ class ModelCacheRef(BaseModel):
 class EndpointPicker(BaseModel):
     config: dict[str, Any] | None = None
     """
-    The picker's configuration, such as an llm-d EndpointPickerConfig, passed to the picker without Modelplane reading it. It replaces Modelplane's default configuration whole.
+    The picker's configuration, such as an llm-d EndpointPickerConfig, passed to the picker without Modelplane reading it. Required under PrefillDecode. It replaces Modelplane's default configuration whole.
     """
     image: constr(min_length=1) | None = None
     """
@@ -262,7 +262,7 @@ class Serving(BaseModel):
     """
     router: Literal['EndpointPicker'] | None = None
     """
-    The router the user writes. Omitted, the cluster routes the deployment as it does by default. EndpointPicker runs the endpoint picker set in endpointPicker, and the user writes any sidecar the picker needs as a container in the member templates.
+    The router the user writes. Required under PrefillDecode. Omitted under Unified, the cluster routes the deployment. EndpointPicker runs the endpoint picker set in endpointPicker, and the user writes any sidecar the picker needs as a container in the member templates.
     """
 
 
