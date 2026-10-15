@@ -97,10 +97,11 @@ the replica doesn't become Ready.
 
 ## The sidecar
 
-With `PrefillDecode` serving, the sidecar in each decode pod sends the prefill half of
-a request to the prefill pod the picker chose. You write it as a container
-beside `engine` in the decode member's template. A member's template can hold
-other containers too. Modelplane changes only the container named `engine`.
+With `PrefillDecode` serving, the sidecar in each decode pod sends the prefill
+half of a request to the prefill pod the picker chose. You write it as a
+container beside `engine` in the decode member's template. A member's template
+can hold other containers too. Modelplane changes only the container named
+`engine`.
 
 The sidecar and the picker must match your engines:
 
@@ -119,18 +120,21 @@ serves it, and SGLang rejects it.
 
 ## Ports
 
-A serving pod receives requests on port 8000. The picker also reads `/metrics`
-on 8000. The engine's port named `http` is where Modelplane checks the engine's
-health and the collector reads its metrics, and no other container can use that
-name. In this table, "engine port" means that port:
+A serving pod receives requests on port 8000. The engine's port named `http` is
+where Modelplane checks the engine's health and the collector reads its
+metrics. It defaults to 8000, so an engine alone in its pod declares nothing.
 
-| Pod | Engine port | Container on port 8000 |
-|---|---|---|
-| The engine alone | 8000, which you can leave out | The engine |
-| The engine and a container that serves 8000, such as the sidecar | Declare it, such as 8001 | The other container. It passes requests, including `/metrics`, to the engine. |
-| The engine and a container that doesn't serve, such as a log shipper | Declare it as 8000 | The engine |
+When a container is in front of the engine, such as the sidecar:
 
-Modelplane rejects any other combination when you apply the `ModelDeployment`.
+- That container declares port 8000, and passes requests to the engine. The
+  picker reads `/metrics` there too.
+- The engine declares its `http` port on another port, such as 8001. The health
+  check must reach the engine itself, because the llm-d sidecar answers
+  `/health` without asking the engine.
+
+A container that doesn't serve, such as a log shipper, doesn't declare a port,
+and the engine doesn't either. Modelplane rejects a `ModelDeployment` where more
+or less than one container serves 8000.
 
 ## Example: SGLang prefill and decode
 

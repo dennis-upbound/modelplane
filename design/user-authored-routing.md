@@ -243,24 +243,24 @@ containers beside `engine`:
 
 ### Ports
 
-A serving pod receives requests on port 8000, as today. The picker also reads
-`/metrics` on 8000. The engine's `http` port is where Modelplane probes the
-engine and the collector scrapes its metrics. Only `engine` can declare a port
-called `http`. In this table, "engine port" means that port:
+A serving pod receives requests on port 8000, as today. The engine's port named
+`http` is where Modelplane probes the engine and the collector scrapes its
+metrics. It defaults to 8000, so an engine alone in its pod declares nothing.
 
-| Pod | Engine port | Container on port 8000 |
-|---|---|---|
-| The engine alone | Always 8000, so the engine can omit it | The engine |
-| The engine and a container that serves 8000, such as the sidecar | The engine must declare it, such as 8001 | The other container. It passes requests, including `/metrics`, to the engine. |
-| The engine and a container that doesn't serve, such as a log shipper | The engine must declare it as 8000 | The engine |
+When a container is in front of the engine, such as the sidecar:
 
-CEL rejects any other combination. The cluster's routing adds one exception: in
-a `PrefillDecode` decode pod, the injected sidecar takes 8000 and the engine
-listens on its `--port`, as today.
+- That container declares port 8000, and passes requests to the engine. The
+  picker reads `/metrics` there too.
+- The engine declares its `http` port on another port, such as 8001. The probe
+  must reach the engine itself, because the llm-d sidecar answers `/health`
+  without asking the engine.
 
-Only serving pods (a `Standalone` pod, or a gang's leader) get the probe and
-the `http` port. A worker with another container still declares an `http` port,
-but Modelplane doesn't use it.
+A container that doesn't serve, such as a log shipper, doesn't declare a port,
+and the engine doesn't either. CEL makes sure exactly one container serves 8000.
+With `router` omitted, the injected sidecar takes 8000 in a `PrefillDecode`
+decode pod, and the engine listens on its `--port`, as today.
+
+Only serving pods (a `Standalone` pod, or a gang's leader) get the probe.
 
 ### Example
 

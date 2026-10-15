@@ -505,10 +505,8 @@ spec:
                                             x-kubernetes-validations:
                                             - rule: "self.exists_one(c, c.name == 'engine')"
                                               message: "exactly one container must be named 'engine'"
-                                            - rule: "self.all(c, c.name == 'engine' || !has(c.ports) || c.ports.all(p, !has(p.name) || p.name != 'http'))"
-                                              message: "only the engine container may declare a port named 'http'"
-                                            - rule: "size(self) == 1 || self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http'))"
-                                              message: "the engine container must declare its 'http' port when the pod has more than one container"
+                                            - rule: "!self.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000)) || self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000))"
+                                              message: "when another container declares containerPort 8000, the engine container must declare its 'http' port on a different port"
                                             - rule: "!self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000)) || self.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000))"
                                               message: "when the engine container's 'http' port isn't 8000, another container must declare containerPort 8000"
                                             items:
@@ -626,8 +624,8 @@ spec:
                                                     Ports the container listens on. The engine container's
                                                     port named "http" is where Modelplane probes the engine
                                                     and scrapes its metrics. Without one, the engine serves
-                                                    on 8000. Only the engine container may name a port
-                                                    "http".
+                                                    on 8000. A container in front of the engine declares
+                                                    8000, and the engine then declares its "http" port.
                                                   items:
                                                     type: object
                                                     required: [containerPort]
