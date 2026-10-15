@@ -247,7 +247,7 @@ class EndpointPicker(BaseModel):
     """
     image: constr(min_length=1) | None = None
     """
-    The endpoint picker image. Omitted means the image this Modelplane release uses.
+    The endpoint picker image. Set together with config, since a configuration is written for one picker release. Omitted, under Unified, means the image this Modelplane release uses.
     """
 
 
