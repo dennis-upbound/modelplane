@@ -435,24 +435,6 @@ recipes show this, a cluster-scoped resource can hold a named configuration that
 
 ## Alternatives considered
 
-### Always user-written routing
-
-Every deployment would write its picker configuration and sidecar. Both are
-llm-d's, so every `PrefillDecode` deployment would run only where llm-d routes,
-and every existing one would need a rewrite.
-
-### A KV transfer format field
-
-`serving.prefillDecode.kvTransfer: VLLMNixl | SGLang` would let Modelplane
-compose the router for each format. Each new connector, and each router release
-that renames a flag, would need a Modelplane release.
-
-### Detect the format from engine flags
-
-Modelplane could read `--disaggregation-mode` or `--kv-transfer-config` and pick
-the format. Each new format still needs a release, and detection can't see
-flags in a configuration file or an entrypoint script.
-
 ### A sidecar field
 
 `serving.prefillDecode.sidecar` would be a second way to write a container, for
