@@ -254,7 +254,7 @@ class EndpointPicker(BaseModel):
 class Serving(BaseModel):
     endpointPicker: EndpointPicker | None = None
     """
-    The endpoint picker, when router is EndpointPicker. Valid in either mode. Omitted means Modelplane's picker with its default configuration for the mode. Modelplane composes the picker's pool, Service and RBAC around it.
+    The endpoint picker, when router is EndpointPicker. Required, with its config, under PrefillDecode. Under Unified, omitted means Modelplane's picker and default configuration. Modelplane composes the picker's pool, Service and RBAC around it.
     """
     mode: Literal['Unified', 'PrefillDecode']
     """
