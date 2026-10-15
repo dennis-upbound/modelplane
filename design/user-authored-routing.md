@@ -121,16 +121,61 @@ This design doesn't cover:
 
 ## Proposal
 
-| Piece | Written by |
-|---|---|
-| InferencePool and HTTPRoute | Modelplane |
-| Picker Deployment, Service, and RBAC, and the flags that connect it to the InferencePool | Modelplane |
-| `llm-d.ai/role` label | Modelplane, from each engine's `phase`, in `PrefillDecode` |
-| Memory-backed `/dev/shm` | Modelplane, on every engine container |
-| Picker image and configuration | User, in `serving.endpointPicker` |
-| Sidecar | User, as a container in the decode pod |
-| KV transfer environment, such as `VLLM_NIXL_SIDE_CHANNEL_HOST` | User, in the engine container's `env` |
-| Labels the picker reads, such as `llm-d.ai/engine-type` | User, in the pod template's `labels` |
+I propose two API changes:
+
+1. `serving.endpointPicker` sets the picker's image and configuration.
+2. A member's template can hold containers beside `engine`, and a container can
+   declare `ports`.
+
+A `PrefillDecode` deployment uses both. The user writes the picker
+configuration, and adds the sidecar to the decode member:
+
+```yaml
+serving:
+  mode: PrefillDecode
+  endpointPicker:
+    image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+    config: { ... }               # optional
+engines:
+- name: decode
+  phase: Decode
+  members:
+  - role: Standalone
+    template:
+      spec:
+        containers:
+        - name: sidecar             # new: a container beside the engine
+          image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
+          args:
+          - --kv-connector=nixlv2
+          - --vllm-port=8001
+          ports:
+          - containerPort: 8000
+        - name: engine
+          image: vllm/vllm-openai:v0.23.0
+          args:
+          - --port=8001
+          - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer"}
+          ports:
+          - name: http              # new: where the engine serves
+            containerPort: 8001
+```
+
+This table shows who writes each part of the router, today and with this
+design:
+
+| Part of the router | Today | With this design |
+|---|---|---|
+| InferencePool and HTTPRoute | Modelplane | Modelplane |
+| Picker Deployment, Service, RBAC, and the flags that connect the picker to the InferencePool | Modelplane | Modelplane |
+| `llm-d.ai/role` pod label, from each engine's `phase` (`PrefillDecode` only) | Modelplane | Modelplane |
+| Memory-backed `/dev/shm` on the engine container | Modelplane | Modelplane |
+| Picker image | Modelplane, fixed | User, in `serving.endpointPicker.image`. The default is today's image. |
+| Picker configuration | Modelplane, for vLLM with NIXL | User, in `serving.endpointPicker.config`. The default is today's configuration. |
+| Sidecar | Modelplane injects it, with `--kv-connector=nixlv2` | User, as a container in the decode member's template |
+| KV transfer environment, such as `VLLM_NIXL_SIDE_CHANNEL_HOST` | Modelplane injects it | User, in the engine container's `env` |
+| Labels the picker reads, such as `llm-d.ai/engine-type` | Not set | User, in the template's `labels` |
+| The engine's port | Modelplane reads `--port` | User, as the engine's `http` port |
 
 ### The endpoint picker
 
@@ -152,7 +197,7 @@ Extension endpoint picker that accepts those flags and serves gRPC on 9002. If
 the picker rejects its configuration, the picker isn't available and the
 replica isn't Ready.
 
-### Sidecars
+### Containers beside the engine
 
 This design adopts #108. A member's template can list containers beside
 `engine`:
@@ -161,34 +206,39 @@ This design adopts #108. A member's template can list containers beside
 - A container beside `engine` takes the same fields as `engine`: `image`,
   `command`, `args`, `env`, and `ports`.
 - Modelplane changes only `engine`. It adds device claims, `MODELPLANE_`
-  environment, ModelCache mounts, `/dev/shm`, and the readiness probe.
+  environment, ModelCache mounts, `/dev/shm`, and the readiness probe. The
+  pod's readiness follows the engine.
 - Each member has its own template. The user chooses which pods of a gang get a
   container.
-
-Port 8000 in a serving pod receives requests, as today. The engine's `http` port
-is where Modelplane probes the engine and the collector scrapes its metrics:
-
-- Only `engine` can declare a port called `http`.
-- If the engine is the only container, it serves on 8000, so its `http` port is
-  8000.
-- If the pod has more than one container, `engine` must declare its `http` port.
-- If the engine's `http` port isn't 8000, another container must declare port
-  8000. It must pass requests through to the engine, including `/metrics`,
-  which the picker reads on 8000.
-- Only serving pods get the probe and the `http` port. A worker's engine still
-  declares an `http` port when the worker has another container, but Modelplane
-  doesn't use it.
-
-Only `engine` gets a readiness probe. The pod's readiness follows the engine.
-
-In a `PrefillDecode` decode pod, the sidecar is the container on 8000.
-Modelplane doesn't inject the sidecar or `VLLM_NIXL_SIDE_CHANNEL_HOST`. With the
-llm-d router, a decode pod without the sidecar sends every request to decode
-alone. vLLM serves it, and SGLang rejects it.
 
 Other per-pod helpers can use the same mechanism. #500 needs a session-affine
 proxy, such as `sglang-router`, in front of an engine whose data-parallel ranks
 share one pod.
+
+### Ports
+
+A serving pod receives requests on port 8000, as today. The picker also reads
+`/metrics` on 8000. The engine's `http` port is where Modelplane probes the
+engine and the collector scrapes its metrics. Only `engine` can declare a port
+called `http`. In this table, "engine port" means that port:
+
+| Pod | Engine port | Container on port 8000 |
+|---|---|---|
+| The engine alone | Always 8000, so the engine can omit it | The engine |
+| The engine and a container that serves 8000, such as the sidecar | The engine must declare it, such as 8001 | The other container. It passes requests, including `/metrics`, to the engine. |
+| The engine and a container that doesn't serve, such as a log shipper | The engine must declare it as 8000 | The engine |
+
+CEL rejects any other combination.
+
+Only serving pods (a `Standalone` pod, or a gang's leader) get the probe and
+the `http` port. A worker with another container still declares an `http` port,
+but Modelplane doesn't use it.
+
+### Without a sidecar
+
+Modelplane doesn't inject the sidecar or `VLLM_NIXL_SIDE_CHANNEL_HOST`. With the
+llm-d router, a decode pod without the sidecar sends every request to decode
+alone. vLLM serves it, and SGLang rejects it.
 
 ### Examples
 
