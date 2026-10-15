@@ -25,7 +25,9 @@ How much you write depends on the serving mode:
 - **`PrefillDecode`.** You write the router. Set
   `serving.router: EndpointPicker`, the picker's configuration in
   `serving.endpointPicker`, and the sidecar in the decode member. Modelplane
-  rejects a `PrefillDecode` deployment without them.
+  rejects a `PrefillDecode` deployment without `router` and `endpointPicker`.
+  It can't check for the sidecar, so a decode pod without one serves decode
+  alone.
 
 ## What you write for prefill/decode
 
@@ -82,16 +84,15 @@ memory. It doesn't add the sidecar or any KV transfer environment.
 
 ## The endpoint picker
 
-- `image` is the picker image. Without it, Modelplane runs the image it's
-  released with.
-- `config` is the picker's configuration, such as an llm-d
-  `EndpointPickerConfig`. Modelplane passes it to the picker without checking
-  it. `PrefillDecode` requires it. Under `Unified`, Modelplane uses its
-  [default configuration](#picker-configurations) when you leave it out.
+- `image` is the picker image, and `config` is its configuration, such as an
+  llm-d `EndpointPickerConfig`. Modelplane passes the configuration to the
+  picker without checking it.
+- Set `image` and `config` together. The configuration format changes between
+  picker releases, so pin the picker your configuration is for. Modelplane
+  upgrades don't change a pinned image.
 - A `config` replaces the default. Modelplane doesn't merge the two.
-- A `config` needs an `image`. The configuration format changes between picker
-  releases, so pin the picker your configuration is for. Modelplane upgrades
-  don't change a pinned image.
+- `PrefillDecode` requires both. Under `Unified`, leave both out to get
+  Modelplane's picker and [default configuration](#picker-configurations).
 
 Modelplane runs the image with llm-d's router command line:
 
@@ -129,15 +130,24 @@ serves it, and SGLang rejects it.
 
 For vLLM with `MooncakeConnector`, set `"kv_connector":"MooncakeConnector"` in
 `--kv-transfer-config` on both engines, and leave out the `VLLM_NIXL_*`
-environment. vLLM's
+environment. The sidecar's `--mooncake-bootstrap-port` must match
+`VLLM_MOONCAKE_BOOTSTRAP_PORT` on the prefill engine. Both default to 8998.
+vLLM's
 [Mooncake documentation](https://docs.vllm.ai/en/v0.31.0/features/mooncake_connector_usage.html)
 covers the rest, including the image it needs.
 
+SGLang's bootstrap port is 8998 by default too. If you change it on the
+engines, set `SGLANG_BOOTSTRAP_PORT` to the same value on the sidecar.
+
 ## Engine type
 
-Label SGLang pods `llm-d.ai/engine-type: sglang`, in either serving mode. The
-picker then reads SGLang's metric names. Without the label, the picker reads
-vLLM's names and sees a queue depth of zero. vLLM pods don't need the label.
+Label SGLang pods `llm-d.ai/engine-type: sglang`, in either serving mode, with
+or without `router`. The picker then reads SGLang's metric names. Without the
+label, the picker reads vLLM's names and sees a queue depth of zero. vLLM pods
+don't need the label.
+
+Modelplane also labels each serving pod `app` and `llm-d.ai/inference-serving`
+for the picker, replacing any `app` label your template sets.
 
 ## Ports
 
@@ -302,7 +312,9 @@ spec:
 ## Picker configurations
 
 `Unified` uses this configuration when you don't set `config`. Modelplane sets
-`blockSizeTokens` from the engine's `--block-size` or `--page-size`, or 16.
+`blockSizeTokens` from the engine's `--block-size` or `--page-size`. Without
+either, it uses 16, vLLM's default. An SGLang deployment sets `--page-size` or
+writes its own configuration.
 
 ```yaml {nocopy=true}
 apiVersion: llm-d.ai/v1alpha1
@@ -331,7 +343,7 @@ For `PrefillDecode`, this configuration is a starting point for vLLM. Copy it
 into `config`, and set `blockSizeTokens` to the engine's block size. SGLang
 needs `always-disagg-pd-decider` in place of `prefix-based-pd-decider`.
 
-```yaml {nocopy=true}
+```yaml
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
 plugins:
@@ -342,7 +354,6 @@ plugins:
     maxPrefixBlocksToMatch: 256
     lruCapacityPerServer: 31250
 - type: prefix-cache-scorer
-- type: disagg-headers-handler
 - type: queue-scorer
 - type: prefill-filter
 - type: decode-filter
@@ -372,6 +383,22 @@ schedulingProfiles:
   - pluginRef: queue-scorer
     weight: 1
 ```
+
+## Upgrading a prefill/decode deployment
+
+Before this release, Modelplane wrote the routing for a `PrefillDecode`
+deployment. After the upgrade, a `PrefillDecode` deployment without `router`
+and `endpointPicker` stops reconciling. Its `ModelReplica` reports the error,
+and its pods and router keep serving as they were. To resume, add:
+
+- `serving.router: EndpointPicker`, with `serving.endpointPicker`'s `image` and
+  `config`.
+- The sidecar in the decode member, on port 8000, with the engine's `http` port
+  declared.
+- `VLLM_NIXL_SIDE_CHANNEL_HOST` and `VLLM_NIXL_SIDE_CHANNEL_PORT` on both
+  engines, for vLLM with NIXL.
+
+The [Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) shows each one.
 
 ## Where it runs
 

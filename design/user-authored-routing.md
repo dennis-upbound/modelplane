@@ -97,7 +97,7 @@ picker returns the pod. Everything else differs between projects:
 
 | | llm-d | Dynamo 1.5 |
 |---|---|---|
-| Picker configuration | An `EndpointPickerConfig` | `DYN_*` environment variables only |
+| Picker configuration | An `EndpointPickerConfig` | `DYN_*` environment variables for its native picker. A deprecated Go picker takes an `EndpointPickerConfig`. |
 | Prefill/decode | The llm-d sidecar in the decode pod | A Dynamo frontend in the worker pods, or a standalone frontend with no picker |
 | Engine | A stock engine, such as `vllm serve` | Dynamo's wrapper, such as `python -m dynamo.vllm` |
 
@@ -114,13 +114,16 @@ its router and the router's configuration, so Modelplane never guesses which
 engines it serves.
 
 **Keep `Unified` simple.** A `Unified` deployment still gets its cluster's
-routing with nothing written.
+routing without writing a router. It labels its pods with the engine type,
+which describes the engine rather than the routing.
 
 This design doesn't cover:
 
-- Reporting a `PrefillDecode` deployment that serves without disaggregating
-  (#TBD). llm-d's picker already counts its decode-only decisions in
-  `pd_decision_total`.
+- Detecting a `PrefillDecode` pair that reports Ready but doesn't
+  disaggregate, from a wrong decider, connector, or engine-type label, or a
+  missing sidecar (#TBD). Modelplane can't check these from the API. llm-d's
+  picker counts its decode-only decisions in `llm_d_epp_pd_decision_total`,
+  which a check could read.
 - Routing to data-parallel ranks inside a pod (#500).
 
 ## Proposal
@@ -196,43 +199,47 @@ Modelplane composes the rest:
 The Kimi-K2 recipe changes to this form. This is a breaking change to
 `v1alpha1`. After the upgrade, a `PrefillDecode` replica without its routing
 stops reconciling: `compose-model-replica` returns an error, and leaves the
-running pods and router in place until the `ModelDeployment` adds `router`,
-`endpointPicker.config`, and the sidecar.
+running pods and router in place until the `ModelDeployment` sets `router` and
+`endpointPicker`. The deployment must add the sidecar too, though Modelplane
+can't check for it.
 
 ### Unified serving
 
 A `Unified` deployment that doesn't set `router` gets its cluster's routing. On
 every cluster today, that's llm-d's picker with Modelplane's default
-configuration, which reads the block size from `--block-size` or `--page-size`.
-A `Unified` deployment can set `router: EndpointPicker` to tune the picker.
+configuration, which reads the block size from `--block-size` or `--page-size`,
+or uses vLLM's default of 16. A `Unified` deployment can set
+`router: EndpointPicker` to tune the picker. Modelplane labels each serving pod
+`app` and `llm-d.ai/inference-serving` for the picker, replacing any `app`
+label the template sets.
 
 ### Placement
 
 `router: EndpointPicker` runs only on a cluster that composes an InferencePool
 for a picker the user names. Each `InferenceCluster` lists the routers it can
-compose in `status.routers`. The scheduler places a deployment that sets
-`router` only on those clusters, and reports `ReplicasScheduled=False` when none
-qualify. Every cluster today lists `EndpointPicker`. The filter lands with the
-stack-aware placement in #418.
+compose in `status.routers`, which `compose-inference-cluster` sets from the
+cluster's serving stack. Every cluster today lists `EndpointPicker`, on either
+stack. With the stack-aware placement in #418, the scheduler places a deployment
+that sets `router` only on those clusters, and reports `ReplicasScheduled=False`
+when none qualify.
 
 ### The endpoint picker
 
 `serving.endpointPicker` is valid only with `router: EndpointPicker`:
 
-- `image` is the picker image. The default is the image Modelplane is released
-  with.
-- `config` is the picker's configuration. Modelplane passes it to the picker and
-  doesn't validate it. A `Unified` deployment that omits `config` gets
-  Modelplane's default.
+- `image` is the picker image, and `config` is its configuration. Modelplane
+  passes the configuration to the picker and doesn't validate it.
+- `image` and `config` are set together. The configuration format changes
+  between router releases. A configuration states the picker it's for, and a
+  pinned picker never runs Modelplane's default configuration.
 - A `config` replaces the default whole. Modelplane doesn't merge them.
-- If `config` is set, `image` is required. The configuration format changes
-  between router releases, so a configuration must state its picker.
+- A `Unified` deployment that omits both gets Modelplane's picker and default
+  configuration.
 
 Modelplane runs the image with the command line of llm-d's router, which the
 Gateway API Inference Extension's reference picker shares:
 
-```
-
+```text
 --pool-name=<replica>-pool --pool-namespace=<namespace>
 --pool-group=inference.networking.k8s.io --config-file=/config/epp-config.yaml
 --grpc-port=9002 --metrics-port=9090 --metrics-endpoint-auth=false
@@ -243,7 +250,9 @@ pods by `modelplane.ai/serving`, and sends to port 8000. Under `PrefillDecode`,
 Modelplane labels each engine's pods `llm-d.ai/role: prefill` or
 `llm-d.ai/role: decode`, which llm-d's `prefill-filter` and `decode-filter`
 select on. If the picker rejects its configuration, the picker isn't available
-and the replica isn't Ready.
+and the replica isn't Ready. Envoy AI Gateway fails closed without a picker,
+whatever the InferencePool's failure mode. A picker outage stops requests
+rather than sending them to prefill pods.
 
 ### Containers beside the engine
 
@@ -426,6 +435,7 @@ These router settings must match the engines:
 | `--kv-connector=sglang` on the sidecar | The engines are SGLang. |
 | `always-disagg-pd-decider` in the picker configuration | An SGLang decode engine rejects a request that skips prefill. |
 | `llm-d.ai/engine-type: sglang` on the pods | The picker reads SGLang's metric names. Without it, the picker sees a queue depth of zero. |
+| `blockSizeTokens: 64` in the picker configuration | llm-d's SGLang guidance: 64, or the engine's page size if it's larger. |
 
 ## Future improvements
 
@@ -434,13 +444,17 @@ These router settings must match the engines:
 A cluster that composes a DynamoGraphDeployment would route `Unified`
 deployments with Dynamo by default. Dynamo 1.5's own picker takes no flags and
 reads `DYN_*` environment variables, so prefill/decode on Dynamo needs its own
-`router` value rather than `EndpointPicker`.
+`router` value rather than `EndpointPicker`. A `Unified` deployment keeps the
+unchanged API that [serving stacks](./serving-stacks.md) promises Dynamo
+users. A `PrefillDecode` deployment names its router on any stack.
 
 ### More container fields
 
 A namespace whose LimitRange or quota requires resource limits needs
 `resources` on every container. Containers beside the engine can't set them
-yet. The API can add `resources` to all containers at once.
+yet. The API can add `resources` to all containers at once. Containers can't
+mount volumes either. The sidecar runs with `--secure-proxy=false`, because
+`--cert-path` has nothing to point at.
 
 ### Shared picker configurations
 

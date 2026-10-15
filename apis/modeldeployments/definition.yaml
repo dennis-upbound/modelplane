@@ -175,15 +175,16 @@ spec:
                               Modelplane composes the picker's pool, Service and RBAC
                               around it.
                             x-kubernetes-validations:
-                            - rule: "!has(self.config) || has(self.image)"
-                              message: "endpointPicker.image is required when endpointPicker.config is set"
+                            - rule: "has(self.config) == has(self.image)"
+                              message: "endpointPicker.image and endpointPicker.config must be set together"
                             properties:
                               image:
                                 type: string
                                 minLength: 1
                                 description: >-
-                                  The endpoint picker image. Omitted means the image this
-                                  Modelplane release uses.
+                                  The endpoint picker image. Set together with config, since
+                                  a configuration is written for one picker release. Omitted,
+                                  under Unified, means the image this Modelplane release uses.
                               config:
                                 type: object
                                 x-kubernetes-preserve-unknown-fields: true

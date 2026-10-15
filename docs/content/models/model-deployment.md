@@ -105,11 +105,12 @@ engines:
   phase: Decode
 ```
 
-A `PrefillDecode` deployment writes its own routing. That's the endpoint
-picker's configuration and llm-d's sidecar in the decode pod, both matched to
-your engines' KV connector. Set `serving.router: EndpointPicker` and `serving.endpointPicker`,
-as [Configure Routing]({{< ref "routing.md" >}}) describes. The
-[Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) is a complete vLLM example.
+A `PrefillDecode` deployment writes its own routing. The endpoint picker's
+configuration matches your engine. The llm-d sidecar in the decode pod matches
+its KV connector. Set `serving.router: EndpointPicker` and
+`serving.endpointPicker`, as [Configure Routing]({{< ref "routing.md" >}})
+describes. The [Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) is a complete
+vLLM example.
 
 Disaggregation pays off for large models under load with strict latency targets
 and long context. For small models or low traffic, the KV-transfer overhead

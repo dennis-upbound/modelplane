@@ -92,8 +92,8 @@ spec:
                   endpointPicker:
                     type: object
                     x-kubernetes-validations:
-                    - rule: "!has(self.config) || has(self.image)"
-                      message: "endpointPicker.image is required when endpointPicker.config is set"
+                    - rule: "has(self.config) == has(self.image)"
+                      message: "endpointPicker.image and endpointPicker.config must be set together"
                     properties:
                       image:
                         type: string
