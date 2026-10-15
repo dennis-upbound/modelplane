@@ -25,7 +25,7 @@ serving:
   mode: PrefillDecode
   endpointPicker:
     image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
-    config: { ... }   # passed to the picker as is
+    config: { ... }   # optional; Modelplane doesn't read it
 ```
 
 ## Background
@@ -38,10 +38,10 @@ Modelplane's router is two components from
   request to the prefill pod that the picker chose.
 
 The [base design](./design.md) gives the engines to the user and the router to
-Modelplane. Modelplane doesn't read or inject engine flags, and the user
-configures KV transfer in those flags. The base design keeps the picker out of
-the API until a deployment needs to tune it. SGLang prefill/decode needs to
-tune it.
+Modelplane. It says Modelplane shouldn't read or inject engine flags, and that
+the user configures KV transfer in those flags. The base design keeps the picker
+out of the API until a deployment needs to tune it. SGLang prefill/decode needs
+to tune it.
 
 ### What must match
 
@@ -127,13 +127,14 @@ I propose two API changes:
 2. A member's template can hold containers beside `engine`, and a container can
    declare `ports`.
 
-A `PrefillDecode` deployment uses both. The user writes the picker
-configuration, and adds the sidecar to the decode member:
+A `PrefillDecode` deployment can use both. This is the decode member of a vLLM
+deployment with NIXL, such as the Kimi-K2 recipe. The prefill member sets the
+same environment, without the sidecar.
 
 ```yaml
 serving:
   mode: PrefillDecode
-  endpointPicker:
+  endpointPicker:                 # optional; omit it for the default picker
     image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
     config: { ... }               # optional
 engines:
@@ -147,15 +148,25 @@ engines:
         - name: sidecar             # new: a container beside the engine
           image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
           args:
-          - --kv-connector=nixlv2
+          - --secure-proxy=false
+          - --kv-connector=nixlv2   # matches the engine's NixlConnector
           - --vllm-port=8001
           ports:
           - containerPort: 8000
         - name: engine
           image: vllm/vllm-openai:v0.23.0
+          command: ["vllm", "serve", "RedHatAI/Kimi-K2-Instruct-quantized.w4a16"]
           args:
           - --port=8001
           - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer"}
+          # ... the rest of the Kimi-K2 recipe's flags
+          env:
+          - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+            value: "5557"
           ports:
           - name: http              # new: where the engine serves
             containerPort: 8001
@@ -175,7 +186,7 @@ design:
 | Sidecar | Modelplane injects it, with `--kv-connector=nixlv2` | User, as a container in the decode member's template |
 | KV transfer environment, such as `VLLM_NIXL_SIDE_CHANNEL_HOST` | Modelplane injects it | User, in the engine container's `env` |
 | Labels the picker reads, such as `llm-d.ai/engine-type` | Not set | User, in the template's `labels` |
-| The engine's port | Modelplane reads `--port` | User, as the engine's `http` port |
+| The engine's port, when another container takes 8000 | Modelplane reads `--port` | User, as the engine's `http` port |
 
 ### The endpoint picker
 
@@ -391,57 +402,23 @@ These router settings must match the engines:
 
 #### vLLM with NIXL
 
-A vLLM deployment can omit `endpointPicker` and use the default picker. This is
-the decode member's template, and the Kimi-K2 recipe changes to this form. The
-prefill member sets the same environment, without the sidecar.
-
-```yaml
-template:
-  spec:
-    containers:
-    - name: sidecar
-      image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
-      args:
-      - --secure-proxy=false
-      - --kv-connector=nixlv2
-      - --vllm-port=8001
-      ports:
-      - containerPort: 8000
-    - name: engine
-      image: vllm/vllm-openai:v0.23.0
-      command: ["vllm", "serve", "RedHatAI/Kimi-K2-Instruct-quantized.w4a16"]
-      args:
-      - --port=8001
-      - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer"}
-      # ... the rest of the Kimi-K2 recipe's flags
-      env:
-      - name: VLLM_NIXL_SIDE_CHANNEL_HOST
-        valueFrom:
-          fieldRef:
-            fieldPath: status.podIP
-      - name: VLLM_NIXL_SIDE_CHANNEL_PORT
-        value: "5557"
-      ports:
-      - name: http
-        containerPort: 8001
-```
-
+The sketch at the start of this section is a vLLM decode member. A vLLM
+deployment can omit `endpointPicker` and use the default picker, which suits
+`NixlConnector`.
 
 ## Future improvements
 
 ### More container fields
 
-A container beside the engine takes the same fields
-as the engine. A namespace whose LimitRange or quota requires resource limits
-needs `resources` on every container. The API can add `resources` to all
-containers at once.
+A container beside the engine takes the same fields as the engine. A namespace
+whose LimitRange or quota requires resource limits needs `resources` on every
+container. The API can add `resources` to all containers at once.
 
 ### Shared picker configurations
 
-Deployments that use the same engine repeat
-the same picker configuration. If recipes show this, a cluster-scoped resource
-can hold a named configuration that `endpointPicker` refers to. MetricMapping
-is a similar resource today.
+Deployments that use the same engine repeat the same picker configuration. If
+recipes show this, a cluster-scoped resource can hold a named configuration that
+`endpointPicker` refers to. MetricMapping is a similar resource today.
 
 ## Alternatives considered
 
