@@ -158,7 +158,7 @@ class Container(BaseModel):
     """
     ports: list[Port] | None = Field(None, max_length=8)
     """
-    Ports the container listens on. The engine container's port named "http" is where Modelplane probes the engine and scrapes its metrics. Without one, the engine serves on 8000. Only the engine container may name a port "http".
+    Ports the container listens on. The engine container's port named "http" is where Modelplane probes the engine and scrapes its metrics. Without one, the engine serves on 8000. A container in front of the engine declares 8000, and the engine then declares its "http" port.
     """
 
 
