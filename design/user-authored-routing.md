@@ -114,8 +114,9 @@ its router and the router's configuration, so Modelplane never guesses which
 engines it serves.
 
 **Keep `Unified` simple.** A `Unified` deployment gets its cluster's routing
-without writing a router. At most it labels its engine: an SGLang deployment
-sets `llm-d.ai/engine-type: sglang`.
+without writing a router. At most it labels its engine, because the cluster's
+picker reads each engine's own metric names. An SGLang deployment sets
+`llm-d.ai/engine-type: sglang`.
 
 This design doesn't cover:
 
