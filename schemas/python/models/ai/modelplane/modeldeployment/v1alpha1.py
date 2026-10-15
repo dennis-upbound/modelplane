@@ -254,11 +254,15 @@ class EndpointPicker(BaseModel):
 class Serving(BaseModel):
     endpointPicker: EndpointPicker | None = None
     """
-    The endpoint picker that routes requests to the engines, under either mode. Omitted means Modelplane's picker with its default configuration for the mode. Modelplane composes the picker's pool, Service and RBAC around it.
+    The endpoint picker, when router is EndpointPicker. Valid in either mode. Omitted means Modelplane's picker with its default configuration for the mode. Modelplane composes the picker's pool, Service and RBAC around it.
     """
     mode: Literal['Unified', 'PrefillDecode']
     """
     Unified serves prefill and decode on one engine. PrefillDecode splits them across two engines, each marking its phase as Prefill or Decode.
+    """
+    router: Literal['EndpointPicker'] | None = None
+    """
+    The router the user writes. Omitted, the cluster routes the deployment as it does by default. EndpointPicker runs the endpoint picker set in endpointPicker, and the user writes any sidecar the picker needs as a container in the member templates.
     """
 
 

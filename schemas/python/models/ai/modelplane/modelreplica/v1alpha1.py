@@ -173,6 +173,7 @@ class EndpointPicker(BaseModel):
 class Serving(BaseModel):
     endpointPicker: EndpointPicker | None = None
     mode: Literal['Unified', 'PrefillDecode'] | None = 'Unified'
+    router: Literal['EndpointPicker'] | None = None
 
 
 class SpecModel(BaseModel):
