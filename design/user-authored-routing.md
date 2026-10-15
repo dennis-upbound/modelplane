@@ -9,24 +9,25 @@
 
 A `ModelDeployment` lets the user configure the engines but not the router.
 Modelplane configures the router for one case: vLLM with its `NixlConnector`.
-An SGLang prefill/decode deployment gets a router it can't use (#502). Each new
-KV transfer format needs a Modelplane release.
+An SGLang prefill/decode deployment gets a router it can't use, and reports
+Ready while it rejects requests (#502). Each new KV transfer format needs a
+Modelplane release.
 
-I propose an optional `serving.router`:
+I propose the user writes the router for prefill/decode serving:
 
-- Omitted, the cluster routes the deployment as it does today. Existing
-  deployments don't change.
-- `router: EndpointPicker` hands the routing to the user. They set the endpoint
-  picker's image and configuration in `serving.endpointPicker`, and write the
-  sidecar into the decode pod as a container beside `engine` (#108).
+- `serving.router: EndpointPicker` hands the routing to the user. They set the
+  endpoint picker's image and configuration in `serving.endpointPicker`, and
+  write the sidecar into the decode pod as a container beside `engine` (#108).
+- A `PrefillDecode` deployment must set both. Only `Unified` serving keeps a
+  default, where the cluster routes the deployment.
 
 ```yaml
 serving:
   mode: PrefillDecode
-  router: EndpointPicker      # optional; omitted, the cluster routes
+  router: EndpointPicker      # required under PrefillDecode
   endpointPicker:
     image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
-    config: { ... }           # optional; Modelplane doesn't read it
+    config: { ... }           # required under PrefillDecode
 ```
 
 ## Background
@@ -59,7 +60,7 @@ can't decode alone.
 | Engine and KV connector | Sidecar `--kv-connector` | Decider can skip prefill |
 |---|---|---|
 | vLLM [`NixlConnector`](https://docs.vllm.ai/en/v0.31.0/features/nixl_connector_usage.html) | `nixlv2` | Yes |
-| vLLM `MooncakeConnector` | [`mooncake`](https://github.com/llm-d/llm-d-router/blob/v0.9.0/docs/disaggregation.md) | Yes |
+| vLLM [`MooncakeConnector`](https://docs.vllm.ai/en/v0.31.0/features/mooncake_connector_usage.html) | `mooncake` | Yes |
 | [SGLang](https://docs.sglang.io/docs/advanced_features/pd_disaggregation), any transfer backend | `sglang` | No. Decode [rejects the request](https://github.com/sgl-project/sglang/blob/v0.5.21/python/sglang/srt/managers/scheduler.py#L2836-L2851) with HTTP 400. |
 
 ### What Modelplane composes today
@@ -73,12 +74,18 @@ Modelplane configures the router for vLLM with NIXL:
 - It reads `--port` from the decode engine's args, to find the engine behind the
   sidecar.
 - It reads `--block-size` or `--page-size` from the engine's args, to configure
-  prefix-cache scoring. #179 calls this a hack.
+  prefix-cache scoring. #179 tracks removing it.
 
 So other engines don't work. SGLang needs a different decider, connector, and
 pod label, and each new connector needs a Modelplane release. Router releases
 break things too: llm-d-router v0.11.0 deprecates the sidecar's `--vllm-port`
 flag and removes a plugin Modelplane uses.
+
+A wrong default costs `Unified` serving some load-balancing quality. It costs
+`PrefillDecode` serving a pair that reports Ready and rejects requests. A
+default that suits both vLLM and SGLang, such as an always-disaggregate decider,
+would still have Modelplane assert which engines its configuration works for,
+and the next engine that doesn't fit would fail the same way.
 
 ### Routers differ by serving stack
 
@@ -92,19 +99,20 @@ picker returns the pod. Everything else differs between projects:
 | Prefill/decode | The llm-d sidecar in the decode pod | A Dynamo frontend in the worker pods, or a standalone frontend with no picker |
 | Engine | A stock engine, such as `vllm serve` | Dynamo's wrapper, such as `python -m dynamo.vllm` |
 
-A [composed DynamoGraphDeployment](./serving-stacks.md) would bring Dynamo's
-own router to a cluster. A deployment that writes llm-d's picker configuration
-and sidecar only runs where llm-d routes.
+A prefill/decode deployment's engines are already specific to one stack. A
+default router wouldn't make it portable.
 
 ## Goals
 
 **Serve any engine the router supports.** A user can serve a new engine or KV
 connector with no Modelplane release.
 
-**Let the cluster route by default.** A deployment that doesn't set `router`
-gets its cluster's routing. On every cluster now, that's the routing Modelplane
-composes today, so existing deployments don't change. A future cluster can bring
-its own router without an API change.
+**Make prefill/decode routing explicit.** A `PrefillDecode` deployment states
+its router and the router's configuration, so Modelplane never guesses which
+engines it serves.
+
+**Keep `Unified` simple.** A `Unified` deployment still gets its cluster's
+routing with nothing written.
 
 This design doesn't cover:
 
@@ -115,18 +123,20 @@ This design doesn't cover:
 
 ## Proposal
 
-I propose three API changes:
+The API changes in three places:
 
 1. `serving.router` names the router the user writes. Its one value is
-   `EndpointPicker`. It's optional, and has no default.
+   `EndpointPicker`. It's required under `PrefillDecode` and optional under
+   `Unified`.
 2. `serving.endpointPicker` sets the picker's image and configuration. It's
-   valid only with `router: EndpointPicker`.
+   valid only with `router: EndpointPicker`, and its `config` is required under
+   `PrefillDecode`.
 3. A member's template can hold containers beside `engine`, and a container can
    declare `ports`.
 
-With `router: EndpointPicker`, the user writes the routing in the
-`ModelDeployment`. This is the decode member of a vLLM deployment with NIXL.
-The comments mark each part the user writes:
+A `PrefillDecode` deployment writes its routing in the `ModelDeployment`. This
+is the decode member of a vLLM deployment with NIXL. The comments mark each part
+the user writes:
 
 ```yaml
 serving:
@@ -134,16 +144,13 @@ serving:
   router: EndpointPicker
   endpointPicker:
     image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0  # the picker image
-    config: { ... }                  # the picker configuration (optional)
+    config: { ... }                  # the picker configuration
 engines:
 - name: decode
   phase: Decode
   members:
   - role: Standalone
     template:
-      metadata:
-        labels:
-          llm-d.ai/engine-type: vllm # a label the picker reads
       spec:
         containers:
         - name: sidecar              # the sidecar, on port 8000
@@ -170,12 +177,11 @@ engines:
           - name: http               # the engine's port
             containerPort: 8001
 ```
-
 The prefill member sets the same environment, without the sidecar. Modelplane
-injects neither. With the llm-d router, a decode pod without the sidecar sends
-every request to decode alone. vLLM serves it, and SGLang rejects it.
+injects neither. A multi-node decode engine puts the sidecar in its `Leader`
+member's template.
 
-Modelplane composes the rest, whether or not `router` is set:
+Modelplane composes the rest:
 
 - The InferencePool and the HTTPRoute.
 - The picker's Deployment, Service, and RBAC, and the flags that connect the
@@ -184,24 +190,15 @@ Modelplane composes the rest, whether or not `router` is set:
   `phase`.
 - A memory-backed `/dev/shm` on each engine container.
 
-### The cluster's routing
+The Kimi-K2 recipe changes to this form. Existing `PrefillDecode` deployments
+add their routing before they upgrade.
 
-With `router` omitted, the cluster routes the deployment. On every cluster
-today, Modelplane sets every part the comments above mark, for vLLM with NIXL,
-as it does now. It reads the block size from `--block-size` or `--page-size`,
-and doesn't set the engine-type label. Modelplane doesn't add engines or
-connectors to this routing. A deployment that needs one sets `router`.
+### Unified serving
 
-A deployment that forgets `router` gets a router its engines can't use. So on
-this path only, Modelplane checks the decode engine's args for one format. If
-they set `--disaggregation-mode`, or a `kv_connector` other than
-`NixlConnector`, the replica gets a warning to set `router`. The check covers
-the one format this routing serves, so it doesn't grow with new engines.
-
-Taking over the routing is all or nothing. Tuning the picker's scoring means
-writing the sidecar and the KV transfer environment too. A picker configuration
-only means something to a known picker, and the cluster's routing doesn't
-promise one.
+A `Unified` deployment that doesn't set `router` gets its cluster's routing. On
+every cluster today, that's llm-d's picker with Modelplane's default
+configuration, which reads the block size from `--block-size` or `--page-size`.
+A `Unified` deployment can set `router: EndpointPicker` to tune the picker.
 
 ### Placement
 
@@ -219,40 +216,38 @@ stack-aware placement in #418.
 - `image` is the picker image. The default is the image Modelplane is released
   with.
 - `config` is the picker's configuration. Modelplane passes it to the picker and
-  doesn't validate it.
-- If `config` is omitted, Modelplane uses its default configuration for the
-  serving mode. If `config` is set, it replaces the default. Modelplane doesn't
-  merge them.
+  doesn't validate it. A `Unified` deployment that omits `config` gets
+  Modelplane's default.
+- A `config` replaces the default whole. Modelplane doesn't merge them.
 - If `config` is set, `image` is required. The configuration format changes
   between router releases, so a configuration must state its picker.
 
-Modelplane runs the image with the command line of the Gateway API Inference
-Extension's reference picker, which llm-d's router accepts:
+Modelplane runs the image with the command line of llm-d's router, which the
+Gateway API Inference Extension's reference picker shares:
 
 ```
 --pool-name=<replica>-pool --pool-namespace=<namespace>
 --pool-group=inference.networking.k8s.io --config-file=/config/epp-config.yaml
 --grpc-port=9002 --metrics-port=9090 --metrics-endpoint-auth=false
 ```
-
 The picker serves gRPC on 9002. The InferencePool selects the replica's serving
 pods by `modelplane.ai/serving`, and sends to port 8000. Under `PrefillDecode`,
 Modelplane labels each engine's pods `llm-d.ai/role: prefill` or
-`llm-d.ai/role: decode`, which the picker's prefill and decode filters select
-on. If the picker rejects its configuration, the picker isn't available and the
-replica isn't Ready.
+`llm-d.ai/role: decode`, which llm-d's `prefill-filter` and `decode-filter`
+select on. If the picker rejects its configuration, the picker isn't available
+and the replica isn't Ready.
 
 ### Containers beside the engine
 
-This design adopts #108, for any `router`. A member's template can list
+This design adopts #108, in either serving mode. A member's template can list
 containers beside `engine`:
 
 - Exactly one container is named `engine`, and container names are unique.
 - A container beside `engine` takes the same fields as `engine`: `image`,
   `command`, `args`, `env`, and `ports`.
-- Modelplane changes only `engine`. It adds device claims, `MODELPLANE_`
-  environment, ModelCache mounts, `/dev/shm`, and the readiness probe. The
-  pod's readiness follows the engine.
+- Modelplane doesn't change any container except `engine`. It adds device
+  claims, `MODELPLANE_` environment, ModelCache mounts, `/dev/shm`, and the
+  readiness probe. The pod's readiness follows the engine.
 - Each member has its own template. The user chooses which pods of a gang get a
   container.
 
@@ -262,32 +257,27 @@ A serving pod receives requests on port 8000, as today. The engine's port named
 `http` is where Modelplane probes the engine and the collector scrapes its
 metrics. It defaults to 8000, so an engine alone in its pod declares nothing.
 
-When something else takes 8000, the engine declares its `http` port on another
-port, such as 8001. The probe must reach the engine itself, because the llm-d
-sidecar answers `/health` without asking the engine. Port 8000 goes to:
+When a container is in front of the engine, such as the sidecar:
 
-- A container the user writes in front of the engine, such as the sidecar. It
-  declares port 8000, and passes requests to the engine. The picker reads
-  `/metrics` there too.
-- The sidecar the cluster's routing injects into a `PrefillDecode` decode pod.
-  An existing deployment that doesn't declare the engine's port keeps working:
-  Modelplane reads it from `--port`, as today.
+- That container declares port 8000, and passes requests to the engine. It must
+  pass `/metrics` through too, because the picker reads it there.
+- The engine declares its `http` port on another port, such as 8001. The probe
+  must reach the engine itself, because the llm-d sidecar answers `/health`
+  without asking the engine.
 
 A container that doesn't serve, such as a log shipper, doesn't declare a port,
-and the engine doesn't either. CEL makes sure exactly one container serves 8000.
-
-Only serving pods (a `Standalone` pod, or a gang's leader) get the probe. In a
-multi-node decode engine, the sidecar goes in the `Leader` member's template.
+and the engine doesn't either. CEL allows at most one container to declare 8000,
+and requires one when the engine's `http` port is elsewhere. Only serving pods
+(a `Standalone` pod, or a gang's leader) get the probe, so a `Worker` member's
+ports aren't checked.
 
 ### Example
 
-The Kimi-K2 recipe omits `router`, and doesn't change. This SGLang deployment
-sets it, because the cluster's routing serves only vLLM with NIXL. It serves
-Laguna-S-2.1 on two 8x H100 nodes, one for each phase. The engines come from the
-[Laguna SGLang
+This SGLang deployment serves Laguna-S-2.1 on two 8x H100 nodes, one for each
+phase. The engines come from the [Laguna SGLang
 recipe](../docs/manifests/recipes/laguna/model-deployment-sglang.yaml), with the
 disaggregation flags from llm-d's [SGLang
-guide](https://github.com/llm-d/llm-d/tree/v0.8.0/guides/pd-disaggregation/modelserver/gpu/sglang/base).
+guide](https://github.com/llm-d/llm-d/tree/v0.9.0/guides/pd-disaggregation/modelserver/gpu/sglang/base).
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -420,7 +410,6 @@ spec:
                 - name: http
                   containerPort: 8001
 ```
-
 These router settings must match the engines:
 
 | Router setting | Why |
@@ -433,12 +422,10 @@ These router settings must match the engines:
 
 ### Dynamo
 
-A cluster that composes a DynamoGraphDeployment would route with Dynamo by
-default. A default-routed deployment would still need its engines to run under
-Dynamo, which needs a stock-engine wrapper
-([dynamo#10835](https://github.com/ai-dynamo/dynamo/issues/10835), a draft).
-Dynamo 1.5's own picker takes no flags and reads `DYN_*` environment variables,
-so it needs its own `router` value rather than `EndpointPicker`.
+A cluster that composes a DynamoGraphDeployment would route `Unified`
+deployments with Dynamo by default. Dynamo 1.5's own picker takes no flags and
+reads `DYN_*` environment variables, so prefill/decode on Dynamo needs its own
+`router` value rather than `EndpointPicker`.
 
 ### More container fields
 

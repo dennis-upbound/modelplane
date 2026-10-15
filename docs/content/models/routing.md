@@ -1,7 +1,7 @@
 ---
 title: Configure Routing
 weight: 15
-description: Write the endpoint picker and the prefill/decode sidecar yourself, for engines the cluster's routing doesn't serve.
+description: Write the endpoint picker and the prefill/decode sidecar for your engines.
 ---
 <!-- vale write-good.Passive = NO -->
 **API:** [`modelplane.ai/v1alpha1` · ModelDeployment]({{< ref "/reference/modeldeployments" >}})
@@ -17,34 +17,19 @@ This page uses these terms:
 | The sidecar | A container in each decode pod that sends the prefill half of a request to the prefill pod the picker chose |
 | KV connector | The engine setting that moves the KV cache between pods, such as vLLM's `NixlConnector` |
 
-By default, the cluster chooses the router. On every cluster now, that's llm-d's
-endpoint picker, which picks a pod by prefix cache and load. Under
-`PrefillDecode` serving, the cluster's routing also adds llm-d's sidecar to each
-decode pod, configured for vLLM with its `NixlConnector`. You don't write any of
-it.
+How much you write depends on the serving mode:
 
-Set `serving.router: EndpointPicker` to write the routing yourself. You need it
-for:
+- **`Unified`.** The cluster routes your deployment with llm-d's endpoint
+  picker, which picks a pod by prefix cache and load. You don't write anything.
+  Set `serving.router: EndpointPicker` only to tune the picker.
+- **`PrefillDecode`.** You write the router. Set
+  `serving.router: EndpointPicker`, the picker's configuration in
+  `serving.endpointPicker`, and the sidecar in the decode member. Modelplane
+  rejects a `PrefillDecode` deployment without them.
 
-- SGLang prefill/decode, which needs a different picker configuration and
-  sidecar.
-- A KV connector other than NIXL, such as vLLM's `MooncakeConnector`.
-- Picker scoring tuned for your workload.
+## What you write for prefill/decode
 
-{{< hint "important" >}}
-An SGLang or Mooncake `PrefillDecode` deployment without `router` gets a sidecar
-for vLLM with NIXL, and its requests fail. Modelplane warns on the replica when
-the decode engine's args don't look like vLLM with NIXL.
-{{< /hint >}}
-
-Taking over is all or nothing. To tune the picker's scoring, you also write the
-sidecar and the KV transfer environment.
-
-## What you write
-
-With `router: EndpointPicker`, you set the picker in `serving.endpointPicker`
-and write the sidecar into the decode member. This decode member is vLLM with
-NIXL, and the comments mark what you write:
+This decode member is vLLM with NIXL, and the comments mark what you write:
 
 ```yaml {nocopy=true}
 serving:
@@ -52,16 +37,13 @@ serving:
   router: EndpointPicker
   endpointPicker:
     image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0  # the picker image
-    config: { ... }                  # the picker configuration (optional)
+    config: { ... }                  # the picker configuration
 engines:
 - name: decode
   phase: Decode
   members:
   - role: Standalone
     template:
-      metadata:
-        labels:
-          llm-d.ai/engine-type: vllm # a label the picker reads
       spec:
         containers:
         - name: sidecar              # the sidecar, on port 8000
@@ -91,7 +73,7 @@ engines:
 The prefill member sets the same environment, without the sidecar. For a
 multi-node decode engine, the sidecar goes in the `Leader` member's template.
 
-Modelplane still composes the InferencePool, the HTTPRoute, and the picker's
+Modelplane composes the InferencePool, the HTTPRoute, and the picker's
 Deployment, Service, and RBAC. It gives each engine container a `/dev/shm` in
 memory. It doesn't add the sidecar or any KV transfer environment.
 
@@ -101,37 +83,31 @@ memory. It doesn't add the sidecar or any KV transfer environment.
   released with.
 - `config` is the picker's configuration, such as an llm-d
   `EndpointPickerConfig`. Modelplane passes it to the picker without checking
-  it. Without it, Modelplane uses its
-  [default configuration](#default-picker-configurations) for the serving mode.
-- A `config` replaces the default. Modelplane doesn't merge the two. To change
-  one setting, copy the default and edit it.
+  it. `PrefillDecode` requires it. Under `Unified`, Modelplane uses its
+  [default configuration](#picker-configurations) when you leave it out.
+- A `config` replaces the default. Modelplane doesn't merge the two.
 - A `config` needs an `image`. The configuration format changes between picker
   releases, so pin the picker your configuration is for. Modelplane upgrades
   don't change a pinned image.
 
-SGLang needs a `config`. The default configuration's decider skips prefill for
-short or cached prompts, and an SGLang decode engine rejects those requests.
-
-Modelplane runs the image with the command line of the Gateway API Inference
-Extension's reference picker, which llm-d's router accepts:
+Modelplane runs the image with llm-d's router command line:
 
 ```text {nocopy=true}
 --pool-name=<replica>-pool --pool-namespace=<namespace>
 --pool-group=inference.networking.k8s.io --config-file=/config/epp-config.yaml
 --grpc-port=9002 --metrics-port=9090 --metrics-endpoint-auth=false
 ```
-
 The picker serves gRPC on port 9002. Under `PrefillDecode`, Modelplane labels
-each engine's pods `llm-d.ai/role: prefill` or `llm-d.ai/role: decode`, which the
-picker's `prefill-filter` and `decode-filter` select on. A picker that rejects
+each engine's pods `llm-d.ai/role: prefill` or `llm-d.ai/role: decode`, which
+llm-d's `prefill-filter` and `decode-filter` select on. A picker that rejects
 its configuration doesn't become available, and the replica doesn't become
 Ready.
 
 ## The sidecar
 
-Under `PrefillDecode` serving, you write the sidecar as a container beside
-`engine` in the decode member's template. A member's template can hold other
-containers too. Modelplane changes only the container named `engine`.
+You write the sidecar as a container beside `engine` in the decode member's
+template. A member's template can hold other containers too. Modelplane doesn't
+change any container except `engine`.
 
 The sidecar and the picker must match your engines:
 
@@ -139,21 +115,25 @@ The sidecar and the picker must match your engines:
 |---|---|---|
 | vLLM with `NixlConnector` | `nixlv2` | Any, such as `prefix-based-pd-decider` |
 | vLLM with `MooncakeConnector` | `mooncake` | Any |
-| SGLang, any transfer backend | `sglang` | `always-disagg-pd-decider` |
+| SGLang, any transfer backend | `sglang` | `always-disagg-pd-decider`. An SGLang decode engine rejects a request that skips prefill. |
 
 The sidecar's `--vllm-port` names the decode engine's port, whatever the engine
 is.
 
-Label SGLang pods `llm-d.ai/engine-type: sglang`. The picker then reads SGLang's
-metric names. Without the label, the picker reads vLLM's names and sees a queue
-depth of zero. vLLM pods don't need the label.
-
-There's no Mooncake example yet. Mooncake needs its own engine configuration,
-as vLLM's `MooncakeConnector` documentation describes, and an image that
-includes Mooncake rather than only NIXL.
-
 A decode pod without the sidecar sends every request to decode alone. vLLM
 serves it, and SGLang rejects it.
+
+For vLLM with `MooncakeConnector`, set `"kv_connector":"MooncakeConnector"` in
+`--kv-transfer-config` on both engines, and leave out the `VLLM_NIXL_*`
+environment. vLLM's
+[Mooncake documentation](https://docs.vllm.ai/en/v0.31.0/features/mooncake_connector_usage.html)
+covers the rest, including the image it needs.
+
+## Engine type
+
+Label SGLang pods `llm-d.ai/engine-type: sglang`, in either serving mode. The
+picker then reads SGLang's metric names. Without the label, the picker reads
+vLLM's names and sees a queue depth of zero. vLLM pods don't need the label.
 
 ## Ports
 
@@ -163,15 +143,17 @@ metrics. It defaults to 8000, so an engine alone in its pod declares nothing.
 
 When a container is in front of the engine, such as the sidecar:
 
-- That container declares port 8000, and passes requests to the engine. The
-  picker reads `/metrics` there too.
+- That container declares port 8000, and passes requests to the engine. It must
+  pass `/metrics` through too, because the picker reads it there.
 - The engine declares its `http` port on another port, such as 8001. The health
   check must reach the engine itself, because the llm-d sidecar answers
   `/health` without asking the engine.
 
 A container that doesn't serve, such as a log shipper, doesn't declare a port,
-and the engine doesn't either. Modelplane rejects a `ModelDeployment` whose
-declared ports leave port 8000 to no container, or to more than one.
+and the engine doesn't either. Modelplane rejects a pod where more than one
+container declares 8000, or where the engine moves off 8000 and no other
+container declares it. A `Worker` member's ports aren't checked, because worker
+pods don't receive requests.
 
 ## Example: SGLang prefill and decode
 
@@ -312,13 +294,37 @@ spec:
                 - name: http
                   containerPort: 8001
 ```
-## Default picker configurations
+## Picker configurations
 
-Modelplane runs these configurations when you don't set `config`. Modelplane sets
+`Unified` uses this configuration when you don't set `config`. Modelplane sets
 `blockSizeTokens` from the engine's `--block-size` or `--page-size`, or 16.
 
-{{< tabs >}}
-{{< tab "PrefillDecode" >}}
+```yaml {nocopy=true}
+apiVersion: llm-d.ai/v1alpha1
+kind: EndpointPickerConfig
+plugins:
+- type: approx-prefix-cache-producer
+  parameters:
+    autoTune: false
+    blockSizeTokens: 16
+    maxPrefixBlocksToMatch: 256
+    lruCapacityPerServer: 31250
+- type: prefix-cache-scorer
+- type: queue-scorer
+- type: max-score-picker
+schedulingProfiles:
+- name: default
+  plugins:
+  - pluginRef: max-score-picker
+  - pluginRef: prefix-cache-scorer
+    weight: 2
+  - pluginRef: queue-scorer
+    weight: 1
+```
+For `PrefillDecode`, this configuration is a starting point for vLLM. Copy it
+into `config`, and set `blockSizeTokens` to the engine's block size. SGLang
+needs `always-disagg-pd-decider` in place of `prefix-based-pd-decider`.
+
 ```yaml {nocopy=true}
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
@@ -360,35 +366,10 @@ schedulingProfiles:
   - pluginRef: queue-scorer
     weight: 1
 ```
-{{< /tab >}}
-{{< tab "Unified" >}}
-```yaml {nocopy=true}
-apiVersion: llm-d.ai/v1alpha1
-kind: EndpointPickerConfig
-plugins:
-- type: approx-prefix-cache-producer
-  parameters:
-    autoTune: false
-    blockSizeTokens: 16
-    maxPrefixBlocksToMatch: 256
-    lruCapacityPerServer: 31250
-- type: prefix-cache-scorer
-- type: queue-scorer
-- type: max-score-picker
-schedulingProfiles:
-- name: default
-  plugins:
-  - pluginRef: max-score-picker
-  - pluginRef: prefix-cache-scorer
-    weight: 2
-  - pluginRef: queue-scorer
-    weight: 1
-```
-{{< /tab >}}
-{{< /tabs >}}
-
 ## Where it runs
 
 Each `InferenceCluster` lists the routers it can compose in `status.routers`.
-The scheduler places a deployment that sets `router` only on clusters that list
-it. When none do, the deployment's `ReplicasScheduled` condition is `False`.
+Once placement by serving stack
+([#418](https://github.com/modelplaneai/modelplane/issues/418)) lands, the
+scheduler places a deployment that sets `router` only on clusters that list it.
+When none do, the deployment's `ReplicasScheduled` condition is `False`.

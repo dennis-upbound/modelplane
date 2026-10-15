@@ -100,9 +100,7 @@ spec:
                     x-kubernetes-validations:
                     - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || size(self.engines) == 2"
                       message: "PrefillDecode serving requires exactly two engines (one Prefill, one Decode)"
-                    - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || has(self.serving.router) || self.engines.all(e, !has(e.phase) || e.phase != 'Decode' || e.members.all(m, !has(m.template.spec) || m.template.spec.containers.all(c, !has(c.ports) || c.ports.all(p, p.containerPort != 8000))))"
-                      message: "with serving.router omitted, the cluster's routing puts its sidecar on 8000 in a Decode engine's pod, so no container there may declare containerPort 8000"
-                    - rule: "!has(self.engines) || self.engines.all(e, e.members.all(m, !has(m.template.spec) || (has(self.serving) && self.serving.mode == 'PrefillDecode' && !has(self.serving.router) && has(e.phase) && e.phase == 'Decode') || !m.template.spec.containers.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000)) || m.template.spec.containers.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000))))"
+                    - rule: "!has(self.engines) || self.engines.all(e, e.members.all(m, !has(m.template.spec) || (has(m.role) && m.role == 'Worker') || !m.template.spec.containers.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000)) || m.template.spec.containers.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000))))"
                       message: "when an engine container's 'http' port isn't 8000, another container in its pod must declare containerPort 8000"
                     - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || self.engines.exists_one(e, has(e.phase) && e.phase == 'Prefill')"
                       message: "PrefillDecode serving requires exactly one engine with phase Prefill"
@@ -139,6 +137,8 @@ spec:
                         x-kubernetes-validations:
                         - rule: "!has(self.endpointPicker) || (has(self.router) && self.router == 'EndpointPicker')"
                           message: "serving.endpointPicker may only be set when serving.router is EndpointPicker"
+                        - rule: "!has(self.mode) || self.mode != 'PrefillDecode' || (has(self.router) && has(self.endpointPicker) && has(self.endpointPicker.config))"
+                          message: "PrefillDecode serving requires serving.router EndpointPicker and serving.endpointPicker.config"
                         description: >-
                           How the deployment is served from the cluster edge to its
                           engines. Modelplane fronts the serving pods with an
@@ -161,10 +161,11 @@ spec:
                             type: string
                             enum: [EndpointPicker]
                             description: >-
-                              The router the user writes. Omitted, the cluster routes the
-                              deployment as it does by default. EndpointPicker runs the
-                              endpoint picker set in endpointPicker, and the user writes any
-                              sidecar the picker needs as a container in the member templates.
+                              The router the user writes. Required under PrefillDecode.
+                              Omitted under Unified, the cluster routes the deployment.
+                              EndpointPicker runs the endpoint picker set in endpointPicker,
+                              and the user writes any sidecar the picker needs as a container
+                              in the member templates.
                           endpointPicker:
                             type: object
                             description: >-
@@ -188,8 +189,8 @@ spec:
                                 description: >-
                                   The picker's configuration, such as an llm-d
                                   EndpointPickerConfig, passed to the picker without
-                                  Modelplane reading it. It replaces Modelplane's default
-                                  configuration whole.
+                                  Modelplane reading it. Required under PrefillDecode. It
+                                  replaces Modelplane's default configuration whole.
                       tolerations:
                         type: array
                         description: >-
@@ -509,6 +510,8 @@ spec:
                                               message: "exactly one container must be named 'engine'"
                                             - rule: "!self.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000)) || self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000))"
                                               message: "when another container declares containerPort 8000, the engine container must declare its 'http' port on a different port"
+                                            - rule: "self.filter(c, has(c.ports) && c.ports.exists(p, p.containerPort == 8000)).size() <= 1"
+                                              message: "at most one container in a pod may declare containerPort 8000"
                                             items:
                                               type: object
                                               required: [name, image]
