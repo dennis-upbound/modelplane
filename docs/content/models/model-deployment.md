@@ -12,8 +12,9 @@ cluster.
 
 Modelplane is unopinionated about the engine itself. You bring the container and
 its flags, and Modelplane shapes a serving topology around it. The engine flags
-you write carry parallelism, quantization, and KV transfer, never injected by
-Modelplane.
+you write carry parallelism, quantization, and KV transfer. Modelplane never
+injects engine flags. For [disaggregated serving](#disaggregated-serving), the
+cluster's default routing adds environment, listed below.
 
 As with a Kubernetes Deployment, `spec.replicas` sets the replica count and
 `spec.template` describes each replica. Labels for the composed ModelReplicas
@@ -101,15 +102,17 @@ engines:
   phase: Decode
 ```
 
-By default, the cluster routes the pair. On today's clusters that routing is for
-vLLM with its `NixlConnector`. Modelplane adds llm-d's sidecar to each decode pod
-on port 8000, and sets the NIXL address on every engine. Your engines set the
-rest:
+By default, the cluster routes the pair. On every cluster now, that routing is
+for vLLM with its `NixlConnector`. Modelplane adds llm-d's sidecar to each
+decode pod on port 8000. It sets `VLLM_NIXL_SIDE_CHANNEL_HOST` to the pod's IP
+and `VLLM_NIXL_SIDE_CHANNEL_PORT` to 5557 on every engine. Each engine then
+advertises an address that its peer connects to. Your engines set the rest:
 
 - `--kv-transfer-config` with `"kv_connector":"NixlConnector"` on both engines,
   with `kv_role` `kv_producer` on prefill and `kv_consumer` on decode.
 - `--port` on the decode engine, to a port other than 8000, such as 8001. The
-  sidecar takes 8000 and forwards to the port you set.
+  sidecar takes 8000 and forwards to that port. You can also declare it as the
+  engine's `http` port.
 
 The [Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) is a complete example. For
 SGLang, another KV connector, or your own picker configuration, set
@@ -120,10 +123,10 @@ Disaggregation pays off for large models under load with strict latency targets
 and long context. For small models or low traffic, the KV-transfer overhead
 outweighs the benefit, so unified serving is the default.
 
-It requires an engine image that includes the **NIXL** KV-transfer runtime.
-vLLM's `NixlConnector` (and SGLang's prefill/decode transfer) import the `nixl`
-package, so disaggregated engines crash at startup with `NIXL is not available`
-on an image that lacks it. Recent vanilla `vllm/vllm-openai` images include NIXL,
+With a NIXL connector, the engine image must include the **NIXL** KV-transfer
+runtime. vLLM's `NixlConnector` (and SGLang's NIXL transfer backend) import the
+`nixl` package. On an image without it, the engines crash at startup with
+`NIXL is not available`. Recent vanilla `vllm/vllm-openai` images include NIXL,
 so pin a current tag rather than an old one. The engine image is yours to choose,
 so this is a prerequisite Modelplane does not bundle for you.
 
@@ -267,6 +270,9 @@ autoscaling.
 {{< /tab >}}
 {{< tab "Multi-node" >}}
 {{< manifests "concepts/model-deployment-multinode.yaml" >}}
+{{< /tab >}}
+{{< tab "Disaggregated" >}}
+{{< manifests "recipes/kimi-k2/model-deployment.yaml" >}}
 {{< /tab >}}
 {{< /tabs >}}
 <!-- vale write-good.Passive = YES -->

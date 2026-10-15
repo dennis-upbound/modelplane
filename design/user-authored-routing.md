@@ -103,13 +103,14 @@ connector with no Modelplane release.
 
 **Let the cluster route by default.** A deployment that doesn't set `router`
 gets its cluster's routing. On every cluster now, that's the routing Modelplane
-composes today, so existing deployments don't change. A future Dynamo cluster
-can route the same deployment with Dynamo.
+composes today, so existing deployments don't change. A future cluster can bring
+its own router without an API change.
 
 This design doesn't cover:
 
 - Reporting a `PrefillDecode` deployment that serves without disaggregating
-  (#TBD).
+  (#TBD). llm-d's picker already counts its decode-only decisions in
+  `pd_decision_total`.
 - Routing to data-parallel ranks inside a pod (#500).
 
 ## Proposal
@@ -187,20 +188,29 @@ Modelplane composes the rest, whether or not `router` is set:
 
 With `router` omitted, the cluster routes the deployment. On every cluster
 today, Modelplane sets every part the comments above mark, for vLLM with NIXL,
-as it does now. It reads the engine's port from `--port` and the block size from
-`--block-size` or `--page-size`, and doesn't set the engine-type label.
-Modelplane doesn't add engines or connectors to this routing. A deployment that
-needs one sets `router`.
+as it does now. It reads the block size from `--block-size` or `--page-size`,
+and doesn't set the engine-type label. Modelplane doesn't add engines or
+connectors to this routing. A deployment that needs one sets `router`.
 
-Each ModelReplica reports in its status the router its cluster resolved.
+A deployment that forgets `router` gets a router its engines can't use. So on
+this path only, Modelplane checks the decode engine's args for one format. If
+they set `--disaggregation-mode`, or a `kv_connector` other than
+`NixlConnector`, the replica gets a warning to set `router`. The check covers
+the one format this routing serves, so it doesn't grow with new engines.
+
+Taking over the routing is all or nothing. Tuning the picker's scoring means
+writing the sidecar and the KV transfer environment too. A picker configuration
+only means something to a known picker, and the cluster's routing doesn't
+promise one.
 
 ### Placement
 
 `router: EndpointPicker` runs only on a cluster that composes an InferencePool
-for a picker the user names. Each `InferenceCluster` lists in its status the
-routers it can compose, and the scheduler places a deployment that sets
-`router` only on those clusters. Every cluster today composes an InferencePool,
-so the filter lands with the stack-aware placement in #418.
+for a picker the user names. Each `InferenceCluster` lists the routers it can
+compose in `status.routers`. The scheduler places a deployment that sets
+`router` only on those clusters, and reports `ReplicasScheduled=False` when none
+qualify. Every cluster today lists `EndpointPicker`. The filter lands with the
+stack-aware placement in #418.
 
 ### The endpoint picker
 
@@ -216,10 +226,20 @@ so the filter lands with the stack-aware placement in #418.
 - If `config` is set, `image` is required. The configuration format changes
   between router releases, so a configuration must state its picker.
 
-Modelplane adds the flags that connect the picker to the InferencePool, such as
-`--pool-name` and `--config-file`. So `image` must be a Gateway API Inference
-Extension endpoint picker that accepts those flags and serves gRPC on 9002. If
-the picker rejects its configuration, the picker isn't available and the
+Modelplane runs the image with the command line of the Gateway API Inference
+Extension's reference picker, which llm-d's router accepts:
+
+```
+--pool-name=<replica>-pool --pool-namespace=<namespace>
+--pool-group=inference.networking.k8s.io --config-file=/config/epp-config.yaml
+--grpc-port=9002 --metrics-port=9090 --metrics-endpoint-auth=false
+```
+
+The picker serves gRPC on 9002. The InferencePool selects the replica's serving
+pods by `modelplane.ai/serving`, and sends to port 8000. Under `PrefillDecode`,
+Modelplane labels each engine's pods `llm-d.ai/role: prefill` or
+`llm-d.ai/role: decode`, which the picker's prefill and decode filters select
+on. If the picker rejects its configuration, the picker isn't available and the
 replica isn't Ready.
 
 ### Containers beside the engine
@@ -242,20 +262,22 @@ A serving pod receives requests on port 8000, as today. The engine's port named
 `http` is where Modelplane probes the engine and the collector scrapes its
 metrics. It defaults to 8000, so an engine alone in its pod declares nothing.
 
-When a container is in front of the engine, such as the sidecar:
+When something else takes 8000, the engine declares its `http` port on another
+port, such as 8001. The probe must reach the engine itself, because the llm-d
+sidecar answers `/health` without asking the engine. Port 8000 goes to:
 
-- That container declares port 8000, and passes requests to the engine. The
-  picker reads `/metrics` there too.
-- The engine declares its `http` port on another port, such as 8001. The probe
-  must reach the engine itself, because the llm-d sidecar answers `/health`
-  without asking the engine.
+- A container the user writes in front of the engine, such as the sidecar. It
+  declares port 8000, and passes requests to the engine. The picker reads
+  `/metrics` there too.
+- The sidecar the cluster's routing injects into a `PrefillDecode` decode pod.
+  An existing deployment that doesn't declare the engine's port keeps working:
+  Modelplane reads it from `--port`, as today.
 
 A container that doesn't serve, such as a log shipper, doesn't declare a port,
 and the engine doesn't either. CEL makes sure exactly one container serves 8000.
-With `router` omitted, the injected sidecar takes 8000 in a `PrefillDecode`
-decode pod, and the engine listens on its `--port`, as today.
 
-Only serving pods (a `Standalone` pod, or a gang's leader) get the probe.
+Only serving pods (a `Standalone` pod, or a gang's leader) get the probe. In a
+multi-node decode engine, the sidecar goes in the `Leader` member's template.
 
 ### Example
 
@@ -411,10 +433,12 @@ These router settings must match the engines:
 
 ### Dynamo
 
-A cluster that composes a DynamoGraphDeployment routes with Dynamo by default.
-A `router` value for Dynamo's frontend would let a deployment tune it. Dynamo's
-endpoint picker reads `DYN_*` environment variables, so an `env` field on
-`endpointPicker` would let `router: EndpointPicker` run it too.
+A cluster that composes a DynamoGraphDeployment would route with Dynamo by
+default. A default-routed deployment would still need its engines to run under
+Dynamo, which needs a stock-engine wrapper
+([dynamo#10835](https://github.com/ai-dynamo/dynamo/issues/10835), a draft).
+Dynamo 1.5's own picker takes no flags and reads `DYN_*` environment variables,
+so it needs its own `router` value rather than `EndpointPicker`.
 
 ### More container fields
 

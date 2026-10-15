@@ -100,8 +100,10 @@ spec:
                     x-kubernetes-validations:
                     - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || size(self.engines) == 2"
                       message: "PrefillDecode serving requires exactly two engines (one Prefill, one Decode)"
-                    - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || has(self.serving.router) || self.engines.all(e, !has(e.phase) || e.phase != 'Decode' || e.members.all(m, !has(m.template.spec) || m.template.spec.containers.all(c, c.name == 'engine' || !has(c.ports) || c.ports.all(p, p.containerPort != 8000))))"
-                      message: "with serving.router omitted, a Decode engine's other containers may not declare containerPort 8000, which the cluster's routing uses"
+                    - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || has(self.serving.router) || self.engines.all(e, !has(e.phase) || e.phase != 'Decode' || e.members.all(m, !has(m.template.spec) || m.template.spec.containers.all(c, !has(c.ports) || c.ports.all(p, p.containerPort != 8000))))"
+                      message: "with serving.router omitted, the cluster's routing puts its sidecar on 8000 in a Decode engine's pod, so no container there may declare containerPort 8000"
+                    - rule: "!has(self.engines) || self.engines.all(e, e.members.all(m, !has(m.template.spec) || (has(self.serving) && self.serving.mode == 'PrefillDecode' && !has(self.serving.router) && has(e.phase) && e.phase == 'Decode') || !m.template.spec.containers.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000)) || m.template.spec.containers.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000))))"
+                      message: "when an engine container's 'http' port isn't 8000, another container in its pod must declare containerPort 8000"
                     - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || self.engines.exists_one(e, has(e.phase) && e.phase == 'Prefill')"
                       message: "PrefillDecode serving requires exactly one engine with phase Prefill"
                     - rule: "!has(self.serving) || self.serving.mode != 'PrefillDecode' || self.engines.exists_one(e, has(e.phase) && e.phase == 'Decode')"
@@ -507,8 +509,6 @@ spec:
                                               message: "exactly one container must be named 'engine'"
                                             - rule: "!self.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000)) || self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000))"
                                               message: "when another container declares containerPort 8000, the engine container must declare its 'http' port on a different port"
-                                            - rule: "!self.exists(c, c.name == 'engine' && has(c.ports) && c.ports.exists(p, has(p.name) && p.name == 'http' && p.containerPort != 8000)) || self.exists(c, c.name != 'engine' && has(c.ports) && c.ports.exists(p, p.containerPort == 8000))"
-                                              message: "when the engine container's 'http' port isn't 8000, another container must declare containerPort 8000"
                                             items:
                                               type: object
                                               required: [name, image]
