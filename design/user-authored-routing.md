@@ -100,31 +100,21 @@ A [composed DynamoGraphDeployment](./serving-stacks.md) would bring Dynamo's
 own router to a cluster. A deployment that writes llm-d's picker configuration
 and sidecar only runs where llm-d routes.
 
-KServe's LLMInferenceService has the same split. Its router fields are neutral,
-and its controller fills them with llm-d's picker and sidecar.
-
 ## Goals
 
 **Serve any engine the router supports.** A user can serve a new engine or KV
 connector with no Modelplane release.
 
 **Let the cluster route by default.** A deployment that doesn't set `router`
-runs wherever its engines run, and the cluster composes the routing.
-
-**Keep existing deployments working.** A deployment written for today's routing
-gets the same routing.
-
-**Compose the wiring, not the routing.** When the user names a router,
-Modelplane composes the path from the cluster edge to the engines. The user
-configures how the router picks a pod and moves the KV cache.
+gets its cluster's routing. On today's clusters that's today's routing, so
+existing deployments don't change. A future Dynamo cluster can route the same
+deployment with Dynamo.
 
 This design doesn't cover:
 
 - Reporting a `PrefillDecode` deployment that serves without disaggregating
   (#TBD).
 - Routing to data-parallel ranks inside a pod (#500).
-- A router value for Dynamo's frontend. That comes with the composed
-  DynamoGraphDeployment.
 
 ## Proposal
 
@@ -184,7 +174,10 @@ engines:
             containerPort: 8001
 ```
 
-The prefill member sets the same environment, without the sidecar.
+The prefill member sets the same environment, without the sidecar. With `router:
+EndpointPicker`, Modelplane injects neither. With the llm-d router, a decode pod
+without the sidecar sends every request to decode alone. vLLM serves it, and
+SGLang rejects it.
 
 Modelplane composes the rest, whether or not `router` is set:
 
@@ -195,26 +188,16 @@ Modelplane composes the rest, whether or not `router` is set:
   `phase`.
 - A memory-backed `/dev/shm` on each engine container.
 
-With `router` omitted, Modelplane sets every part the comments mark, as it does
-today. It reads the engine's port from `--port`, and doesn't set the engine-type
-label.
-
 ### The cluster's routing
 
 With `router` omitted, the cluster routes the deployment. On every cluster
-today, that's the routing Modelplane composes now, for vLLM with NIXL. It keeps
-reading `--port` and `--block-size`, so existing deployments, such as the
-Kimi-K2 recipe, don't change. Modelplane doesn't add engines or connectors to
-this routing. A deployment that needs one sets `router`.
+today, Modelplane sets every part the comments above mark, for vLLM with NIXL,
+as it does now. It reads the engine's port from `--port` and the block size from
+`--block-size` or `--page-size`, and doesn't set the engine-type label.
+Modelplane doesn't add engines or connectors to this routing. A deployment that
+needs one sets `router`.
 
-A future serving stack can route differently. A cluster that composes a
-DynamoGraphDeployment would use Dynamo's router, with the same deployment.
-
-Under this routing, Modelplane owns port 8000 in a `PrefillDecode` decode pod.
-CEL rejects a container beside the engine that declares 8000 there.
-
-Each ModelReplica reports in its status the router its cluster resolved, so a
-user can see which routing a replica got.
+Each ModelReplica reports in its status the router its cluster resolved.
 
 ### Placement
 
@@ -258,10 +241,6 @@ containers beside `engine`:
 - Each member has its own template. The user chooses which pods of a gang get a
   container.
 
-Other per-pod helpers can use the same mechanism. #500 needs a session-affine
-proxy, such as `sglang-router`, in front of an engine whose data-parallel ranks
-share one pod.
-
 ### Ports
 
 A serving pod receives requests on port 8000, as today. The picker also reads
@@ -283,25 +262,12 @@ Only serving pods (a `Standalone` pod, or a gang's leader) get the probe and
 the `http` port. A worker with another container still declares an `http` port,
 but Modelplane doesn't use it.
 
-### Without a sidecar
+### Example
 
-With `router: EndpointPicker`, Modelplane doesn't inject the sidecar or
-`VLLM_NIXL_SIDE_CHANNEL_HOST`. With the llm-d router, a decode pod without the
-sidecar sends every request to decode alone. vLLM serves it, and SGLang rejects
-it.
-
-### Examples
-
-#### vLLM with NIXL
-
-The Kimi-K2 recipe omits `router`, and its cluster routes it as today. Nothing
-in it changes.
-
-#### SGLang with NIXL
-
-This deployment serves Laguna-S-2.1 on two 8x H100 nodes, one for each phase.
-It sets `router`, because the cluster's routing serves only vLLM with NIXL.
-The engines come from the [Laguna SGLang
+The Kimi-K2 recipe omits `router`, and doesn't change. This SGLang deployment
+sets it, because the cluster's routing serves only vLLM with NIXL. It serves
+Laguna-S-2.1 on two 8x H100 nodes, one for each phase. The engines come from the
+[Laguna SGLang
 recipe](../docs/manifests/recipes/laguna/model-deployment-sglang.yaml), with the
 disaggregation flags from llm-d's [SGLang
 guide](https://github.com/llm-d/llm-d/tree/v0.8.0/guides/pd-disaggregation/modelserver/gpu/sglang/base).
@@ -448,17 +414,12 @@ These router settings must match the engines:
 
 ## Future improvements
 
-### A router for Dynamo's frontend
+### Dynamo
 
 A cluster that composes a DynamoGraphDeployment routes with Dynamo by default.
-A `router` value for Dynamo's frontend would let a deployment tune it, the way
-`EndpointPicker` does for a picker.
-
-### Pickers configured by environment
-
-Dynamo 1.5's endpoint picker reads `DYN_*` environment variables and no
-configuration file. An `env` field on `endpointPicker` would let
-`router: EndpointPicker` run it.
+A `router` value for Dynamo's frontend would let a deployment tune it. Dynamo's
+endpoint picker reads `DYN_*` environment variables, so an `env` field on
+`endpointPicker` would let `router: EndpointPicker` run it too.
 
 ### More container fields
 
@@ -516,10 +477,8 @@ can't see flags in:
 
 llm-d reached the same view for its router
 ([llm-d-router#3030](https://github.com/llm-d/llm-d-router/issues/3030)): one
-engine type for each picker, set by the user. A mismatch should be visible. The
-running engines should report it, because that also catches a wrong decider or
-a missing sidecar (#TBD). Detection could still add a warning condition later,
-and this design doesn't prevent it.
+engine type for each picker, set by the user. Detection could still add a
+warning condition later.
 
 ### A router value for llm-d
 
