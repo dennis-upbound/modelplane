@@ -103,7 +103,10 @@ class EnvItem(BaseModel):
 
 class Port(BaseModel):
     containerPort: conint(ge=1, le=65535)
-    name: constr(min_length=1, max_length=15) | None = None
+    name: (
+        constr(pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', min_length=1, max_length=15)
+        | None
+    ) = None
 
 
 class Container(BaseModel):
@@ -111,7 +114,9 @@ class Container(BaseModel):
     command: list[str] | None = None
     env: list[EnvItem] | None = None
     image: constr(min_length=1)
-    name: constr(min_length=1, max_length=63)
+    name: constr(
+        pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', min_length=1, max_length=63
+    )
     ports: list[Port] | None = Field(None, max_length=8)
 
 
@@ -189,7 +194,7 @@ class SpecModel(BaseModel):
     """
     serving: Serving | None = None
     """
-    Serving mode, inherited verbatim from the parent ModelDeployment. PrefillDecode fronts the engines with an InferencePool + endpoint picker and role-labels the engine each marks with its phase; Unified (or absent) fronts them with a Service.
+    Serving, inherited verbatim from the parent ModelDeployment. Both modes front the serving pods with an InferencePool and an endpoint picker, which endpointPicker can configure. PrefillDecode also role-labels the engine each marks with its phase.
     """
 
 

@@ -120,7 +120,16 @@ class EnvItem(BaseModel):
 
 class Port(BaseModel):
     containerPort: conint(ge=1, le=65535)
-    name: constr(min_length=1, max_length=15) | None = None
+    """
+    Port number the container listens on.
+    """
+    name: (
+        constr(pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', min_length=1, max_length=15)
+        | None
+    ) = None
+    """
+    Port name. The engine container's port named "http" is where Modelplane probes the engine and scrapes its metrics.
+    """
 
 
 class Container(BaseModel):
@@ -141,7 +150,9 @@ class Container(BaseModel):
     """
     Container image.
     """
-    name: constr(min_length=1, max_length=63)
+    name: constr(
+        pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', min_length=1, max_length=63
+    )
     """
     Container name. The container named "engine" is the inference engine.
     """
@@ -282,7 +293,7 @@ class SpecModel(BaseModel):
     """
     serving: Serving | None = None
     """
-    How the deployment is served from the cluster edge to its engines. Unified (the default) fronts the engines with a Service. PrefillDecode serves prefill and decode from the two engines marking those phases, with inference-aware routing that sequences prefill then decode. Omitted means Unified.
+    How the deployment is served from the cluster edge to its engines. Modelplane fronts the serving pods with an InferencePool and an endpoint picker in both modes. Unified (the default) serves prefill and decode on each engine. PrefillDecode serves them from the two engines marking those phases, with routing that sequences prefill then decode. Omitted means Unified.
     """
     tolerations: list[Toleration] | None = None
     """
