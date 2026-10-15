@@ -114,8 +114,8 @@ its router and the router's configuration, so Modelplane never guesses which
 engines it serves.
 
 **Keep `Unified` simple.** A `Unified` deployment still gets its cluster's
-routing without writing a router. It labels its pods with the engine type,
-which describes the engine rather than the routing.
+routing without writing a router. An SGLang deployment labels its pods with the
+engine type, which describes the engine rather than the routing.
 
 This design doesn't cover:
 
@@ -133,9 +133,9 @@ The API changes in three places:
 1. `serving.router` names the router the user writes. Its one value is
    `EndpointPicker`. It's required under `PrefillDecode` and optional under
    `Unified`.
-2. `serving.endpointPicker` sets the picker's image and configuration. It's
-   valid only with `router: EndpointPicker`, and its `config` is required under
-   `PrefillDecode`.
+2. `serving.endpointPicker` sets the picker's image and configuration, which
+   are set together. It's valid only with `router: EndpointPicker`, and
+   required under `PrefillDecode`.
 3. A member's template can hold containers beside `engine`, and a container can
    declare `ports`.
 
@@ -184,8 +184,8 @@ engines:
 ```
 
 The prefill member sets the same environment, without the sidecar. Modelplane
-injects neither. A multi-node decode engine puts the sidecar in its `Leader`
-member's template.
+injects neither the sidecar nor the environment. A multi-node decode engine
+puts the sidecar in its `Leader` member's template.
 
 Modelplane composes the rest:
 
@@ -208,10 +208,8 @@ can't check for it.
 A `Unified` deployment that doesn't set `router` gets its cluster's routing. On
 every cluster today, that's llm-d's picker with Modelplane's default
 configuration, which reads the block size from `--block-size` or `--page-size`,
-or uses vLLM's default of 16. A `Unified` deployment can set
-`router: EndpointPicker` to tune the picker. Modelplane labels each serving pod
-`app` and `llm-d.ai/inference-serving` for the picker, replacing any `app`
-label the template sets.
+or uses vLLM's default of 16. A `Unified` deployment can set `router:
+EndpointPicker` to tune the picker.
 
 ### Placement
 
@@ -247,12 +245,13 @@ Gateway API Inference Extension's reference picker shares:
 
 The picker serves gRPC on 9002. The InferencePool selects the replica's serving
 pods by `modelplane.ai/serving`, and sends to port 8000. Under `PrefillDecode`,
-Modelplane labels each engine's pods `llm-d.ai/role: prefill` or
-`llm-d.ai/role: decode`, which llm-d's `prefill-filter` and `decode-filter`
-select on. If the picker rejects its configuration, the picker isn't available
-and the replica isn't Ready. Envoy AI Gateway fails closed without a picker,
-whatever the InferencePool's failure mode. A picker outage stops requests
-rather than sending them to prefill pods.
+Modelplane labels each engine's pods `llm-d.ai/role: prefill` or `llm-d.ai/role:
+decode`, which llm-d's `prefill-filter` and `decode-filter` select on. In either
+mode it labels each serving pod `app` and `llm-d.ai/inference-serving`,
+replacing any `app` label the template sets. If the picker rejects its
+configuration, the picker isn't available and the replica isn't Ready. Envoy AI
+Gateway fails closed without a picker, whatever the InferencePool's failure
+mode. A picker outage stops requests rather than sending them to prefill pods.
 
 ### Containers beside the engine
 

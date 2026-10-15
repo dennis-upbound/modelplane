@@ -25,9 +25,8 @@ How much you write depends on the serving mode:
 - **`PrefillDecode`.** You write the router. Set
   `serving.router: EndpointPicker`, the picker's configuration in
   `serving.endpointPicker`, and the sidecar in the decode member. Modelplane
-  rejects a `PrefillDecode` deployment without `router` and `endpointPicker`.
-  It can't check for the sidecar, so a decode pod without one serves decode
-  alone.
+  rejects a `PrefillDecode` deployment without `router` and `endpointPicker`,
+  but it can't check for the sidecar.
 
 ## What you write for prefill/decode
 
@@ -132,8 +131,7 @@ For vLLM with `MooncakeConnector`, set `"kv_connector":"MooncakeConnector"` in
 `--kv-transfer-config` on both engines, and leave out the `VLLM_NIXL_*`
 environment. The sidecar's `--mooncake-bootstrap-port` must match
 `VLLM_MOONCAKE_BOOTSTRAP_PORT` on the prefill engine. Both default to 8998.
-vLLM's
-[Mooncake documentation](https://docs.vllm.ai/en/v0.31.0/features/mooncake_connector_usage.html)
+vLLM's [Mooncake documentation](https://docs.vllm.ai/en/v0.31.0/features/mooncake_connector_usage.html)
 covers the rest, including the image it needs.
 
 SGLang's bootstrap port is 8998 by default too. If you change it on the
@@ -164,10 +162,10 @@ When a container is in front of the engine, such as the sidecar:
   `/health` without asking the engine.
 
 A container that doesn't serve, such as a log shipper, doesn't declare a port,
-and the engine doesn't either. Modelplane rejects a pod where more than one
-container declares 8000, or where the engine moves off 8000 and no other
-container declares it. A `Worker` member doesn't need a container on 8000,
-because worker pods don't receive requests.
+and the engine doesn't either. Modelplane rejects a `ModelDeployment` with a pod
+where more than one container declares 8000, or where the engine moves off 8000
+and no other container declares it. A `Worker` member doesn't need a container
+on 8000, because worker pods don't receive requests.
 
 ## Example: SGLang prefill and decode
 
