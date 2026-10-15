@@ -75,14 +75,10 @@ Modelplane configures the router for vLLM with NIXL:
 - It reads `--block-size` or `--page-size` from the engine's args, to configure
   prefix-cache scoring. #179 calls this a hack.
 
-This causes these problems:
-
-- Other engines don't work. SGLang needs a different decider, connector, and
-  pod label.
-- Each new connector needs a Modelplane release.
-- Each router release can break Modelplane's configuration. llm-d-router
-  v0.11.0 deprecates the sidecar's `--vllm-port` flag and removes a plugin
-  Modelplane uses.
+So other engines don't work. SGLang needs a different decider, connector, and
+pod label, and each new connector needs a Modelplane release. Router releases
+break things too: llm-d-router v0.11.0 deprecates the sidecar's `--vllm-port`
+flag and removes a plugin Modelplane uses.
 
 ### Routers differ by serving stack
 
@@ -106,9 +102,9 @@ and sidecar only runs where llm-d routes.
 connector with no Modelplane release.
 
 **Let the cluster route by default.** A deployment that doesn't set `router`
-gets its cluster's routing. On today's clusters that's today's routing, so
-existing deployments don't change. A future Dynamo cluster can route the same
-deployment with Dynamo.
+gets its cluster's routing. On every cluster now, that's the routing Modelplane
+composes today, so existing deployments don't change. A future Dynamo cluster
+can route the same deployment with Dynamo.
 
 This design doesn't cover:
 
@@ -174,10 +170,9 @@ engines:
             containerPort: 8001
 ```
 
-The prefill member sets the same environment, without the sidecar. With `router:
-EndpointPicker`, Modelplane injects neither. With the llm-d router, a decode pod
-without the sidecar sends every request to decode alone. vLLM serves it, and
-SGLang rejects it.
+The prefill member sets the same environment, without the sidecar. Modelplane
+injects neither. With the llm-d router, a decode pod without the sidecar sends
+every request to decode alone. vLLM serves it, and SGLang rejects it.
 
 Modelplane composes the rest, whether or not `router` is set:
 
@@ -423,9 +418,9 @@ endpoint picker reads `DYN_*` environment variables, so an `env` field on
 
 ### More container fields
 
-A container beside the engine takes the same fields as the engine. A namespace
-whose LimitRange or quota requires resource limits needs `resources` on every
-container. The API can add `resources` to all containers at once.
+A namespace whose LimitRange or quota requires resource limits needs
+`resources` on every container. Containers beside the engine can't set them
+yet. The API can add `resources` to all containers at once.
 
 ### Shared picker configurations
 
