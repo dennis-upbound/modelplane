@@ -113,9 +113,9 @@ connector with no Modelplane release.
 its router and the router's configuration, so Modelplane never guesses which
 engines it serves.
 
-**Keep `Unified` simple.** A `Unified` deployment still gets its cluster's
-routing without writing a router. An SGLang deployment labels its pods with the
-engine type, which describes the engine rather than the routing.
+**Keep `Unified` simple.** A `Unified` deployment gets its cluster's routing
+without writing a router. At most it labels its engine: an SGLang deployment
+sets `llm-d.ai/engine-type: sglang`.
 
 This design doesn't cover:
 
