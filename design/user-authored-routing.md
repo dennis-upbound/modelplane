@@ -137,20 +137,67 @@ I propose three API changes:
 3. A member's template can hold containers beside `engine`, and a container can
    declare `ports`.
 
-This table shows who writes each part of the router:
+With `router: EndpointPicker`, the user writes the routing in the
+`ModelDeployment`. This is the decode member of a vLLM deployment with NIXL.
+The comments mark each part the user writes:
 
-| Part of the router | `router` omitted | `router: EndpointPicker` |
-|---|---|---|
-| InferencePool and HTTPRoute | Modelplane | Modelplane |
-| Picker Deployment, Service, RBAC, and the flags that connect the picker to the InferencePool | Modelplane | Modelplane |
-| `llm-d.ai/role` pod label, from each engine's `phase` (`PrefillDecode` only) | Modelplane | Modelplane |
-| Memory-backed `/dev/shm` on the engine container | Modelplane | Modelplane |
-| Picker image | Modelplane | User, in `serving.endpointPicker.image`. The default is Modelplane's image. |
-| Picker configuration | Modelplane, for vLLM with NIXL | User, in `serving.endpointPicker.config`. The default is Modelplane's configuration. |
-| Sidecar | Modelplane injects it, with `--kv-connector=nixlv2` | User, as a container in the decode member's template |
-| KV transfer environment, such as `VLLM_NIXL_SIDE_CHANNEL_HOST` | Modelplane injects it | User, in the engine container's `env` |
-| Labels the picker reads, such as `llm-d.ai/engine-type` | Not set | User, in the template's `labels` |
-| The decode engine's port | Modelplane reads `--port` | User, as the engine's `http` port |
+```yaml
+serving:
+  mode: PrefillDecode
+  router: EndpointPicker
+  endpointPicker:
+    image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0  # the picker image
+    config: { ... }                  # the picker configuration (optional)
+engines:
+- name: decode
+  phase: Decode
+  members:
+  - role: Standalone
+    template:
+      metadata:
+        labels:
+          llm-d.ai/engine-type: vllm # a label the picker reads
+      spec:
+        containers:
+        - name: sidecar              # the sidecar, on port 8000
+          image: ghcr.io/llm-d/llm-d-router-disagg-sidecar:v0.9.0
+          args:
+          - --secure-proxy=false
+          - --kv-connector=nixlv2    # matches the engine's connector
+          - --vllm-port=8001
+          ports:
+          - containerPort: 8000
+        - name: engine
+          image: vllm/vllm-openai:v0.23.0
+          args:
+          - --port=8001
+          - --kv-transfer-config={"kv_connector":"NixlConnector","kv_role":"kv_consumer"}
+          env:                       # the KV transfer environment
+          - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+            value: "5557"
+          ports:
+          - name: http               # the engine's port
+            containerPort: 8001
+```
+
+The prefill member sets the same environment, without the sidecar.
+
+Modelplane composes the rest, whether or not `router` is set:
+
+- The InferencePool and the HTTPRoute.
+- The picker's Deployment, Service, and RBAC, and the flags that connect the
+  picker to the InferencePool.
+- The `llm-d.ai/role` label on each `PrefillDecode` engine's pods, from its
+  `phase`.
+- A memory-backed `/dev/shm` on each engine container.
+
+With `router` omitted, Modelplane sets every part the comments mark, as it does
+today. It reads the engine's port from `--port`, and doesn't set the engine-type
+label.
 
 ### The cluster's routing
 
