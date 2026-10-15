@@ -87,13 +87,17 @@ engine binds the right interface instead of guessing it.
 The prefill and decode phases have opposite hardware profiles, and on one engine
 a prefill burst stalls the decodes already running. Set
 `spec.template.spec.serving.mode: PrefillDecode` to run them as two engines, one
-marking `phase: Prefill` and the other `phase: Decode`. Modelplane fronts the
-pair with inference-aware routing that sequences prefill then decode, moving the
-KV cache between them. Each phase can sit on the GPU class that suits it.
+marking `phase: Prefill` and the other `phase: Decode`. The routing sequences
+prefill then decode, and the engines move the KV cache between them. Each phase
+can sit on the GPU class that suits it.
 
 ```yaml {nocopy=true}
 serving:
   mode: PrefillDecode       # the two engines below are one P/D pair
+  router: EndpointPicker    # required under PrefillDecode
+  endpointPicker:
+    image: ghcr.io/llm-d/llm-d-router-endpoint-picker:v0.9.0
+    config: {...}           # required under PrefillDecode
 engines:
 - name: prefill
   phase: Prefill

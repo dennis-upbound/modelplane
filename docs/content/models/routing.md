@@ -29,7 +29,8 @@ How much you write depends on the serving mode:
 
 ## What you write for prefill/decode
 
-This decode member is vLLM with NIXL, and the comments mark what you write:
+This decode member is vLLM with NIXL, and the comments mark what you write. The
+[Kimi-K2 recipe]({{< ref "/recipes/kimi-k2" >}}) is the whole deployment.
 
 ```yaml {nocopy=true}
 serving:
@@ -70,8 +71,10 @@ engines:
           - name: http               # the engine's port
             containerPort: 8001
 ```
-The prefill member sets the same environment, without the sidecar. For a
-multi-node decode engine, the sidecar goes in the `Leader` member's template.
+
+The prefill member sets the same environment. It has no sidecar, and its engine
+serves on 8000, so it doesn't declare a port. For a multi-node decode engine,
+the sidecar goes in the `Leader` member's template.
 
 Modelplane composes the InferencePool, the HTTPRoute, and the picker's
 Deployment, Service, and RBAC. It gives each engine container a `/dev/shm` in
@@ -97,6 +100,7 @@ Modelplane runs the image with llm-d's router command line:
 --pool-group=inference.networking.k8s.io --config-file=/config/epp-config.yaml
 --grpc-port=9002 --metrics-port=9090 --metrics-endpoint-auth=false
 ```
+
 The picker serves gRPC on port 9002. Under `PrefillDecode`, Modelplane labels
 each engine's pods `llm-d.ai/role: prefill` or `llm-d.ai/role: decode`, which
 llm-d's `prefill-filter` and `decode-filter` select on. A picker that rejects
@@ -152,8 +156,8 @@ When a container is in front of the engine, such as the sidecar:
 A container that doesn't serve, such as a log shipper, doesn't declare a port,
 and the engine doesn't either. Modelplane rejects a pod where more than one
 container declares 8000, or where the engine moves off 8000 and no other
-container declares it. A `Worker` member's ports aren't checked, because worker
-pods don't receive requests.
+container declares it. A `Worker` member doesn't need a container on 8000,
+because worker pods don't receive requests.
 
 ## Example: SGLang prefill and decode
 
@@ -294,6 +298,7 @@ spec:
                 - name: http
                   containerPort: 8001
 ```
+
 ## Picker configurations
 
 `Unified` uses this configuration when you don't set `config`. Modelplane sets
@@ -321,6 +326,7 @@ schedulingProfiles:
   - pluginRef: queue-scorer
     weight: 1
 ```
+
 For `PrefillDecode`, this configuration is a starting point for vLLM. Copy it
 into `config`, and set `blockSizeTokens` to the engine's block size. SGLang
 needs `always-disagg-pd-decider` in place of `prefix-based-pd-decider`.
@@ -366,6 +372,7 @@ schedulingProfiles:
   - pluginRef: queue-scorer
     weight: 1
 ```
+
 ## Where it runs
 
 Each `InferenceCluster` lists the routers it can compose in `status.routers`.

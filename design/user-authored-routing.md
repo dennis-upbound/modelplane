@@ -76,10 +76,12 @@ Modelplane configures the router for vLLM with NIXL:
 - It reads `--block-size` or `--page-size` from the engine's args, to configure
   prefix-cache scoring. #179 tracks removing it.
 
-So other engines don't work. SGLang needs a different decider, connector, and
-pod label, and each new connector needs a Modelplane release. Router releases
-break things too: llm-d-router v0.11.0 deprecates the sidecar's `--vllm-port`
-flag and removes a plugin Modelplane uses.
+This works only for vLLM with NIXL. SGLang needs a different decider, connector,
+and pod label, and each new connector needs a Modelplane release. Router
+releases break things too: llm-d-router v0.11.0 deprecates the sidecar's
+`--vllm-port` flag and removes a plugin Modelplane uses.
+
+### A default for prefill/decode
 
 A wrong default costs `Unified` serving some load-balancing quality. It costs
 `PrefillDecode` serving a pair that reports Ready and rejects requests. A
@@ -177,6 +179,7 @@ engines:
           - name: http               # the engine's port
             containerPort: 8001
 ```
+
 The prefill member sets the same environment, without the sidecar. Modelplane
 injects neither. A multi-node decode engine puts the sidecar in its `Leader`
 member's template.
@@ -190,8 +193,11 @@ Modelplane composes the rest:
   `phase`.
 - A memory-backed `/dev/shm` on each engine container.
 
-The Kimi-K2 recipe changes to this form. Existing `PrefillDecode` deployments
-add their routing before they upgrade.
+The Kimi-K2 recipe changes to this form. This is a breaking change to
+`v1alpha1`. After the upgrade, a `PrefillDecode` replica without its routing
+stops reconciling: `compose-model-replica` returns an error, and leaves the
+running pods and router in place until the `ModelDeployment` adds `router`,
+`endpointPicker.config`, and the sidecar.
 
 ### Unified serving
 
@@ -226,10 +232,12 @@ Modelplane runs the image with the command line of llm-d's router, which the
 Gateway API Inference Extension's reference picker shares:
 
 ```
+
 --pool-name=<replica>-pool --pool-namespace=<namespace>
 --pool-group=inference.networking.k8s.io --config-file=/config/epp-config.yaml
 --grpc-port=9002 --metrics-port=9090 --metrics-endpoint-auth=false
 ```
+
 The picker serves gRPC on 9002. The InferencePool selects the replica's serving
 pods by `modelplane.ai/serving`, and sends to port 8000. Under `PrefillDecode`,
 Modelplane labels each engine's pods `llm-d.ai/role: prefill` or
@@ -268,8 +276,8 @@ When a container is in front of the engine, such as the sidecar:
 A container that doesn't serve, such as a log shipper, doesn't declare a port,
 and the engine doesn't either. CEL allows at most one container to declare 8000,
 and requires one when the engine's `http` port is elsewhere. Only serving pods
-(a `Standalone` pod, or a gang's leader) get the probe, so a `Worker` member's
-ports aren't checked.
+(a `Standalone` pod, or a gang's leader) get the probe, so a `Worker` member
+doesn't need a container on 8000.
 
 ### Example
 
@@ -410,6 +418,7 @@ spec:
                 - name: http
                   containerPort: 8001
 ```
+
 These router settings must match the engines:
 
 | Router setting | Why |
