@@ -437,64 +437,25 @@ recipes show this, a cluster-scoped resource can hold a named configuration that
 
 ### Always user-written routing
 
-Every deployment could write its picker configuration and sidecar, with no
-cluster routing. There would be one code path, and no flag reading.
-
-But the sidecar and the configuration are llm-d's, so every `PrefillDecode`
-deployment would run only where llm-d routes. Every existing `PrefillDecode`
-deployment would also need a rewrite.
+Every deployment would write its picker configuration and sidecar. Both are
+llm-d's, so every `PrefillDecode` deployment would run only where llm-d routes,
+and every existing one would need a rewrite.
 
 ### A KV transfer format field
 
-`serving.prefillDecode.kvTransfer: VLLMNixl | SGLang` names the format.
-Modelplane composes the sidecar, decider, environment, and label for it. It's
-one field, and the user can't get the decider or connector wrong.
-
-But Modelplane must maintain each value. Each of these would need a release:
-
-- vLLM with Mooncake.
-- SGLang with Mooncake.
-- Each new connector the router adds.
-- Each router release that renames a flag.
+`serving.prefillDecode.kvTransfer: VLLMNixl | SGLang` would let Modelplane
+compose the router for each format. Each new connector, and each router release
+that renames a flag, would need a Modelplane release.
 
 ### Detect the format from engine flags
 
-Most engine flags show the format:
-
-- `--disaggregation-mode` means SGLang.
-- `--kv-transfer-config` with `NixlConnector` means vLLM with NIXL.
-
-Modelplane could detect the format and let a field override it. A condition
-would report when the field and the flags disagree. Most users would set
-nothing.
-
-Each new format still needs a new detection rule and a release. Detection also
-can't see flags in:
-
-- A configuration file.
-- An environment variable.
-- An entrypoint script.
-
-llm-d reached the same view for its router
-([llm-d-router#3030](https://github.com/llm-d/llm-d-router/issues/3030)): one
-engine type for each picker, set by the user. Detection could still add a
-warning condition later.
-
-### A router value for llm-d
-
-`router: LLMD` would say plainly that the configuration and the sidecar are
-llm-d's. But Dynamo's picker speaks the same protocol, and the name would
-exclude it. `EndpointPicker` is the protocol, and the picker image says which
-project's picker runs.
+Modelplane could read `--disaggregation-mode` or `--kv-transfer-config` and pick
+the format. Each new format still needs a release, and detection can't see
+flags in a configuration file or an entrypoint script.
 
 ### A sidecar field
 
-`serving.prefillDecode.sidecar` could set the sidecar's image and flags, with a
-default. Existing deployments would keep their sidecar.
-
-It's a second way to write a container, for routing only. Modelplane would also
-have to choose which pods of a gang get the sidecar, but the member templates
-already say this. llm-d's main branch also adds a
-[coordinator](https://github.com/llm-d/llm-d-router/blob/main/docs/coordinator_architecture.md)
-that replaces the sidecar, which would leave the field with nothing to
-configure.
+`serving.prefillDecode.sidecar` would be a second way to write a container, for
+routing only. llm-d is also replacing the sidecar with a
+[coordinator](https://github.com/llm-d/llm-d-router/blob/main/docs/coordinator_architecture.md),
+which would leave the field with nothing to configure.
