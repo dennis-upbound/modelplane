@@ -252,7 +252,8 @@ Modelplane labels each engine's pods `llm-d.ai/role: prefill` or `llm-d.ai/role:
 decode`, which llm-d's `prefill-filter` and `decode-filter` select on. In either
 mode it labels each serving pod `app` and `llm-d.ai/inference-serving`,
 replacing any `app` label the template sets. If the picker rejects its
-configuration, the picker isn't available and the replica isn't Ready. Envoy AI
+configuration, a new replica isn't Ready. A running replica keeps its old
+picker, which serves the old configuration, and stays Ready. Envoy AI
 Gateway fails closed without a picker, whatever the InferencePool's failure
 mode. A picker outage stops requests rather than sending them to prefill pods.
 
