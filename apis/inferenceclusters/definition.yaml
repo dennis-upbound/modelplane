@@ -596,18 +596,6 @@ spec:
                       certificate. An InferenceGateway validates the gateway's
                       serving certificate against it. Written once cert-manager on
                       the cluster has issued.
-              routers:
-                type: array
-                description: >-
-                  The serving.router values this cluster can compose, which
-                  Modelplane sets from the cluster's serving stack. Once
-                  placement reads it, a deployment that sets serving.router
-                  is placed only on clusters that list it.
-                maxItems: 8
-                x-kubernetes-list-type: set
-                items:
-                  type: string
-                  enum: [EndpointPicker]
               cache:
                 type: object
                 description: >-

@@ -401,10 +401,6 @@ class Status(BaseModel):
     Namespace where the internal XRs (cluster, backend) were created.
     """
     providerConfigRef: ProviderConfigRef | None = None
-    routers: list[Literal['EndpointPicker']] | None = Field(None, max_length=8)
-    """
-    The serving.router values this cluster can compose, which Modelplane sets from the cluster's serving stack. Once placement reads it, a deployment that sets serving.router is placed only on clusters that list it.
-    """
 
 
 class InferenceCluster(BaseModel):
