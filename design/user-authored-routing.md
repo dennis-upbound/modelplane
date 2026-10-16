@@ -125,8 +125,8 @@ This design doesn't cover:
 - Detecting a `PrefillDecode` pair that reports Ready but doesn't
   disaggregate, from a wrong decider, connector, or engine-type label, or a
   missing sidecar (#TBD). Modelplane can't check these from the API. llm-d's
-  picker counts its decode-only decisions in `llm_d_epp_pd_decision_total`,
-  which a check could read.
+  picker counts its decisions by type, such as `decode-only`, in
+  `llm_d_epp_disagg_decision_total`, which a check could read.
 - Routing to data-parallel ranks inside a pod (#500).
 
 ## Proposal
