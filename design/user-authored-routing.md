@@ -459,6 +459,11 @@ yet. The API can add `resources` to all containers at once. Containers can't
 mount volumes either. The sidecar runs with `--secure-proxy=false`, because
 `--cert-path` has nothing to point at.
 
+Modelplane probes only the engine, so a decode pod is Ready once its
+engine is, whether or not the sidecar listens. The sidecar starts in about a
+second and the engine in minutes, so this rarely matters. A `readinessProbe` on
+every container would close it.
+
 ### Shared picker configurations
 
 Deployments that use the same engine repeat the same picker configuration. If
