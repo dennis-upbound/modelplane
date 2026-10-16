@@ -74,7 +74,9 @@ Modelplane configures the router for vLLM with NIXL:
 - It reads `--port` from the decode engine's args, to find the engine behind the
   sidecar.
 - It reads `--block-size` or `--page-size` from the engine's args, to configure
-  prefix-cache scoring. #179 tracks removing it.
+  prefix-cache scoring.
+
+The user can't change the picker's configuration or image (#179).
 
 This works only for vLLM with NIXL. SGLang needs a different decider, connector,
 and pod label, and each new connector needs a Modelplane release. Router
