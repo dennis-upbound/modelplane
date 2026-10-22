@@ -248,7 +248,7 @@ def _job_object(pc: str, *, command: str = _HYDRATE_CMD, env: list | None = None
                                 "containers": [
                                     {
                                         "name": "hydrate",
-                                        "image": "python:3.11-slim",
+                                        "image": "python:3.13-slim@sha256:57b29a7c050c4e679e4bea572e14b3965cf4b5839de2da49d55e49ffc4024f39",
                                         "command": ["/bin/sh", "-c", command],
                                         "env": env,
                                         "volumeMounts": [{"name": "artifact", "mountPath": "/mnt/artifact"}],
