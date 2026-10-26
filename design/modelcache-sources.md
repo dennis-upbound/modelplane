@@ -1,26 +1,21 @@
-# ModelCache sources and the mount contract
+# ModelCache sources
 
 **Status:** Draft
 **Date:** October 2026
 **Author:** Dennis Ramdass
-**Issues:** [#512](https://github.com/modelplaneai/modelplane/issues/512), [#495](https://github.com/modelplaneai/modelplane/issues/495), [#210](https://github.com/modelplaneai/modelplane/issues/210)
+**Issues:** [#512](https://github.com/modelplaneai/modelplane/issues/512)
 
 ## Summary
 
 A `ModelCache` reads only from HuggingFace, and it stages what it reads onto a
 ReadWriteMany claim on each cluster. On some clouds that claim is slow, costly
-at small sizes, or fails to bind. `compose-model-replica`, the function that
-mounts the cache into engine pods, works out the claim's name itself, and it
-doesn't wait for the cache. An engine can start before the weights are there,
-and download them a second time.
+at small sizes, or fails to bind.
 
-I propose two changes:
-
-- `spec.source` gets two new values. `OCI` reads the model from a registry with
-  no claim. `PersistentVolumeClaim` mounts a claim the user already filled.
-- Each cluster entry in `status.clusters[]` gets a `mount` field. It says how to
-  read the model on that cluster. `compose-model-replica` copies it into the
-  pod, and waits until it's there.
+I propose that `spec.source` get two new values. `OCI` reads the model from a
+registry with no claim. `PersistentVolumeClaim` mounts a claim the user already
+filled. Each source writes the `mount` that
+[the mount contract](./modelcache-mount-contract.md) adds to each cluster
+entry, and replicas copy it as they do for `HuggingFace`.
 
 ```yaml
 apiVersion: modelplane.ai/v1alpha1
@@ -70,24 +65,6 @@ the cost:
 An `OCI` source doesn't use a ReadWriteMany claim. The node pulls the model to
 its own disk.
 
-### Mounting the cache
-
-A cluster entry has a `phase` and a `message`, but not the claim's name.
-`compose-model-replica` computes the name in `cache_pvc_name`, and
-`compose-model-cache` keeps a second copy of the same code. The name is only
-right for a `HuggingFace` source.
-
-No function checks whether the model is readable.
-`compose-model-deployment` checks that a cluster has a storage class, not that
-the cache staged onto it. This causes these faults:
-
-- [#495](https://github.com/modelplaneai/modelplane/issues/495): an engine
-  started while its 464 GB cache was staging. It downloaded the model again, in
-  parallel.
-- [#498](https://github.com/modelplaneai/modelplane/issues/498): a deployment's
-  status doesn't say why a model doesn't serve. The faults above each needed a
-  person with access to the workload cluster.
-
 ## Goals
 
 **Read the model where it is.** A user can serve a model from an OCI registry or
@@ -96,13 +73,8 @@ from a claim they filled.
 **Don't stage what a node can pull.** An `OCI` source doesn't use a Modelplane
 claim.
 
-**Give each cluster one answer.** A cluster entry says how to read the model
-there, and `compose-model-replica` copies that answer instead of computing it.
-
-**Wait for the model.** Modelplane composes no engine pod on a cluster until
-that cluster's entry has a `mount`.
-
-**Say why a cluster can't read the model.** The cluster entry gives the reason.
+**Mount every source the same way.** Each source writes the cluster entry's
+`mount`, so replicas don't need code for a new source.
 
 This design doesn't cover:
 
@@ -162,39 +134,21 @@ and `compose-model-deployment` don't require a storage class for `OCI` and
 
 Modelplane installs the model CSI driver on every cluster.
 
-### The mount contract
+### Mounts
 
-Each cluster entry gets a `mount` field. Each item uses some of the fields of
-the Kubernetes type in its comment:
+Each source writes the cluster entry's `mount`, as
+[the mount contract](./modelcache-mount-contract.md) describes for
+`HuggingFace`. `OCI` and `PersistentVolumeClaim` put the model at
+`/mnt/models`, and don't set environment variables. They also extend the
+contract:
 
-```yaml
-mount:
-  volumes: []           # corev1.Volume: persistentVolumeClaim, image, or csi
-  volumeMounts: []      # corev1.VolumeMount: name, mountPath, subPath, readOnly
-  env: []               # corev1.EnvVar: name, value
-  imagePullSecrets: []  # corev1.LocalObjectReference
-```
-
-`OCI` and `PersistentVolumeClaim` put the model at `/mnt/models`, and `env` is
-empty. A `HuggingFace` entry puts the hub cache root at `/mnt/models` and sets
-`HF_HUB_CACHE`. The engine then finds the staged snapshot by repository ID.
-
-`compose-model-cache` knows the source, so it writes the contract. Each cluster
-entry comes from that cluster's own observed resources, so a failed cluster
-doesn't change another cluster's entry.
-
-`compose-model-replica` reads the `ModelCache` as a required resource, and
-builds the pod without knowing the source. It follows these rules:
-
-- It finds the entry for its own cluster.
-- It adds `imagePullSecrets` to the pod.
-- It adds `env` before the user's environment. A user's variable with the same
-  name then takes effect. It adds `volumes` and `volumeMounts` as they are.
-- If a mount is read-only, it adds an `emptyDir` with a size limit and points
-  `HOME` at it. Engines write compile and download caches under `HOME`, and the
-  size limit stops a large one from getting the pod evicted.
-- If the cluster has no entry, or the entry has no `mount`, it sets a condition
-  and composes no workload. This fixes #495.
+- `mount` gets `imagePullSecrets`, a list of `corev1.LocalObjectReference`.
+  `compose-model-replica` adds them to the pod, for an `OCI` source in a
+  private registry.
+- If a volume mount sets `readOnly`, `compose-model-replica` adds an `emptyDir` with a
+  size limit and points `HOME` at it. Engines write compile and download caches
+  under `HOME`, and the size limit stops a large one from getting the pod
+  evicted.
 
 ### Cluster status
 
@@ -294,6 +248,13 @@ through a `hostPath` volume. That avoids the ReadWriteMany read for
 `HuggingFace`, but it puts each model on each node, so it needs size limits and
 eviction first.
 
+**Several caches per deployment.**
+[#281](https://github.com/modelplaneai/modelplane/issues/281) asks for a draft
+model or tokenizer from a second cache. Each cache would then need its own
+volume name and its own path, where `OCI` and `PersistentVolumeClaim` use
+`/mnt/models` here. The mount's shape already allows that, because replicas
+copy whatever the cache publishes.
+
 **Cache metrics.** Pull time and each cluster entry's phase would have shown the
 stuck cache in #494. Cache state is on the control plane, so it waits on #476.
 
@@ -302,11 +263,6 @@ model doesn't serve. The contract covers the model not being readable. A
 container's exit code needs another data source.
 
 ## Alternatives considered
-
-### A child resource for each cluster
-
-#210 asks for a `ModelCacheHydration` child for each cluster. The contract
-needs one place for each cluster, and `status.clusters[]` already gives it.
 
 ### One enum value for each kind of artifact
 
