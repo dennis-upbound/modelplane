@@ -973,3 +973,60 @@ def test_compose(case: Case) -> None:
     """RunFunction composes AKS cluster infrastructure."""
     got = asyncio.run(fn.FunctionRunner().RunFunction(case.req, None))
     assert _to_dict(got) == _to_dict(case.want), case.reason
+
+
+def _named_xr(*, name: str) -> v1alpha1.AKSCluster:
+    """The observed AKSCluster XR, with the given name."""
+    return v1alpha1.AKSCluster(
+        metadata=metav1.ObjectMeta(name=name, namespace="modelplane-system"),
+        spec=v1alpha1.Spec(
+            location="westeurope",
+            nodePools=[
+                v1alpha1.NodePool(
+                    name="gpuh100",
+                    role="GPU",
+                    vmSize="Standard_ND96isr_H100_v5",
+                    nodeCount=1,
+                    minNodeCount=0,
+                    maxNodeCount=1,
+                ),
+            ],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "want"),
+    [
+        # The derived name is exactly 54 characters: used as is.
+        ("mpiiiiiiiiiiiiiiiiiiiiiiii", "modelplane-system-mpiiiiiiiiiiiiiiiiiiiiiiii-aks-383fa"),
+        # The derived name is 55 characters: it loses a character before its
+        # hash suffix to fit.
+        ("mpiiiiiiiiiiiiiiiiiiiiiiiii", "modelplane-system-mpiiiiiiiiiiiiiiiiiiiiiiiii-ak-0d844"),
+        # The cut lands on a hyphen: the trailing hyphen is stripped, so the
+        # prefix still ends alphanumeric.
+        (
+            "mpi-" + "i" * 25,
+            "modelplane-system-mpi-iiiiiiiiiiiiiiiiiiiiiiiii-90184",
+        ),
+    ],
+)
+def test_dns_prefix(name: str, want: str) -> None:
+    """_dns_prefix uses the cluster name as the DNS prefix when it fits Azure's 54 character limit, and cuts it to fit when it doesn't."""
+    got = fn._dns_prefix(_named_xr(name=name))
+    assert got == want
+
+
+def test_dns_prefix_wired() -> None:
+    """A cluster whose name exceeds Azure's 54 character DNS prefix limit gets the cut prefix, not its full name."""
+    xr = _named_xr(name="mpiiiiiiiiiiiiiiiiiiiiiiiii")
+    req = fnv1.RunFunctionRequest(
+        observed=fnv1.State(
+            composite=fnv1.Resource(
+                resource=resource.dict_to_struct(xr.model_dump(exclude_none=True, mode="json", by_alias=True))
+            )
+        ),
+    )
+    got = asyncio.run(fn.FunctionRunner().RunFunction(req, None))
+    cluster = resource.struct_to_dict(got.desired.resources["cluster"].resource)
+    assert cluster["spec"]["forProvider"]["dnsPrefix"] == "modelplane-system-mpiiiiiiiiiiiiiiiiiiiiiiiii-ak-0d844"

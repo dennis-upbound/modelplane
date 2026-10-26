@@ -176,6 +176,9 @@ _AZURE_FILES_MOUNT_OPTIONS = [
 # - through this annotation.
 _ANNOTATION_EXTERNAL_NAME = "crossplane.io/external-name"
 
+# Azure caps an AKS cluster's DNS prefix at 54 characters.
+_DNS_PREFIX_MAX_LEN = 54
+
 
 def _name(meta: metav1.ObjectMeta | None) -> str:
     """The object's name, always set on resources read from the API server."""
@@ -206,6 +209,21 @@ def _cluster_name(xr: v1alpha1.AKSCluster) -> str:
     uniqueness.
     """
     return resource.child_name(_namespace(xr.metadata), _name(xr.metadata), "aks")
+
+
+def _dns_prefix(xr: v1alpha1.AKSCluster) -> str:
+    """The AKS cluster's DNS prefix, which is its name cut to fit Azure's limit.
+
+    child_name caps the name at 63 characters, but Azure allows a DNS prefix
+    of at most 54. A name that fits is used as is. A longer name keeps its
+    hash suffix and loses characters before it, so the prefix stays unique
+    and ends in an alphanumeric, as Azure requires.
+    """
+    name = _cluster_name(xr)
+    if len(name) <= _DNS_PREFIX_MAX_LEN:
+        return name
+    prefix, suffix = name.rsplit("-", 1)
+    return f"{prefix[: _DNS_PREFIX_MAX_LEN - len(suffix) - 1].rstrip('-')}-{suffix}"
 
 
 class FunctionRunner(grpcv1.FunctionRunnerServiceServicer):
@@ -339,7 +357,7 @@ class Composer:
                 forProvider=clusterv1beta1.ForProvider(
                     location=self.xr.spec.location,
                     kubernetesVersion=self.xr.spec.kubernetesVersion,
-                    dnsPrefix=_cluster_name(self.xr),
+                    dnsPrefix=_dns_prefix(self.xr),
                     # The resource group AKS creates for the cluster's own
                     # resources (VM Scale Sets, load balancer, disks). Named
                     # explicitly because the default MC_<rg>_<cluster>_<region>
