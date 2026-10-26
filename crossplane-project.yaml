@@ -97,6 +97,13 @@ spec:
       repository: https://github.com/crossplane/crossplane
       ref: v2.3.2
       path: cluster/crds
+  # The serving stack installs the cluster agent, at the version
+  # compose-serving-stack pins, on every InferenceCluster.
+  - type: crd
+    git:
+      repository: https://github.com/modelplaneai/cluster-agent
+      ref: v0.1.0
+      path: cluster/charts/cluster-agent/files/crds
   - type: xpkg
     xpkg:
       apiVersion: pkg.crossplane.io/v1
