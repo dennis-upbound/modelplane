@@ -302,6 +302,7 @@ COMPOSE_CASES = [
         ),
         provider_config="cluster-a-pc",
         want={
+            "metadata": {"annotations": {"crossplane.io/poll-interval": "30s"}},
             "spec": {
                 "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
                 "readiness": {"policy": "SuccessfulCreate"},

@@ -131,6 +131,15 @@ _NAMESPACE_SYSTEM = "modelplane-system"
 _AGENT_CONDITION_HEALTHY = "Healthy"
 _AGENT_REASON_OBSERVATION_FAILED = "ObservationFailed"
 
+# provider-kubernetes stops receiving watch events once the token in a
+# cluster's kubeconfig expires, which on EKS is after 15 minutes. A watched
+# PoolObservation then only reaches this XR when it's polled, every 10 minutes
+# by default, so it's polled more often.
+# TODO(negz): Remove once provider-kubernetes fixes this.
+# https://github.com/crossplane-contrib/provider-kubernetes/issues/598
+_ANNOTATION_POLL_INTERVAL = "crossplane.io/poll-interval"
+_POOL_OBSERVATION_POLL_INTERVAL = "30s"
+
 # Accelerator type naming an NVIDIA H100 in an InferenceClass. On Civo,
 # a pool of single-H100 nodes needs the serving stack to load that
 # pool's GPU driver with NVLink disabled (see civo_nvlink_disabled_pools).
@@ -541,8 +550,9 @@ class Composer:
         the PoolObservation CRD arrive with the serving stack, so they're first
         composed once the stack is ready, and kept after.
 
-        provider-kubernetes watches each one, so the agent's reports reach this
-        XR when they change rather than when the Object is next polled. Each is
+        provider-kubernetes watches each one, and polls it often in case the
+        watch has stopped (see _POOL_OBSERVATION_POLL_INTERVAL), so the agent's
+        reports reach this XR soon after they change. Each is
         marked ready unconditionally: the scheduler falls back to whole-node
         accounting for a pool it has no observation of, so a missing one mustn't
         hold up the cluster.
@@ -565,7 +575,10 @@ class Composer:
             if not (backend_ready or key in self.req.observed.resources):
                 continue
             obj = k8sobjv1alpha1.Object(
-                metadata=metav1.ObjectMeta(namespace=_NAMESPACE_SYSTEM),
+                metadata=metav1.ObjectMeta(
+                    namespace=_NAMESPACE_SYSTEM,
+                    annotations={_ANNOTATION_POLL_INTERVAL: _POOL_OBSERVATION_POLL_INTERVAL},
+                ),
                 spec=k8sobjv1alpha1.Spec(
                     providerConfigRef=k8sobjv1alpha1.ProviderConfigRef(kind="ClusterProviderConfig", name=pc),
                     readiness=k8sobjv1alpha1.Readiness(policy="SuccessfulCreate"),

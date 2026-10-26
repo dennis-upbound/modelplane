@@ -708,12 +708,13 @@ def _epp_service(*, ready: fnv1.Ready) -> fnv1.Resource:
 
 
 def _replica_observation() -> fnv1.Resource:
-    """The watched Object creating the replica's ReplicaObservation, selecting its engine pods, and marked ready."""
+    """The watched and polled Object creating the replica's ReplicaObservation, selecting its engine pods, and marked ready."""
     return fnv1.Resource(
         resource=resource.dict_to_struct(
             {
                 "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
                 "kind": "Object",
+                "metadata": {"annotations": {"crossplane.io/poll-interval": "30s"}},
                 "spec": {
                     "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
                     "readiness": {"policy": "SuccessfulCreate"},

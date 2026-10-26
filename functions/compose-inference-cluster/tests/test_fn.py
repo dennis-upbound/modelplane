@@ -410,13 +410,16 @@ def _namespace_object(*, team: str, name: str) -> fnv1.Resource:
 
 
 def _pool_observation(*, pool: str) -> fnv1.Resource:
-    """The composed Object that creates a PoolObservation of pool on the cluster, watched, without deleting it, and marked ready."""
+    """The composed Object that creates a PoolObservation of pool on the cluster, watched and polled, without deleting it, and marked ready."""
     return fnv1.Resource(
         resource=resource.dict_to_struct(
             {
                 "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
                 "kind": "Object",
-                "metadata": {"namespace": "modelplane-system"},
+                "metadata": {
+                    "namespace": "modelplane-system",
+                    "annotations": {"crossplane.io/poll-interval": "30s"},
+                },
                 "spec": {
                     "providerConfigRef": {
                         "kind": "ClusterProviderConfig",

@@ -47,6 +47,15 @@ REASON_WAITING_FOR_PODS = "WaitingForPods"
 # to nodes.
 _AGENT_CONDITION_SCHEDULED = "Scheduled"
 
+# provider-kubernetes stops receiving watch events once the token in a
+# cluster's kubeconfig expires, which on EKS is after 15 minutes. A watched
+# ReplicaObservation then only reaches the replica when it's polled, every 10
+# minutes by default, so it's polled more often.
+# TODO(negz): Remove once provider-kubernetes fixes this.
+# https://github.com/crossplane-contrib/provider-kubernetes/issues/598
+_ANNOTATION_POLL_INTERVAL = "crossplane.io/poll-interval"
+_POLL_INTERVAL = "30s"
+
 
 def compose(replica: v1alpha1.ModelReplica, provider_config: str) -> k8sobjv1alpha1.Object | None:
     """The Object creating the replica's ReplicaObservation on its cluster.
@@ -57,9 +66,9 @@ def compose(replica: v1alpha1.ModelReplica, provider_config: str) -> k8sobjv1alp
     without a replica label, so a replica its deployment didn't label gets no
     observation.
 
-    provider-kubernetes watches the ReplicaObservation, so the agent's reports
-    reach the replica when they change rather than when the Object is next
-    polled.
+    provider-kubernetes watches the ReplicaObservation, and polls it often in
+    case the watch has stopped (see _POLL_INTERVAL), so the agent's reports
+    reach the replica soon after they change.
     """
     meta = replica.metadata
     if meta is None or meta.name is None:
@@ -82,8 +91,9 @@ def compose(replica: v1alpha1.ModelReplica, provider_config: str) -> k8sobjv1alp
                 ),
             ),
         ).model_dump(exclude_unset=True),
+        watch=True,
     )
-    obj.spec.watch = True
+    obj.metadata = metav1.ObjectMeta(annotations={_ANNOTATION_POLL_INTERVAL: _POLL_INTERVAL})
     return obj
 
 
