@@ -409,6 +409,81 @@ def _namespace_object(*, team: str, name: str) -> fnv1.Resource:
     )
 
 
+def _pool_observation(*, pool: str) -> fnv1.Resource:
+    """The composed Object that creates a PoolObservation of pool on the cluster, watched and polled, without deleting it, and marked ready."""
+    return fnv1.Resource(
+        resource=resource.dict_to_struct(
+            {
+                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                "kind": "Object",
+                "metadata": {
+                    "namespace": "modelplane-system",
+                    "annotations": {"crossplane.io/poll-interval": "30s"},
+                },
+                "spec": {
+                    "providerConfigRef": {
+                        "kind": "ClusterProviderConfig",
+                        "name": "test-cluster-cluster-kubeconfig-d0f89",
+                    },
+                    "readiness": {"policy": "SuccessfulCreate"},
+                    "watch": True,
+                    "managementPolicies": ["Observe", "Create", "Update"],
+                    "forProvider": {
+                        "manifest": {
+                            "apiVersion": "agent.modelplane.ai/v1alpha1",
+                            "kind": "PoolObservation",
+                            "metadata": {"name": pool},
+                            "spec": {"poolName": pool},
+                        },
+                    },
+                },
+            }
+        ),
+        ready=fnv1.READY_TRUE,
+    )
+
+
+def _observed_pool_observation(*, pool: str, status: dict) -> fnv1.Resource:
+    """The observed Object for pool's PoolObservation, whose remote manifest carries the status the agent reported."""
+    return fnv1.Resource(
+        resource=resource.dict_to_struct(
+            {
+                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                "kind": "Object",
+                "metadata": {"namespace": "modelplane-system"},
+                "spec": {
+                    "providerConfigRef": {
+                        "kind": "ClusterProviderConfig",
+                        "name": "test-cluster-cluster-kubeconfig-d0f89",
+                    },
+                    "readiness": {"policy": "SuccessfulCreate"},
+                    "watch": True,
+                    "managementPolicies": ["Observe", "Create", "Update"],
+                    "forProvider": {
+                        "manifest": {
+                            "apiVersion": "agent.modelplane.ai/v1alpha1",
+                            "kind": "PoolObservation",
+                            "metadata": {"name": pool},
+                            "spec": {"poolName": pool},
+                        },
+                    },
+                },
+                "status": {
+                    "atProvider": {
+                        "manifest": {
+                            "apiVersion": "agent.modelplane.ai/v1alpha1",
+                            "kind": "PoolObservation",
+                            "metadata": {"name": pool},
+                            "spec": {"poolName": pool},
+                            "status": status,
+                        },
+                    },
+                },
+            }
+        ),
+    )
+
+
 def _to_dict(msg: message.Message) -> dict:
     """msg as a dict with sorted keys, so pytest's diff of two lines them up."""
     return json.loads(json_format.MessageToJson(msg, sort_keys=True))
@@ -893,7 +968,7 @@ COMPOSE_CASES = [
     ),
     ComposeCase(
         name="ExistingBackendReady",
-        reason="Once its ServingStack is observed Ready with an address, an Existing cluster relays the address and reports its backend healthy.",
+        reason="Once its ServingStack is observed Ready with an address, an Existing cluster relays the address, reports its backend healthy, and composes a PoolObservation for each pool.",
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
                 composite=_inference_cluster(
@@ -963,6 +1038,7 @@ COMPOSE_CASES = [
                         gpu=None,
                         ready=fnv1.READY_TRUE,
                     ),
+                    "pool-observation-l4-pool": _pool_observation(pool="l4-pool"),
                 },
             ),
             context=structpb.Struct(),
@@ -988,6 +1064,695 @@ COMPOSE_CASES = [
             conditions=[
                 fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
                 fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+            ],
+        ),
+    ),
+    # The PoolObservation status is what the agent reported for a pool of one
+    # g6.12xlarge node with three of its four L4s allocated.
+    ComposeCase(
+        name="ExistingPoolObserved",
+        reason="Once the agent reports on a pool, the cluster publishes the nodes the pool has, how many devices are free on them, and when the agent last saw a claim allocated on them.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="Existing",
+                        existing=v1alpha1.Existing(secretRef=v1alpha1.SecretRef(name="my-kubeconfig")),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="gpu-l4x4-a", className="gpu-l4x4", nodeCount=1, maxNodeCount=3),
+                    ],
+                ),
+                resources={
+                    "serving-stack": _observed_serving_stack(gateway={"address": "34.55.100.10"}),
+                    "pool-observation-gpu-l4x4-a": _observed_pool_observation(
+                        pool="gpu-l4x4-a",
+                        status={
+                            "observedGeneration": 1,
+                            "conditions": [
+                                {
+                                    "type": "Healthy",
+                                    "status": "True",
+                                    "reason": "PoolHealthy",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                                {
+                                    "type": "ScaleUpBlocked",
+                                    "status": "False",
+                                    "reason": "NoUnschedulablePods",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                            ],
+                            "nodes": {"total": 1, "ready": 1, "schedulable": 1},
+                            "unschedulablePods": 0,
+                            "devices": [
+                                {"deviceClassName": "gpu.nvidia.com", "nodes": 1, "allocatable": 4, "allocated": 3},
+                            ],
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 1}, "nodes": 1}],
+                            "lastAllocationTime": "2026-10-20T10:05:40.318204Z",
+                        },
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4x4": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4x4",
+                            count=4,
+                            memory="23034Mi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.12xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 4},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    gpu_pools=[
+                        {
+                            "name": "gpu-l4x4-a",
+                            "nodes": 3,
+                            "observedNodes": 1,
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 1}, "nodes": 1}],
+                            "lastAllocationTime": "2026-10-20T10:05:40.318204Z",
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 4,
+                                    "capacity": {"memory": {"value": "23034Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway={"address": "34.55.100.10"},
+                ),
+                resources={
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="my-kubeconfig", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="Existing",
+                        secrets=[{"type": "Kubeconfig", "name": "my-kubeconfig", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "pool-observation-gpu-l4x4-a": _pool_observation(pool="gpu-l4x4-a"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4x4": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4x4"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
+                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+            ],
+        ),
+    ),
+    ComposeCase(
+        name="ExistingPoolNotObservable",
+        reason="A pool the agent reports it can't observe publishes no observation, rather than an observation of an empty pool.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="Existing",
+                        existing=v1alpha1.Existing(secretRef=v1alpha1.SecretRef(name="my-kubeconfig")),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="gpu-l4x4-a", className="gpu-l4x4", nodeCount=1, maxNodeCount=3),
+                    ],
+                ),
+                resources={
+                    "serving-stack": _observed_serving_stack(gateway={"address": "34.55.100.10"}),
+                    "pool-observation-gpu-l4x4-a": _observed_pool_observation(
+                        pool="gpu-l4x4-a",
+                        status={
+                            "observedGeneration": 1,
+                            "conditions": [
+                                {
+                                    "type": "Healthy",
+                                    "status": "Unknown",
+                                    "reason": "ObservationFailed",
+                                    "message": "cannot observe pool: boom",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                                {
+                                    "type": "ScaleUpBlocked",
+                                    "status": "Unknown",
+                                    "reason": "ObservationFailed",
+                                    "message": "cannot observe pool: boom",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                            ],
+                            "nodes": {"total": 0, "ready": 0, "schedulable": 0},
+                            "unschedulablePods": 0,
+                            "lastAllocationTime": "2026-10-20T10:05:40.318204Z",
+                        },
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4x4": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4x4",
+                            count=4,
+                            memory="23034Mi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.12xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 4},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    gpu_pools=[
+                        {
+                            "name": "gpu-l4x4-a",
+                            "nodes": 3,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 4,
+                                    "capacity": {"memory": {"value": "23034Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway={"address": "34.55.100.10"},
+                ),
+                resources={
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="my-kubeconfig", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="Existing",
+                        secrets=[{"type": "Kubeconfig", "name": "my-kubeconfig", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "pool-observation-gpu-l4x4-a": _pool_observation(pool="gpu-l4x4-a"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4x4": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4x4"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
+                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+            ],
+        ),
+    ),
+    # One of the pool's two nodes is cordoned, so the histogram counts only
+    # the other.
+    ComposeCase(
+        name="ExistingPoolUnhealthy",
+        reason="A pool the agent observes as unhealthy, but not unobservable, still publishes its observation.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="Existing",
+                        existing=v1alpha1.Existing(secretRef=v1alpha1.SecretRef(name="my-kubeconfig")),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="gpu-l4x4-a", className="gpu-l4x4", nodeCount=2, maxNodeCount=3),
+                    ],
+                ),
+                resources={
+                    "serving-stack": _observed_serving_stack(gateway={"address": "34.55.100.10"}),
+                    "pool-observation-gpu-l4x4-a": _observed_pool_observation(
+                        pool="gpu-l4x4-a",
+                        status={
+                            "observedGeneration": 1,
+                            "conditions": [
+                                {
+                                    "type": "Healthy",
+                                    "status": "False",
+                                    "reason": "NodesCordoned",
+                                    "message": "1 of 2 nodes cordoned",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                                {
+                                    "type": "ScaleUpBlocked",
+                                    "status": "False",
+                                    "reason": "NoUnschedulablePods",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                            ],
+                            "nodes": {"total": 2, "ready": 2, "schedulable": 1},
+                            "unschedulablePods": 0,
+                            "devices": [
+                                {"deviceClassName": "gpu.nvidia.com", "nodes": 2, "allocatable": 4, "allocated": 3},
+                            ],
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 1}, "nodes": 1}],
+                            "lastAllocationTime": "2026-10-20T10:05:40.318204Z",
+                        },
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4x4": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4x4",
+                            count=4,
+                            memory="23034Mi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.12xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 4},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    gpu_pools=[
+                        {
+                            "name": "gpu-l4x4-a",
+                            "nodes": 3,
+                            "observedNodes": 2,
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 1}, "nodes": 1}],
+                            "lastAllocationTime": "2026-10-20T10:05:40.318204Z",
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 4,
+                                    "capacity": {"memory": {"value": "23034Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway={"address": "34.55.100.10"},
+                ),
+                resources={
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="my-kubeconfig", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="Existing",
+                        secrets=[{"type": "Kubeconfig", "name": "my-kubeconfig", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "pool-observation-gpu-l4x4-a": _pool_observation(pool="gpu-l4x4-a"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4x4": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4x4"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
+                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+            ],
+        ),
+    ),
+    # The agent's schema requires each bucket to count at least one node.
+    ComposeCase(
+        name="ExistingPoolObservationInvalid",
+        reason="A pool whose observation doesn't match the agent's schema publishes no observation, rather than failing the whole cluster.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="Existing",
+                        existing=v1alpha1.Existing(secretRef=v1alpha1.SecretRef(name="my-kubeconfig")),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="gpu-l4x4-a", className="gpu-l4x4", nodeCount=1, maxNodeCount=3),
+                    ],
+                ),
+                resources={
+                    "serving-stack": _observed_serving_stack(gateway={"address": "34.55.100.10"}),
+                    "pool-observation-gpu-l4x4-a": _observed_pool_observation(
+                        pool="gpu-l4x4-a",
+                        status={
+                            "observedGeneration": 1,
+                            "conditions": [
+                                {
+                                    "type": "Healthy",
+                                    "status": "True",
+                                    "reason": "PoolHealthy",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                                {
+                                    "type": "ScaleUpBlocked",
+                                    "status": "False",
+                                    "reason": "NoUnschedulablePods",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                            ],
+                            "nodes": {"total": 1, "ready": 1, "schedulable": 1},
+                            "unschedulablePods": 0,
+                            "devices": [
+                                {"deviceClassName": "gpu.nvidia.com", "nodes": 1, "allocatable": 4, "allocated": 3},
+                            ],
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 1}, "nodes": 0}],
+                            "lastAllocationTime": "2026-10-20T10:05:40.318204Z",
+                        },
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4x4": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4x4",
+                            count=4,
+                            memory="23034Mi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.12xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 4},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    gpu_pools=[
+                        {
+                            "name": "gpu-l4x4-a",
+                            "nodes": 3,
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 4,
+                                    "capacity": {"memory": {"value": "23034Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway={"address": "34.55.100.10"},
+                ),
+                resources={
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="my-kubeconfig", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="Existing",
+                        secrets=[{"type": "Kubeconfig", "name": "my-kubeconfig", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_TRUE,
+                    ),
+                    "pool-observation-gpu-l4x4-a": _pool_observation(pool="gpu-l4x4-a"),
+                },
+            ),
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_WARNING,
+                    message="Ignoring the cluster agent's observation of pool gpu-l4x4-a: it does not match the "
+                    "agent's schema (1 problems), so the pool is counted in whole nodes.",
+                ),
+            ],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4x4": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4x4"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
+                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_TRUE, reason="BackendHealthy"),
+            ],
+        ),
+    ),
+    # The agent hasn't seen a claim allocated on the pool, so it reports no
+    # allocation time.
+    ComposeCase(
+        name="ExistingPoolObservationKept",
+        reason="A PoolObservation that already exists stays composed when the ServingStack stops being Ready, so the agent's reports keep flowing.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_inference_cluster(
+                    cluster=v1alpha1.Cluster(
+                        source="Existing",
+                        existing=v1alpha1.Existing(secretRef=v1alpha1.SecretRef(name="my-kubeconfig")),
+                    ),
+                    node_pools=[
+                        v1alpha1.NodePool(name="gpu-l4x4-a", className="gpu-l4x4", nodeCount=1, maxNodeCount=3),
+                    ],
+                ),
+                resources={
+                    "serving-stack": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "infrastructure.modelplane.ai/v1alpha1",
+                                "kind": "ServingStack",
+                                "metadata": {"name": "test-cluster-serving-stack-fd00b"},
+                                "status": {
+                                    "conditions": [{"type": "Ready", "status": "False"}],
+                                    "gateway": {"address": "34.55.100.10"},
+                                },
+                            }
+                        ),
+                    ),
+                    "pool-observation-gpu-l4x4-a": _observed_pool_observation(
+                        pool="gpu-l4x4-a",
+                        status={
+                            "observedGeneration": 1,
+                            "conditions": [
+                                {
+                                    "type": "Healthy",
+                                    "status": "True",
+                                    "reason": "PoolHealthy",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                                {
+                                    "type": "ScaleUpBlocked",
+                                    "status": "False",
+                                    "reason": "NoUnschedulablePods",
+                                    "message": "",
+                                    "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                    "observedGeneration": 1,
+                                },
+                            ],
+                            "nodes": {"total": 1, "ready": 1, "schedulable": 1},
+                            "unschedulablePods": 0,
+                            "devices": [
+                                {"deviceClassName": "gpu.nvidia.com", "nodes": 1, "allocatable": 4, "allocated": 0},
+                            ],
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 4}, "nodes": 1}],
+                        },
+                    ),
+                },
+            ),
+            required_resources={
+                "class-gpu-l4x4": fnv1.Resources(
+                    items=[
+                        _inference_class(
+                            name="gpu-l4x4",
+                            count=4,
+                            memory="23034Mi",
+                            provisioning={
+                                "provider": "EKS",
+                                "eks": {
+                                    "instanceType": "g6.12xlarge",
+                                    "diskSizeGb": 100,
+                                    "accelerator": {"type": "nvidia-l4", "count": 4},
+                                },
+                            },
+                        ),
+                    ],
+                ),
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=_desired_inference_cluster(
+                    gpu_pools=[
+                        {
+                            "name": "gpu-l4x4-a",
+                            "nodes": 3,
+                            "observedNodes": 1,
+                            "nodesByFreeDevices": [{"freeDevices": {"gpu.nvidia.com": 4}, "nodes": 1}],
+                            "devices": [
+                                {
+                                    "name": "gpu",
+                                    "claim": "DRA",
+                                    "driver": "gpu.nvidia.com",
+                                    "deviceClassName": "gpu.nvidia.com",
+                                    "count": 4,
+                                    "capacity": {"memory": {"value": "23034Mi"}},
+                                },
+                            ],
+                        },
+                    ],
+                    cache=None,
+                    gateway={"address": "34.55.100.10"},
+                ),
+                resources={
+                    "cluster-provider-config-kubernetes": _cluster_provider_config(
+                        kubeconfig="my-kubeconfig", identity=None
+                    ),
+                    "serving-stack": _serving_stack(
+                        cloud="Existing",
+                        secrets=[{"type": "Kubeconfig", "name": "my-kubeconfig", "key": "kubeconfig"}],
+                        client_cas=None,
+                        gpu=None,
+                        ready=fnv1.READY_UNSPECIFIED,
+                    ),
+                    "pool-observation-gpu-l4x4-a": _pool_observation(pool="gpu-l4x4-a"),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "model-replicas": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelReplica",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-routes": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="ModelRoute",
+                        match_labels=fnv1.MatchLabels(labels={"modelplane.ai/cluster": "test-cluster"}),
+                    ),
+                    "model-caches": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="ModelCache"),
+                    "gateways": fnv1.ResourceSelector(api_version="modelplane.ai/v1alpha1", kind="InferenceGateway"),
+                    "class-gpu-l4x4": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1", kind="InferenceClass", match_name="gpu-l4x4"
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ClusterReady", status=fnv1.STATUS_CONDITION_TRUE, reason="ClusterRunning"),
+                fnv1.Condition(type="BackendReady", status=fnv1.STATUS_CONDITION_FALSE, reason="Installing"),
             ],
         ),
     ),

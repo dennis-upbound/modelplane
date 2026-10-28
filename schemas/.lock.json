@@ -1,7 +1,8 @@
 {
   "packages": {
-    "fs://apis": "1e73064210fec7fa5508d4af954e85d2adba93ccb40101324d926f950e8d2e2f",
+    "fs://apis": "dffeedd4cecb877e11fde90a2f3316ba0690935af6c8d5428bf48fcfe4e92d28",
     "git://https://github.com/crossplane/crossplane/cluster/crds": "90d8b72ad8b829f0bcd7d7d5a98eaa0d579f244a",
+    "git://https://github.com/modelplaneai/cluster-agent/cluster/charts/cluster-agent/files/crds": "ca7631d72ef8550a2d2f415f33db1ec52b20c65c",
     "xpkg://xpkg.upbound.io/upbound/provider-aws-ec2:v2.8.1": "sha256:ca2e9e3b2e3a8b6ca44a9700d5abf7abd733cfa388d1afe9bb2bf7c847cd39ef",
     "xpkg://xpkg.upbound.io/upbound/provider-aws-efs:v2.8.1": "sha256:ebb1bcd8dc9a7e60e97a324652fbd9d1b0609ddbb1107db518ce999cbc1113bd",
     "xpkg://xpkg.upbound.io/upbound/provider-aws-eks:v2.8.1": "sha256:45ba27a14d6f8c4b9acdced0c48bec5650aab22bfc275af8bf1f5c770da3fa24",

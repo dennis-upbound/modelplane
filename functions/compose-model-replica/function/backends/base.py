@@ -258,8 +258,9 @@ LABEL_WORKLOAD = "modelplane.ai/workload"
 # Pod labels carrying the identity every metric off this pod is attributed to.
 # The collector reads them off the pod during service discovery and stamps them
 # on each series, so a MetricMapping needs no labels of its own and a series
-# merged across replicas keeps the identity all of them share. Metrics are the
-# only reason these exist; nothing selects on them.
+# merged across replicas keeps the identity all of them share. A replica's
+# ReplicaObservation also selects its pods by deployment, replica and engine (see
+# observation.compose), so renaming those breaks the scheduler's accounting.
 LABEL_DEPLOYMENT = "modelplane.ai/deployment"
 LABEL_REPLICA = "modelplane.ai/replica"
 LABEL_ENGINE = "modelplane.ai/engine"
@@ -268,7 +269,7 @@ LABEL_PHASE = "modelplane.ai/phase"
 
 
 # Set on the ModelReplica by the composite that scheduled it.
-_LABEL_REPLICA_INDEX = "modelplane.ai/replica-index"
+LABEL_REPLICA_INDEX = "modelplane.ai/replica-index"
 
 
 def telemetry_labels(
@@ -292,7 +293,7 @@ def telemetry_labels(
     # one of them is simply lost. The index rather than the pod: it is bounded
     # by the replica count, and it survives a restart and a rolling update,
     # where a pod name is minted afresh each time.
-    if index := own.get(_LABEL_REPLICA_INDEX):
+    if index := own.get(LABEL_REPLICA_INDEX):
         labels[LABEL_REPLICA] = index
     if engine.name:
         labels[LABEL_ENGINE] = engine.name
@@ -319,7 +320,7 @@ def fleet_labels(replica: v1alpha1.ModelReplica, role: str) -> dict[str, str]:
     own = (replica.metadata.labels if replica.metadata else None) or {}
     if name := own.get(LABEL_DEPLOYMENT):
         labels[LABEL_DEPLOYMENT] = name
-    if index := own.get(_LABEL_REPLICA_INDEX):
+    if index := own.get(LABEL_REPLICA_INDEX):
         labels[LABEL_REPLICA] = index
     return labels
 
