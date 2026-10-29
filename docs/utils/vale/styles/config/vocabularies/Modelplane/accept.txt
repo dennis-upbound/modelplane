@@ -200,12 +200,12 @@ TTFT
 A[0-9]+B
 IQ4_XS
 llama\.cpp
-multi-GPU
+[Mm]ulti-GPU
 [Vv][Rr][Aa][Mm]
-tensor
+[Tt]ensor
 tokenizer
 [Ii]nference
-prefill
+[Pp]refill
 [Cc]loud
 
 # Cloud providers
@@ -324,8 +324,8 @@ stdin
 stdout
 subnets?
 tolerations
-pipeline
-parallelism
+[Pp]ipeline
+[Pp]arallelism
 [Aa]utoscaling
 config
 args
@@ -352,7 +352,7 @@ base64-encoded
 bring-your-own
 built-in
 call-outs
-cache-aware
+[Cc]ache-aware
 cloud-native
 distributed-systems
 performance-sensitive
@@ -372,7 +372,7 @@ double-check
 dry-run
 dynamic-PVC
 e\.g\.
-end-to-end
+[Ee]nd-to-end
 EKS-based
 event-driven
 first-class
@@ -402,7 +402,7 @@ multi-pod
 multi-region
 multi-tenant
 multi-tenancy
-mixture-of-experts
+[Mm]ixture-of-experts
 namespace-scoped
 namespaced
 namespaces?
@@ -431,7 +431,7 @@ resource-intensive
 self-contained
 self-service
 self-signed
-server-side
+[Ss]erver-side
 serving-stack
 [Ss]ingle-node
 single-pod
@@ -462,8 +462,8 @@ workload-cluster
 [Rr]e-converge[sd]?
 
 # Style exceptions
-several
-above
+[Ss]everal
+[Aa]bove
 below
 the cloud
 disabled?
@@ -550,7 +550,7 @@ routable
 pipeline-parallel
 Qwen2.5-14B
 
-agent
+[Aa]gent
 requirement
 PrefillDecode
 
@@ -810,12 +810,12 @@ TTFT
 A[0-9]+B
 IQ4_XS
 llama\.cpp
-multi-GPU
+[Mm]ulti-GPU
 [Vv][Rr][Aa][Mm]
-tensor
+[Tt]ensor
 tokenizer
 [Ii]nference
-prefill
+[Pp]refill
 [Cc]loud
 
 # Cloud providers
@@ -934,8 +934,8 @@ stdin
 stdout
 subnets?
 tolerations
-pipeline
-parallelism
+[Pp]ipeline
+[Pp]arallelism
 [Aa]utoscaling
 config
 args
@@ -962,7 +962,7 @@ base64-encoded
 bring-your-own
 built-in
 call-outs
-cache-aware
+[Cc]ache-aware
 cloud-native
 distributed-systems
 performance-sensitive
@@ -982,7 +982,7 @@ double-check
 dry-run
 dynamic-PVC
 e\.g\.
-end-to-end
+[Ee]nd-to-end
 EKS-based
 event-driven
 first-class
@@ -1012,7 +1012,7 @@ multi-pod
 multi-region
 multi-tenant
 multi-tenancy
-mixture-of-experts
+[Mm]ixture-of-experts
 namespace-scoped
 namespaced
 namespaces?
@@ -1041,7 +1041,7 @@ resource-intensive
 self-contained
 self-service
 self-signed
-server-side
+[Ss]erver-side
 serving-stack
 [Ss]ingle-node
 single-pod
@@ -1072,8 +1072,8 @@ workload-cluster
 [Rr]e-converge[sd]?
 
 # Style exceptions
-several
-above
+[Ss]everal
+[Aa]bove
 below
 the cloud
 disabled?
@@ -1160,7 +1160,7 @@ routable
 pipeline-parallel
 Qwen2.5-14B
 
-agent
+[Aa]gent
 requirement
 PrefillDecode
 
@@ -1212,3 +1212,62 @@ per-deployment
 opt-out
 Framebuffer
 Mooncake
+
+# Inference field guide
+DeepSeek
+R1
+o1
+SRE
+SLOs?
+[Gg]oodput
+FinOps
+Ollama
+benchmarked
+dtypes?
+CUDA
+p50
+p90
+declaratively
+[Ss]harding
+agentic
+subagents?
+GPTQ
+[Ee]vals?
+[Qq]uantizing
+SXM
+datacenter
+B200
+RTX
+safetensors
+repos?
+ServiceMonitor
+teardown
+torch\.compile
+FlashAttention
+PagedAttention
+DistServe
+Pyrra
+GuideLLM
+SemiAnalysis
+AgentX
+upskill
+FP4
+TGI
+\d+(\.\d+)?x
+vCPUs?
+[Cc]onfigs
+READMEs
+runbooks?
+Zeoli
+Kiely
+ByteByteGo
+AIPerf
+Viktor
+Farcic
+Vishakha
+Sadhwani
+Hamel
+Husain
+Shreya
+Lamhot
+Siagian
