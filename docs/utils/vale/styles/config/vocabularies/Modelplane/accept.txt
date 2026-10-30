@@ -562,6 +562,8 @@ routable
 pipeline-parallel
 Qwen2.5-14B
 
+
+[Aa]gentic
 [Aa]gent
 requirement
 PrefillDecode
