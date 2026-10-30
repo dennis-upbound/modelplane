@@ -48,8 +48,8 @@ kubectl get modelreplica -n ml-team
 ```
 
 ```shell{nocopy=true}
-NAME              CLUSTER       SYNCED   READY   COMPOSITION                   AGE
-qwen-demo-7323a   eks-us-east   True     True    modelreplicas.modelplane.ai   12m
+NAME              CLUSTER       SERVING   SYNCED   READY   COMPOSITION                   AGE
+qwen-demo-7323a   eks-us-east   True      True     True    modelreplicas.modelplane.ai   12m
 ```
 
 The ML team never named a cluster. The scheduler matched the GPU requirement

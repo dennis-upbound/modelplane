@@ -118,7 +118,7 @@ container-based engine and any topology.
 
 ## Current status
 
-Modelplane is at v0.1. It is early and evolving fast. See [issues labeled `enhancement`][enhancements] for what's planned.
+Modelplane is pre-1.0. It is early and evolving fast. See [issues labeled `enhancement`][enhancements] for what's planned.
 
 ## Get involved
 

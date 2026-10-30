@@ -140,11 +140,11 @@ select on.
 
 A picker that rejects its configuration never becomes ready:
 
-- On a new deployment, the replica doesn't become Ready.
+- On a new deployment, the replica doesn't start serving.
 - On a running deployment, the old picker keeps serving with the old
-  configuration. The replica stops being Ready once the picker's rollout passes
-  its progress deadline, 10 minutes by default. The new picker's pod log has
-  the reason.
+  configuration. The replica stops serving, and its endpoint is withdrawn, once
+  the picker's rollout passes its progress deadline, 10 minutes by default. The
+  new picker's pod log has the reason.
 
 ## The sidecar
 
@@ -175,8 +175,11 @@ The sidecar and the picker must match your engines:
 | vLLM with `MooncakeConnector` | `mooncake` | Any |
 | SGLang, any transfer backend | `sglang` | `always-disagg-pd-decider`. An SGLang decode engine rejects a request that skips prefill. |
 
-The sidecar's `--vllm-port` names the decode engine's port, whatever the engine
+
+<!-- vale ai-tells.BareNames = NO -->
+The sidecar's `--vllm-port` specifies the decode engine's port, whatever the engine
 is.
+<!-- vale ai-tells.BareNames = YES -->
 
 A decode pod without the sidecar sends every request to decode alone. vLLM
 serves it, and SGLang rejects it.
@@ -219,7 +222,7 @@ and no other container declares it. A `Worker` member doesn't need a container
 on 8000, because worker pods don't receive requests.
 
 Behind the sidecar, the decode port appears in three places: the `--port` flag
-on the engine, its `http` port, and the sidecar flag that names the engine's
+on the engine, its `http` port, and the sidecar flag that specifies the engine's
 port. Keep the three the same. Modelplane doesn't read engine args to check
 them.
 
@@ -387,6 +390,10 @@ spec:
 at least 64. llm-d's picker raises a smaller value to 64, so its prefix index
 doesn't run the picker out of memory.
 
+`maxPrefixTokensToMatch` is set to 131072, llm-d's own default, so the picker
+scores prefix matches on the first 128K tokens of a prompt. It doesn't limit the
+prompts the engine accepts.
+
 ```yaml {nocopy=true}
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
@@ -395,7 +402,7 @@ plugins:
   parameters:
     autoTune: false
     blockSizeTokens: 64
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 131072
     lruCapacityPerServer: 31250
 - type: prefix-cache-scorer
 - type: queue-scorer
@@ -410,6 +417,9 @@ schedulingProfiles:
     weight: 1
 ```
 
+To change it, write the whole configuration in `config`, as
+[The endpoint picker](#the-endpoint-picker) describes.
+
 For `PrefillDecode`, this configuration is a starting point for vLLM. Copy it
 into `config`, and set `blockSizeTokens` to the engine's block size, or 64 if
 that's larger. SGLang needs `always-disagg-pd-decider` in place of
@@ -423,7 +433,7 @@ plugins:
   parameters:
     autoTune: false
     blockSizeTokens: 64
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 131072
     lruCapacityPerServer: 31250
 - type: prefix-cache-scorer
 - type: queue-scorer

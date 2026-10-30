@@ -43,8 +43,8 @@ class Case:
     want: fnv1.RunFunctionResponse
 
 
-def _model_replica() -> fnv1.Resource:
-    """The ModelReplica XR test-replica in ml-team, with one Standalone engine.
+def _model_replica(*, copies: int) -> fnv1.Resource:
+    """The ModelReplica XR test-replica in ml-team, replica 0 of my-deployment, with one Standalone engine.
 
     The device request's CEL selector is as compose-model-deployment stamps it.
     """
@@ -55,6 +55,7 @@ def _model_replica() -> fnv1.Resource:
             labels={
                 "modelplane.ai/deployment": "my-deployment",
                 "modelplane.ai/cluster": "cluster-a",
+                "modelplane.ai/replica-index": "0",
             },
         ),
         spec=v1alpha1.SpecModel1(
@@ -62,7 +63,7 @@ def _model_replica() -> fnv1.Resource:
             engines=[
                 v1alpha1.Engine(
                     name="main",
-                    copies=1,
+                    copies=copies,
                     members=[
                         v1alpha1.Member(
                             role="Standalone",
@@ -100,7 +101,7 @@ def _model_replica() -> fnv1.Resource:
 
 
 def _prefill_decode_replica(*, serving: v1alpha1.Serving) -> fnv1.Resource:
-    """The ModelReplica XR test-replica in ml-team, serving PrefillDecode from a prefill and a decode engine.
+    """The ModelReplica XR test-replica in ml-team, replica 0 of my-deployment, serving PrefillDecode from a prefill and a decode engine.
 
     Each engine's pod runs only its engine container, so the decode pod has no
     sidecar.
@@ -112,6 +113,7 @@ def _prefill_decode_replica(*, serving: v1alpha1.Serving) -> fnv1.Resource:
             labels={
                 "modelplane.ai/deployment": "my-deployment",
                 "modelplane.ai/cluster": "cluster-a",
+                "modelplane.ai/replica-index": "0",
             },
         ),
         spec=v1alpha1.SpecModel1(
@@ -192,8 +194,12 @@ def _prefill_decode_replica(*, serving: v1alpha1.Serving) -> fnv1.Resource:
     return fnv1.Resource(resource=resource.dict_to_struct(xr.model_dump(exclude_none=True, mode="json", by_alias=True)))
 
 
-def _cluster(*, provider_config_ref: str | None) -> fnv1.Resource:
-    """The InferenceCluster cluster-a, with no status until it reports a providerConfigRef."""
+def _cluster(*, provider_config_ref: str | None, observed: bool) -> fnv1.Resource:
+    """The InferenceCluster cluster-a, with no status until it reports a providerConfigRef.
+
+    Its pool frontier, of one node with eight GPUs free, is one the cluster agent
+    reports on if observed is True.
+    """
     cluster = {
         "apiVersion": "modelplane.ai/v1alpha1",
         "kind": "InferenceCluster",
@@ -202,19 +208,24 @@ def _cluster(*, provider_config_ref: str | None) -> fnv1.Resource:
             "cluster": {"source": "Existing", "existing": {"secretRef": {"name": "k"}}},
         },
     }
+    pool: dict = {"name": "frontier", "nodes": 1}
+    if observed:
+        pool["observedNodes"] = 1
+        pool["nodesByFreeDevices"] = [{"freeDevices": {"gpu.nvidia.com": 8}, "nodes": 1}]
     if provider_config_ref is not None:
         cluster["status"] = {
             "providerConfigRef": {"name": provider_config_ref},
             "gateway": {"address": "10.0.0.1"},
+            "schedulablePools": [pool],
         }
     return fnv1.Resource(resource=resource.dict_to_struct(cluster))
 
 
-def _deployment(*, ready: fnv1.Ready, name: str, claim_template_name: str, labels: dict) -> fnv1.Resource:
+def _deployment(*, ready: fnv1.Ready, name: str, claim_template_name: str, labels: dict, copies: int) -> fnv1.Resource:
     """The Object composing an engine's Deployment.
 
     Its pod carries the labels the collector attributes the engine's metrics by:
-    the deployment, the engine and the member's role.
+    the deployment, the replica, the engine and the member's role.
     """
     return fnv1.Resource(
         resource=resource.dict_to_struct(
@@ -225,15 +236,19 @@ def _deployment(*, ready: fnv1.Ready, name: str, claim_template_name: str, label
                     "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
                     "readiness": {
                         "policy": "DeriveFromCelQuery",
-                        "celQuery": 'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")',
+                        "celQuery": (
+                            'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")'
+                            " && has(object.status.readyReplicas) && object.status.readyReplicas >= object.spec.replicas"
+                        ),
                     },
+                    "watch": True,
                     "forProvider": {
                         "manifest": {
                             "apiVersion": "apps/v1",
                             "kind": "Deployment",
                             "metadata": {"name": name, "namespace": "mp-ml-team-51733"},
                             "spec": {
-                                "replicas": 1,
+                                "replicas": copies,
                                 "selector": {"matchLabels": {"modelplane.ai/workload": name}},
                                 "template": {
                                     "metadata": {"labels": labels},
@@ -267,7 +282,17 @@ def _deployment(*, ready: fnv1.Ready, name: str, claim_template_name: str, label
                                                 "key": "nvidia.com/gpu",
                                                 "operator": "Exists",
                                                 "effect": "NoSchedule",
-                                            }
+                                            },
+                                            {
+                                                "key": "amd.com/gpu",
+                                                "operator": "Exists",
+                                                "effect": "NoSchedule",
+                                            },
+                                            {
+                                                "key": "modelplane.ai/cpu",
+                                                "operator": "Exists",
+                                                "effect": "NoSchedule",
+                                            },
                                         ],
                                     },
                                 },
@@ -418,8 +443,8 @@ def _epp(*, ready: fnv1.Ready, config_checksum: str) -> fnv1.Resource:
     """The Object composing the endpoint picker's Deployment, running llm-d's picker with a config.
 
     Its pod carries the labels the collector attributes the picker's metrics by:
-    the deployment and the picker role. The picker's command line takes the pool
-    and the config's path from the environment Modelplane sets.
+    the deployment, the replica and the picker role. The picker's command line
+    takes the pool and the config's path from the environment Modelplane sets.
     """
     return fnv1.Resource(
         resource=resource.dict_to_struct(
@@ -450,6 +475,7 @@ def _epp(*, ready: fnv1.Ready, config_checksum: str) -> fnv1.Resource:
                                             "app": "test-replica-epp",
                                             "modelplane.ai/role": "picker",
                                             "modelplane.ai/deployment": "my-deployment",
+                                            "modelplane.ai/replica": "0",
                                         },
                                         "annotations": {"modelplane.ai/epp-config-checksum": config_checksum},
                                     },
@@ -531,7 +557,7 @@ def _epp_config(*, ready: fnv1.Ready) -> fnv1.Resource:
                                     "  parameters:\n"
                                     "    autoTune: false\n"
                                     "    blockSizeTokens: 64\n"
-                                    "    maxPrefixBlocksToMatch: 256\n"
+                                    "    maxPrefixTokensToMatch: 131072\n"
                                     "    lruCapacityPerServer: 31250\n"
                                     "- type: prefix-cache-scorer\n"
                                     "- type: queue-scorer\n"
@@ -691,8 +717,50 @@ def _epp_service(*, ready: fnv1.Ready) -> fnv1.Resource:
     )
 
 
-def _observed_deployment() -> fnv1.Resource:
-    """The engine's Deployment Object as observed back, applied and Available, so its derived Ready is True."""
+def _replica_observation() -> fnv1.Resource:
+    """The watched and polled Object creating the replica's ReplicaObservation, selecting its engine pods, and marked ready."""
+    return fnv1.Resource(
+        resource=resource.dict_to_struct(
+            {
+                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                "kind": "Object",
+                "metadata": {"annotations": {"crossplane.io/poll-interval": "30s"}},
+                "spec": {
+                    "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
+                    "readiness": {"policy": "SuccessfulCreate"},
+                    "watch": True,
+                    "forProvider": {
+                        "manifest": {
+                            "apiVersion": "agent.modelplane.ai/v1alpha1",
+                            "kind": "ReplicaObservation",
+                            "metadata": {"name": "test-replica", "namespace": "mp-ml-team-51733"},
+                            "spec": {
+                                "podSelector": {
+                                    "matchLabels": {
+                                        "modelplane.ai/deployment": "my-deployment",
+                                        "modelplane.ai/replica": "0",
+                                    },
+                                    "matchExpressions": [{"key": "modelplane.ai/engine", "operator": "Exists"}],
+                                },
+                            },
+                        }
+                    },
+                },
+            }
+        ),
+        ready=fnv1.READY_TRUE,
+    )
+
+
+def _observed_deployment(*, ready: bool, ready_replicas: int) -> fnv1.Resource:
+    """The engine's Deployment Object as observed back.
+
+    ready sets the Object's derived Ready condition, and ready_replicas the
+    Deployment's status.readyReplicas, which a Deployment leaves out at 0.
+    """
+    observed_manifest: dict = {"kind": "Deployment"}
+    if ready_replicas:
+        observed_manifest["status"] = {"readyReplicas": ready_replicas}
     return fnv1.Resource(
         resource=resource.dict_to_struct(
             {
@@ -700,12 +768,12 @@ def _observed_deployment() -> fnv1.Resource:
                 "kind": "Object",
                 "spec": {"forProvider": {"manifest": {"kind": "Deployment"}}},
                 "status": {
-                    "atProvider": {"manifest": {"kind": "Deployment"}},
+                    "atProvider": {"manifest": observed_manifest},
                     "conditions": [
                         {
                             "type": "Ready",
-                            "status": "True",
-                            "reason": "Available",
+                            "status": "True" if ready else "False",
+                            "reason": "Available" if ready else "Unavailable",
                             "lastTransitionTime": "2025-01-01T00:00:00Z",
                         },
                     ],
@@ -760,11 +828,13 @@ COMPOSE_CASES = [
             observed=fnv1.State(
                 composite=_prefill_decode_replica(serving=v1alpha1.Serving(mode="PrefillDecode")),
                 resources={
-                    "model-serving-prefill": _observed_deployment(),
-                    "model-serving-decode": _observed_deployment(),
+                    "model-serving-prefill": _observed_deployment(ready=True, ready_replicas=1),
+                    "model-serving-decode": _observed_deployment(ready=True, ready_replicas=1),
                 },
             ),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
@@ -787,7 +857,62 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
-                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="AllCopiesReady",
+                    message="2 of 2 engine copies ready",
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="DecodeEngineDown",
+        reason=(
+            "A stored PrefillDecode replica whose decode engine has no ready copy isn't serving, though its "
+            "prefill engine is up."
+        ),
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_prefill_decode_replica(serving=v1alpha1.Serving(mode="PrefillDecode")),
+                resources={
+                    "model-serving-prefill": _observed_deployment(ready=True, ready_replicas=1),
+                    "model-serving-decode": _observed_deployment(ready=False, ready_replicas=0),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(),
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_FATAL,
+                    message="PrefillDecode serving requires serving.router: EndpointPicker and serving.endpointPicker",
+                ),
+            ],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="ModelStarting"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="ModelStarting",
+                    message="1 of 2 engine copies ready",
+                ),
             ],
         ),
     ),
@@ -803,7 +928,9 @@ COMPOSE_CASES = [
                     serving=v1alpha1.Serving(mode="PrefillDecode", router="EndpointPicker")
                 )
             ),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
@@ -826,7 +953,13 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_FALSE, reason="Deploying"),
-                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                    message="0 of 2 engine copies ready",
+                ),
             ],
         ),
     ),
@@ -871,19 +1004,23 @@ COMPOSE_CASES = [
                     )
                 )
             ),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 resources={
                     "model-serving-prefill": _deployment(
+                        copies=1,
                         ready=fnv1.READY_UNSPECIFIED,
                         name="test-replica-prefill-10d7e",
                         claim_template_name="test-replica-prefill-standalone-devices-51762",
                         labels={
                             "modelplane.ai/deployment": "my-deployment",
                             "modelplane.ai/engine": "prefill",
+                            "modelplane.ai/replica": "0",
                             "modelplane.ai/phase": "Prefill",
                             "modelplane.ai/role": "Standalone",
                             "modelplane.ai/serving": "test-replica",
@@ -895,12 +1032,14 @@ COMPOSE_CASES = [
                         ready=fnv1.READY_UNSPECIFIED, name="test-replica-prefill-standalone-devices-51762"
                     ),
                     "model-serving-decode": _deployment(
+                        copies=1,
                         ready=fnv1.READY_UNSPECIFIED,
                         name="test-replica-decode-44185",
                         claim_template_name="test-replica-decode-standalone-devices-e863a",
                         labels={
                             "modelplane.ai/deployment": "my-deployment",
                             "modelplane.ai/engine": "decode",
+                            "modelplane.ai/replica": "0",
                             "modelplane.ai/phase": "Decode",
                             "modelplane.ai/role": "Standalone",
                             "modelplane.ai/serving": "test-replica",
@@ -975,15 +1114,13 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(
-                    type="ModelAccepted",
-                    status=fnv1.STATUS_CONDITION_FALSE,
-                    reason="Deploying",
-                ),
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_FALSE, reason="Deploying"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
                 fnv1.Condition(
                     type="ModelReady",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="WaitingForModel",
+                    message="0 of 2 engine copies ready",
                 ),
             ],
         ),
@@ -997,20 +1134,24 @@ COMPOSE_CASES = [
             "endpoint picker, and marks none of it ready."
         ),
         req=fnv1.RunFunctionRequest(
-            observed=fnv1.State(composite=_model_replica()),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            observed=fnv1.State(composite=_model_replica(copies=1)),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 resources={
                     "model-serving-main": _deployment(
+                        copies=1,
                         ready=fnv1.READY_UNSPECIFIED,
                         name="test-replica-main-6b608",
                         claim_template_name="test-replica-main-standalone-devices-e609d",
                         labels={
                             "modelplane.ai/deployment": "my-deployment",
                             "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
                             "modelplane.ai/role": "Standalone",
                             "modelplane.ai/serving": "test-replica",
                             "modelplane.ai/workload": "test-replica-main-6b608",
@@ -1023,13 +1164,14 @@ COMPOSE_CASES = [
                     "inference-pool": _inference_pool(ready=fnv1.READY_UNSPECIFIED),
                     "epp": _epp(
                         ready=fnv1.READY_UNSPECIFIED,
-                        config_checksum="bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007",
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
                     ),
                     "epp-config": _epp_config(ready=fnv1.READY_UNSPECIFIED),
                     "epp-role": _epp_role(ready=fnv1.READY_UNSPECIFIED),
                     "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_UNSPECIFIED),
                     "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_UNSPECIFIED),
                     "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                    "replica-observation": _replica_observation(),
                 },
             ),
             results=[
@@ -1055,9 +1197,497 @@ COMPOSE_CASES = [
                     reason="Deploying",
                 ),
                 fnv1.Condition(
+                    type="ModelServing",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                ),
+                fnv1.Condition(
                     type="ModelReady",
                     status=fnv1.STATUS_CONDITION_FALSE,
                     reason="WaitingForModel",
+                    message="0 of 1 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="ObservationKept",
+        reason="A replica keeps its ReplicaObservation once composed, even when its cluster stops publishing an observation of its pool.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=1),
+                resources={
+                    "replica-observation": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                                "kind": "Object",
+                                "spec": {"forProvider": {"manifest": {"kind": "ReplicaObservation"}}},
+                            }
+                        )
+                    ),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        copies=1,
+                        ready=fnv1.READY_UNSPECIFIED,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_UNSPECIFIED),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_UNSPECIFIED, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_UNSPECIFIED),
+                    "epp": _epp(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-role": _epp_role(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                    "replica-observation": _replica_observation(),
+                },
+            ),
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_NORMAL,
+                    message="Composing vllm/vllm-openai:latest on cluster-a",
+                ),
+            ],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="ModelAccepted",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Deploying",
+                ),
+                fnv1.Condition(
+                    type="ModelServing",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                ),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                    message="0 of 1 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="ObservationRelayed",
+        reason="A replica relays that the agent has seen its pods scheduled, and when it first saw their claims allocated on each pool.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=1),
+                resources={
+                    "replica-observation": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                                "kind": "Object",
+                                "spec": {"forProvider": {"manifest": {"kind": "ReplicaObservation"}}},
+                                "status": {
+                                    "atProvider": {
+                                        "manifest": {
+                                            "apiVersion": "agent.modelplane.ai/v1alpha1",
+                                            "kind": "ReplicaObservation",
+                                            "metadata": {"name": "test-replica", "namespace": "mp-ml-team-51733"},
+                                            "spec": {
+                                                "podSelector": {
+                                                    "matchLabels": {
+                                                        "modelplane.ai/deployment": "my-deployment",
+                                                        "modelplane.ai/replica": "0",
+                                                    },
+                                                    "matchExpressions": [
+                                                        {"key": "modelplane.ai/engine", "operator": "Exists"}
+                                                    ],
+                                                },
+                                            },
+                                            "status": {
+                                                "observedGeneration": 1,
+                                                "conditions": [
+                                                    {
+                                                        "type": "Scheduled",
+                                                        "status": "True",
+                                                        "reason": "PodsScheduled",
+                                                        "message": "",
+                                                        "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                                        "observedGeneration": 1,
+                                                    },
+                                                    {
+                                                        "type": "Ready",
+                                                        "status": "False",
+                                                        "reason": "Starting",
+                                                        "message": "0 of 1 pods ready",
+                                                        "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                                        "observedGeneration": 1,
+                                                    },
+                                                ],
+                                                "pods": {"total": 1, "scheduled": 1, "ready": 0},
+                                                "devices": [
+                                                    {
+                                                        "driver": "gpu.nvidia.com",
+                                                        "pool": "ip-10-0-54-161.ec2.internal",
+                                                        "device": "gpu-2",
+                                                        "nodeName": "ip-10-0-54-161.ec2.internal",
+                                                    },
+                                                ],
+                                                "pools": [
+                                                    {
+                                                        "name": "frontier",
+                                                        "lastAllocationTime": "2026-10-20T10:02:13.482915Z",
+                                                    },
+                                                ],
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        )
+                    ),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                composite=fnv1.Resource(
+                    resource=resource.dict_to_struct(
+                        {
+                            "status": {
+                                "pools": [{"name": "frontier", "lastAllocationTime": "2026-10-20T10:02:13.482915Z"}]
+                            }
+                        }
+                    )
+                ),
+                resources={
+                    "model-serving-main": _deployment(
+                        copies=1,
+                        ready=fnv1.READY_UNSPECIFIED,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_UNSPECIFIED),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_UNSPECIFIED, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_UNSPECIFIED),
+                    "epp": _epp(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-role": _epp_role(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                    "replica-observation": _replica_observation(),
+                },
+            ),
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_NORMAL,
+                    message="Composing vllm/vllm-openai:latest on cluster-a",
+                ),
+            ],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="ModelAccepted",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Deploying",
+                ),
+                fnv1.Condition(
+                    type="ModelServing",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                ),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                    message="0 of 1 engine copies ready",
+                ),
+                fnv1.Condition(type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_TRUE, reason="AllPodsScheduled"),
+            ],
+        ),
+    ),
+    # The agent's schema requires a pool's allocation time.
+    Case(
+        name="ObservationInvalid",
+        reason="A replica whose observation doesn't match the agent's schema waits for an observation, rather than failing.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=1),
+                resources={
+                    "replica-observation": fnv1.Resource(
+                        resource=resource.dict_to_struct(
+                            {
+                                "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+                                "kind": "Object",
+                                "spec": {"forProvider": {"manifest": {"kind": "ReplicaObservation"}}},
+                                "status": {
+                                    "atProvider": {
+                                        "manifest": {
+                                            "apiVersion": "agent.modelplane.ai/v1alpha1",
+                                            "kind": "ReplicaObservation",
+                                            "metadata": {"name": "test-replica", "namespace": "mp-ml-team-51733"},
+                                            "spec": {
+                                                "podSelector": {
+                                                    "matchLabels": {
+                                                        "modelplane.ai/deployment": "my-deployment",
+                                                        "modelplane.ai/replica": "0",
+                                                    },
+                                                    "matchExpressions": [
+                                                        {"key": "modelplane.ai/engine", "operator": "Exists"}
+                                                    ],
+                                                },
+                                            },
+                                            "status": {
+                                                "observedGeneration": 1,
+                                                "conditions": [
+                                                    {
+                                                        "type": "Scheduled",
+                                                        "status": "True",
+                                                        "reason": "PodsScheduled",
+                                                        "message": "",
+                                                        "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                                        "observedGeneration": 1,
+                                                    },
+                                                    {
+                                                        "type": "Ready",
+                                                        "status": "False",
+                                                        "reason": "Starting",
+                                                        "message": "0 of 1 pods ready",
+                                                        "lastTransitionTime": "2026-10-20T10:00:00Z",
+                                                        "observedGeneration": 1,
+                                                    },
+                                                ],
+                                                "pods": {"total": 1, "scheduled": 1, "ready": 0},
+                                                "devices": [
+                                                    {
+                                                        "driver": "gpu.nvidia.com",
+                                                        "pool": "ip-10-0-54-161.ec2.internal",
+                                                        "device": "gpu-2",
+                                                        "nodeName": "ip-10-0-54-161.ec2.internal",
+                                                    },
+                                                ],
+                                                "pools": [{"name": "frontier"}],
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        )
+                    ),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        copies=1,
+                        ready=fnv1.READY_UNSPECIFIED,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_UNSPECIFIED),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_UNSPECIFIED, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_UNSPECIFIED),
+                    "epp": _epp(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-role": _epp_role(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                    "replica-observation": _replica_observation(),
+                },
+            ),
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_NORMAL,
+                    message="Composing vllm/vllm-openai:latest on cluster-a",
+                ),
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_WARNING,
+                    message="Ignoring the cluster agent's observation of this replica: it does not match the agent's "
+                    "schema (1 problems).",
+                ),
+            ],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(
+                    type="ModelAccepted",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Deploying",
+                ),
+                fnv1.Condition(
+                    type="ModelServing",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                ),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                    message="0 of 1 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="AgentNotReporting",
+        reason="A replica on a cluster whose agent reports on none of its pools composes no ReplicaObservation and reports no ModelPodsScheduled condition.",
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(composite=_model_replica(copies=1)),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        copies=1,
+                        ready=fnv1.READY_UNSPECIFIED,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_UNSPECIFIED),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_UNSPECIFIED, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_UNSPECIFIED),
+                    "epp": _epp(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-role": _epp_role(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_UNSPECIFIED),
+                    "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                },
+            ),
+            results=[
+                fnv1.Result(
+                    severity=fnv1.SEVERITY_NORMAL,
+                    message="Composing vllm/vllm-openai:latest on cluster-a",
+                ),
+            ],
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_FALSE, reason="Deploying"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForModel",
+                    message="0 of 1 engine copies ready",
                 ),
             ],
         ),
@@ -1068,7 +1698,7 @@ COMPOSE_CASES = [
         name="ClusterUnresolved",
         reason="Before its cluster resolves, a replica composes nothing and reports waiting, with the XR not ready.",
         req=fnv1.RunFunctionRequest(
-            observed=fnv1.State(composite=_model_replica()),
+            observed=fnv1.State(composite=_model_replica(copies=1)),
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
@@ -1090,16 +1720,9 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(
-                    type="ModelAccepted",
-                    status=fnv1.STATUS_CONDITION_FALSE,
-                    reason="WaitingForCluster",
-                ),
-                fnv1.Condition(
-                    type="ModelReady",
-                    status=fnv1.STATUS_CONDITION_FALSE,
-                    reason="WaitingForModel",
-                ),
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
+                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
             ],
         ),
     ),
@@ -1110,8 +1733,8 @@ COMPOSE_CASES = [
             "not ready."
         ),
         req=fnv1.RunFunctionRequest(
-            observed=fnv1.State(composite=_model_replica()),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref=None)])},
+            observed=fnv1.State(composite=_model_replica(copies=1)),
+            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref=None, observed=False)])},
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
@@ -1133,16 +1756,9 @@ COMPOSE_CASES = [
                 },
             ),
             conditions=[
-                fnv1.Condition(
-                    type="ModelAccepted",
-                    status=fnv1.STATUS_CONDITION_FALSE,
-                    reason="WaitingForCluster",
-                ),
-                fnv1.Condition(
-                    type="ModelReady",
-                    status=fnv1.STATUS_CONDITION_FALSE,
-                    reason="WaitingForModel",
-                ),
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForCluster"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
+                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForModel"),
             ],
         ),
     ),
@@ -1154,30 +1770,34 @@ COMPOSE_CASES = [
         name="ResourcesObserved",
         reason=(
             "With the workload observed Available and the route and claim template observed Ready, each is marked "
-            "ready, while the unobserved routing objects stay unready."
+            "ready, while the unobserved routing objects stay unready, so the replica waits for its routing."
         ),
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
-                composite=_model_replica(),
+                composite=_model_replica(copies=1),
                 resources={
-                    "model-serving-main": _observed_deployment(),
+                    "model-serving-main": _observed_deployment(ready=True, ready_replicas=1),
                     "model-route": _observed_object(ready=True),
                     "resource-claim-main-standalone": _observed_object(ready=True),
                 },
             ),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 resources={
                     "model-serving-main": _deployment(
+                        copies=1,
                         ready=fnv1.READY_TRUE,
                         name="test-replica-main-6b608",
                         claim_template_name="test-replica-main-standalone-devices-e609d",
                         labels={
                             "modelplane.ai/deployment": "my-deployment",
                             "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
                             "modelplane.ai/role": "Standalone",
                             "modelplane.ai/serving": "test-replica",
                             "modelplane.ai/workload": "test-replica-main-6b608",
@@ -1190,13 +1810,14 @@ COMPOSE_CASES = [
                     "inference-pool": _inference_pool(ready=fnv1.READY_UNSPECIFIED),
                     "epp": _epp(
                         ready=fnv1.READY_UNSPECIFIED,
-                        config_checksum="bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007",
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
                     ),
                     "epp-config": _epp_config(ready=fnv1.READY_UNSPECIFIED),
                     "epp-role": _epp_role(ready=fnv1.READY_UNSPECIFIED),
                     "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_UNSPECIFIED),
                     "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_UNSPECIFIED),
                     "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                    "replica-observation": _replica_observation(),
                 },
             ),
             context=structpb.Struct(),
@@ -1211,7 +1832,16 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
-                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForRouting"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForRouting",
+                    message="1 of 1 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
             ],
         ),
     ),
@@ -1221,13 +1851,14 @@ COMPOSE_CASES = [
     Case(
         name="PickerServiceUnready",
         reason=(
-            "With everything observed but the endpoint picker's Service Object not Ready, that Object stays unready."
+            "With everything observed but the endpoint picker's Service Object not Ready, that Object stays unready "
+            "and the replica waits for its routing."
         ),
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
-                composite=_model_replica(),
+                composite=_model_replica(copies=1),
                 resources={
-                    "model-serving-main": _observed_deployment(),
+                    "model-serving-main": _observed_deployment(ready=True, ready_replicas=1),
                     "model-route": _observed_object(ready=True),
                     "resource-claim-main-standalone": _observed_object(ready=True),
                     "inference-pool": _observed_object(ready=True),
@@ -1239,19 +1870,23 @@ COMPOSE_CASES = [
                     "epp-service": _observed_object(ready=False),
                 },
             ),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 resources={
                     "model-serving-main": _deployment(
+                        copies=1,
                         ready=fnv1.READY_TRUE,
                         name="test-replica-main-6b608",
                         claim_template_name="test-replica-main-standalone-devices-e609d",
                         labels={
                             "modelplane.ai/deployment": "my-deployment",
                             "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
                             "modelplane.ai/role": "Standalone",
                             "modelplane.ai/serving": "test-replica",
                             "modelplane.ai/workload": "test-replica-main-6b608",
@@ -1264,13 +1899,14 @@ COMPOSE_CASES = [
                     "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
                     "epp": _epp(
                         ready=fnv1.READY_TRUE,
-                        config_checksum="bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007",
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
                     ),
                     "epp-config": _epp_config(ready=fnv1.READY_TRUE),
                     "epp-role": _epp_role(ready=fnv1.READY_TRUE),
                     "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_TRUE),
                     "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_TRUE),
                     "epp-service": _epp_service(ready=fnv1.READY_UNSPECIFIED),
+                    "replica-observation": _replica_observation(),
                 },
             ),
             context=structpb.Struct(),
@@ -1285,7 +1921,16 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
-                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForRouting"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForRouting",
+                    message="1 of 1 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
             ],
         ),
     ),
@@ -1296,13 +1941,13 @@ COMPOSE_CASES = [
         name="PickerUnavailable",
         reason=(
             "With everything observed but the endpoint picker's Object reporting Ready False, as it does until its "
-            "Deployment is Available, that Object stays unready."
+            "Deployment is Available, that Object stays unready and the replica waits for its routing."
         ),
         req=fnv1.RunFunctionRequest(
             observed=fnv1.State(
-                composite=_model_replica(),
+                composite=_model_replica(copies=1),
                 resources={
-                    "model-serving-main": _observed_deployment(),
+                    "model-serving-main": _observed_deployment(ready=True, ready_replicas=1),
                     "model-route": _observed_object(ready=True),
                     "resource-claim-main-standalone": _observed_object(ready=True),
                     "inference-pool": _observed_object(ready=True),
@@ -1314,19 +1959,23 @@ COMPOSE_CASES = [
                     "epp-service": _observed_object(ready=True),
                 },
             ),
-            required_resources={"cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc")])},
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
         ),
         want=fnv1.RunFunctionResponse(
             meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
             desired=fnv1.State(
                 resources={
                     "model-serving-main": _deployment(
+                        copies=1,
                         ready=fnv1.READY_TRUE,
                         name="test-replica-main-6b608",
                         claim_template_name="test-replica-main-standalone-devices-e609d",
                         labels={
                             "modelplane.ai/deployment": "my-deployment",
                             "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
                             "modelplane.ai/role": "Standalone",
                             "modelplane.ai/serving": "test-replica",
                             "modelplane.ai/workload": "test-replica-main-6b608",
@@ -1339,7 +1988,93 @@ COMPOSE_CASES = [
                     "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
                     "epp": _epp(
                         ready=fnv1.READY_UNSPECIFIED,
-                        config_checksum="bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007",
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_TRUE),
+                    "epp-role": _epp_role(ready=fnv1.READY_TRUE),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_TRUE),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_TRUE),
+                    "epp-service": _epp_service(ready=fnv1.READY_TRUE),
+                    "replica-observation": _replica_observation(),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForRouting"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="WaitingForRouting",
+                    message="1 of 1 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="OneCopyDown",
+        reason=(
+            "With one of two copies ready and the routing in place, the replica serves through the ready copy but "
+            "isn't at full capacity: ModelServing is True and ModelReady is False, and the workload stays unready."
+        ),
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=2),
+                resources={
+                    "model-serving-main": _observed_deployment(ready=False, ready_replicas=1),
+                    "model-route": _observed_object(ready=True),
+                    "resource-claim-main-standalone": _observed_object(ready=True),
+                    "inference-pool": _observed_object(ready=True),
+                    "epp": _observed_object(ready=True),
+                    "epp-config": _observed_object(ready=True),
+                    "epp-role": _observed_object(ready=True),
+                    "epp-rolebinding": _observed_object(ready=True),
+                    "epp-serviceaccount": _observed_object(ready=True),
+                    "epp-service": _observed_object(ready=True),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        copies=2,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_TRUE),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_TRUE, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
+                    "epp": _epp(
+                        ready=fnv1.READY_TRUE,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
                     ),
                     "epp-config": _epp_config(ready=fnv1.READY_TRUE),
                     "epp-role": _epp_role(ready=fnv1.READY_TRUE),
@@ -1360,7 +2095,339 @@ COMPOSE_CASES = [
             ),
             conditions=[
                 fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
-                fnv1.Condition(type="ModelReady", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="Degraded",
+                    message="1 of 2 engine copies ready",
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="NoCopyReady",
+        reason=("With no copy ready, the replica has started but isn't serving, whatever its routing."),
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=2),
+                resources={
+                    "model-serving-main": _observed_deployment(ready=False, ready_replicas=0),
+                    "model-route": _observed_object(ready=True),
+                    "resource-claim-main-standalone": _observed_object(ready=True),
+                    "inference-pool": _observed_object(ready=True),
+                    "epp": _observed_object(ready=True),
+                    "epp-config": _observed_object(ready=True),
+                    "epp-role": _observed_object(ready=True),
+                    "epp-rolebinding": _observed_object(ready=True),
+                    "epp-serviceaccount": _observed_object(ready=True),
+                    "epp-service": _observed_object(ready=True),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        copies=2,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_TRUE),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_TRUE, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
+                    "epp": _epp(
+                        ready=fnv1.READY_TRUE,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_TRUE),
+                    "epp-role": _epp_role(ready=fnv1.READY_TRUE),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_TRUE),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_TRUE),
+                    "epp-service": _epp_service(ready=fnv1.READY_TRUE),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_FALSE, reason="ModelStarting"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="ModelStarting",
+                    message="0 of 2 engine copies ready",
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="RollingOut",
+        reason=(
+            "With every copy ready but the workload not yet, as during a rolling update, the replica serves "
+            "and reports itself rolling out rather than degraded."
+        ),
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=2),
+                resources={
+                    "model-serving-main": _observed_deployment(ready=False, ready_replicas=2),
+                    "model-route": _observed_object(ready=True),
+                    "resource-claim-main-standalone": _observed_object(ready=True),
+                    "inference-pool": _observed_object(ready=True),
+                    "epp": _observed_object(ready=True),
+                    "epp-config": _observed_object(ready=True),
+                    "epp-role": _observed_object(ready=True),
+                    "epp-rolebinding": _observed_object(ready=True),
+                    "epp-serviceaccount": _observed_object(ready=True),
+                    "epp-service": _observed_object(ready=True),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        ready=fnv1.READY_UNSPECIFIED,
+                        copies=2,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_TRUE),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_TRUE, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
+                    "epp": _epp(
+                        ready=fnv1.READY_TRUE,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_TRUE),
+                    "epp-role": _epp_role(ready=fnv1.READY_TRUE),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_TRUE),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_TRUE),
+                    "epp-service": _epp_service(ready=fnv1.READY_TRUE),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_FALSE,
+                    reason="RollingOut",
+                    message="2 of 2 engine copies ready",
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="AllCopiesReady",
+        reason=("With both copies ready and the routing in place, the replica is serving at full capacity."),
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=2),
+                resources={
+                    "model-serving-main": _observed_deployment(ready=True, ready_replicas=2),
+                    "model-route": _observed_object(ready=True),
+                    "resource-claim-main-standalone": _observed_object(ready=True),
+                    "inference-pool": _observed_object(ready=True),
+                    "epp": _observed_object(ready=True),
+                    "epp-config": _observed_object(ready=True),
+                    "epp-role": _observed_object(ready=True),
+                    "epp-rolebinding": _observed_object(ready=True),
+                    "epp-serviceaccount": _observed_object(ready=True),
+                    "epp-service": _observed_object(ready=True),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=False)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        ready=fnv1.READY_TRUE,
+                        copies=2,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_TRUE),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_TRUE, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
+                    "epp": _epp(
+                        ready=fnv1.READY_TRUE,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_TRUE),
+                    "epp-role": _epp_role(ready=fnv1.READY_TRUE),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_TRUE),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_TRUE),
+                    "epp-service": _epp_service(ready=fnv1.READY_TRUE),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="AllCopiesReady",
+                    message="2 of 2 engine copies ready",
+                ),
+            ],
+        ),
+    ),
+    Case(
+        name="ObservationComposedWhileServing",
+        reason=(
+            "A serving replica keeps serving at full capacity when the agent starts reporting on its pool, while the "
+            "ReplicaObservation it then composes isn't yet observed."
+        ),
+        req=fnv1.RunFunctionRequest(
+            observed=fnv1.State(
+                composite=_model_replica(copies=2),
+                resources={
+                    "model-serving-main": _observed_deployment(ready=True, ready_replicas=2),
+                    "model-route": _observed_object(ready=True),
+                    "resource-claim-main-standalone": _observed_object(ready=True),
+                    "inference-pool": _observed_object(ready=True),
+                    "epp": _observed_object(ready=True),
+                    "epp-config": _observed_object(ready=True),
+                    "epp-role": _observed_object(ready=True),
+                    "epp-rolebinding": _observed_object(ready=True),
+                    "epp-serviceaccount": _observed_object(ready=True),
+                    "epp-service": _observed_object(ready=True),
+                },
+            ),
+            required_resources={
+                "cluster": fnv1.Resources(items=[_cluster(provider_config_ref="cluster-a-pc", observed=True)])
+            },
+        ),
+        want=fnv1.RunFunctionResponse(
+            meta=fnv1.ResponseMeta(ttl=durationpb.Duration(seconds=60)),
+            desired=fnv1.State(
+                resources={
+                    "model-serving-main": _deployment(
+                        ready=fnv1.READY_TRUE,
+                        copies=2,
+                        name="test-replica-main-6b608",
+                        claim_template_name="test-replica-main-standalone-devices-e609d",
+                        labels={
+                            "modelplane.ai/deployment": "my-deployment",
+                            "modelplane.ai/engine": "main",
+                            "modelplane.ai/replica": "0",
+                            "modelplane.ai/role": "Standalone",
+                            "modelplane.ai/serving": "test-replica",
+                            "modelplane.ai/workload": "test-replica-main-6b608",
+                        },
+                    ),
+                    "model-route": _route(ready=fnv1.READY_TRUE),
+                    "resource-claim-main-standalone": _claim_template(
+                        ready=fnv1.READY_TRUE, name="test-replica-main-standalone-devices-e609d"
+                    ),
+                    "inference-pool": _inference_pool(ready=fnv1.READY_TRUE),
+                    "epp": _epp(
+                        ready=fnv1.READY_TRUE,
+                        config_checksum="c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39",
+                    ),
+                    "epp-config": _epp_config(ready=fnv1.READY_TRUE),
+                    "epp-role": _epp_role(ready=fnv1.READY_TRUE),
+                    "epp-rolebinding": _epp_role_binding(ready=fnv1.READY_TRUE),
+                    "epp-serviceaccount": _epp_service_account(ready=fnv1.READY_TRUE),
+                    "epp-service": _epp_service(ready=fnv1.READY_TRUE),
+                    "replica-observation": _replica_observation(),
+                },
+            ),
+            context=structpb.Struct(),
+            requirements=fnv1.Requirements(
+                resources={
+                    "cluster": fnv1.ResourceSelector(
+                        api_version="modelplane.ai/v1alpha1",
+                        kind="InferenceCluster",
+                        match_name="cluster-a",
+                    ),
+                },
+            ),
+            conditions=[
+                fnv1.Condition(type="ModelAccepted", status=fnv1.STATUS_CONDITION_TRUE, reason="Accepted"),
+                fnv1.Condition(type="ModelServing", status=fnv1.STATUS_CONDITION_TRUE, reason="Serving"),
+                fnv1.Condition(
+                    type="ModelReady",
+                    status=fnv1.STATUS_CONDITION_TRUE,
+                    reason="AllCopiesReady",
+                    message="2 of 2 engine copies ready",
+                ),
+                fnv1.Condition(
+                    type="ModelPodsScheduled", status=fnv1.STATUS_CONDITION_FALSE, reason="WaitingForObservation"
+                ),
             ],
         ),
     ),

@@ -19,11 +19,12 @@ cluster. It dispatches on the cluster source (GKE, EKS, etc., or
 Existing) to determine how the cluster is obtained, then composes a
 ServingStack on it.
 
-GPU node pools reference InferenceClasses. For provisioned clusters
-the class's provisioning block describes how to build the pool;
-for BYO (Existing) clusters the class is a pure description of pools
-that already exist. Either way, the class's resources block populates
-status.gpuPools so the scheduler can match models.
+Node pools reference InferenceClasses. For provisioned clusters
+the class's provisioning block describes how to build the pool (a GPU
+pool when it names an accelerator, a CPU pool when it doesn't); for BYO
+(Existing) clusters the class is a pure description of pools that
+already exist. Either way, the class's devices populate
+status.schedulablePools so the scheduler can match models.
 
 For provisioned clusters, a system node pool is injected automatically
 to host control-plane components (Envoy Gateway, Prometheus, etc.).
@@ -33,9 +34,11 @@ The system pool is not exposed in the user-facing API.
 from typing import Final, Literal
 
 import grpc
+import pydantic
 from crossplane.function import logging, request, resource, response
 from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from crossplane.function.proto.v1 import run_function_pb2_grpc as grpcv1
+from models.ai.modelplane.agent.poolobservation import v1alpha1 as pov1alpha1
 from models.ai.modelplane.inferenceclass import v1alpha1 as iclv1alpha1
 from models.ai.modelplane.inferencecluster import v1alpha1
 from models.ai.modelplane.inferencegateway import v1alpha1 as igv1alpha1
@@ -81,6 +84,32 @@ CONDITION_REASON_WAITING_FOR_CLASSES = "WaitingForClasses"
 CONDITION_REASON_BACKEND_HEALTHY = "BackendHealthy"
 CONDITION_REASON_INSTALLING = "Installing"
 CONDITION_REASON_INVALID_NODE_POOL = "InvalidNodePool"
+CONDITION_REASON_UNSUPPORTED_DEVICES = "UnsupportedDevices"
+
+# The DRA drivers each cloud supports. A hand-kept mirror of
+# supported_drivers() in compose-serving-stack's stacks package -
+# functions are self-contained by design - which the
+# supported-drivers-mirror flake check holds in sync. EKS's dra.net
+# arrives outside the serving stack (compose_eks_cluster installs the
+# EFA DRA driver when a pool asks for the fabric). Existing has no entry
+# because it never gates: a claimed driver beyond the stack's own
+# installs nothing and is never rejected - the rule, and why, is stated
+# on the stacks package's join() in compose-serving-stack.
+_SUPPORTED_DRA_DRIVERS: dict[Cloud, frozenset[str]] = {
+    CLUSTER_SOURCE_GKE: frozenset({"gpu.nvidia.com", "dra.cpu"}),
+    CLUSTER_SOURCE_EKS: frozenset({"gpu.nvidia.com", "dra.cpu", "dra.net"}),
+    CLUSTER_SOURCE_AKS: frozenset({"gpu.nvidia.com", "dra.cpu"}),
+    CLUSTER_SOURCE_NEBIUS: frozenset({"gpu.nvidia.com", "dra.cpu"}),
+    CLUSTER_SOURCE_VULTR: frozenset({"gpu.nvidia.com", "dra.cpu"}),
+    CLUSTER_SOURCE_CIVO: frozenset({"gpu.nvidia.com", "dra.cpu"}),
+}
+
+# The only driver whose pools the cluster agent can observe (see
+# compose_pool_observations).
+_NVIDIA_GPU_DRIVER = "gpu.nvidia.com"
+
+# InferenceClass device claim values. An unset claim means DRA.
+_CLAIM_DRA = "DRA"
 
 # Composed resource key for the backend XR.
 BACKEND_RESOURCE_KEY = "serving-stack"
@@ -122,6 +151,21 @@ _SECRET_TYPE_KUBECONFIG = "Kubeconfig"
 # The modelplane-system namespace. Used for the ServingStack XR,
 # ClusterProviderConfig secretRefs, and status.namespace.
 _NAMESPACE_SYSTEM = "modelplane-system"
+
+# The cluster agent, which the serving stack installs, reports a pool's nodes
+# and free devices in the status of a PoolObservation. It reports its Healthy
+# condition Unknown, with this reason, when it can't observe the pool.
+_AGENT_CONDITION_HEALTHY = "Healthy"
+_AGENT_REASON_OBSERVATION_FAILED = "ObservationFailed"
+
+# provider-kubernetes stops receiving watch events once the token in a
+# cluster's kubeconfig expires, which on EKS is after 15 minutes. A watched
+# PoolObservation then only reaches this XR when it's polled, every 10 minutes
+# by default, so it's polled more often.
+# TODO(negz): Remove once provider-kubernetes fixes this.
+# https://github.com/crossplane-contrib/provider-kubernetes/issues/598
+_ANNOTATION_POLL_INTERVAL = "crossplane.io/poll-interval"
+_POOL_OBSERVATION_POLL_INTERVAL = "30s"
 
 # Accelerator type naming an NVIDIA H100 in an InferenceClass. On Civo,
 # a pool of single-H100 nodes needs the serving stack to load that
@@ -217,6 +261,17 @@ def _namespace(meta: metav1.ObjectMeta | None) -> str:
     return meta.namespace
 
 
+def _agent_observable(cls: iclv1alpha1.InferenceClass) -> bool:
+    """Whether the cluster agent can observe a pool of this class.
+
+    Only NVIDIA GPU pools. The agent counts a node only if every NoSchedule
+    taint on it is nvidia.com/gpu, so it would report a CPU or AMD pool as
+    having no free devices and the scheduler would never place a replica
+    there. Unobserved, they get whole-node accounting.
+    """
+    return any(d.driver == _NVIDIA_GPU_DRIVER and (d.claim or _CLAIM_DRA) == _CLAIM_DRA for d in cls.spec.devices or [])
+
+
 def _gateway_hostname(cluster_name: str) -> str:
     """The internal name an InferenceGateway addresses this cluster's gateway by.
 
@@ -301,6 +356,9 @@ class Composer:
             return
 
         source = cluster.source
+        if not self.check_devices_supported(source):
+            return
+
         if source == CLUSTER_SOURCE_GKE:
             self.compose_gke(cluster.gke)
         elif source == CLUSTER_SOURCE_EKS:
@@ -317,6 +375,9 @@ class Composer:
             self.compose_existing(cluster.existing)
         else:
             response.warning(self.rsp, f"unsupported cluster source: {source}")
+            return
+
+        self.compose_pool_observations()
 
     def compose_activation(self, kinds: tuple[str, ...]) -> None:
         """Activate the cloud managed resource kinds the cluster XR composes.
@@ -522,6 +583,91 @@ class Composer:
             resource.update(self.rsp.desired.resources[key], obj)
             self.rsp.desired.resources[key].ready = fnv1.READY_TRUE
 
+    def compose_pool_observations(self) -> None:
+        """Compose a PoolObservation on the cluster for each of its NVIDIA GPU pools.
+
+        The cluster agent reports each pool's nodes and free devices in the
+        status of its PoolObservation, which schedulable_pools publishes. The
+        agent and the PoolObservation CRD arrive with the serving stack, so
+        they're first composed once the stack is ready, and kept after.
+
+        provider-kubernetes watches each one, and polls it often in case the
+        watch has stopped (see _POOL_OBSERVATION_POLL_INTERVAL), so the agent's
+        reports reach this XR soon after they change. Each is
+        marked ready unconditionally: the scheduler falls back to whole-node
+        accounting for a pool it has no observation of, so a missing one mustn't
+        hold up the cluster.
+
+        Each is composed no-Delete. Nothing holds the cluster until they're
+        gone, so deleting one could race the cluster's own deletion and never
+        finish. A PoolObservation left on a cluster, or for a pool that's since
+        been removed, has no effect on scheduling.
+        """
+        backend_ready = (
+            resource.get_condition(self.req.observed.resources.get(BACKEND_RESOURCE_KEY), "Ready").status == "True"
+        )
+        pc = resource.child_name(_name(self.xr.metadata), "cluster-kubeconfig")
+        for pool in self.xr.spec.nodePools or []:
+            cls = self.classes.get(pool.className)
+            if not cls or not _agent_observable(cls):
+                continue
+            key = f"pool-observation-{pool.name}"
+            if not (backend_ready or key in self.req.observed.resources):
+                continue
+            obj = k8sobjv1alpha1.Object(
+                metadata=metav1.ObjectMeta(
+                    namespace=_NAMESPACE_SYSTEM,
+                    annotations={_ANNOTATION_POLL_INTERVAL: _POOL_OBSERVATION_POLL_INTERVAL},
+                ),
+                spec=k8sobjv1alpha1.Spec(
+                    providerConfigRef=k8sobjv1alpha1.ProviderConfigRef(kind="ClusterProviderConfig", name=pc),
+                    readiness=k8sobjv1alpha1.Readiness(policy="SuccessfulCreate"),
+                    watch=True,
+                    forProvider=k8sobjv1alpha1.ForProvider(
+                        manifest=pov1alpha1.PoolObservation(
+                            apiVersion="agent.modelplane.ai/v1alpha1",
+                            kind="PoolObservation",
+                            metadata=metav1.ObjectMeta(name=pool.name),
+                            spec=pov1alpha1.Spec(poolName=pool.name),
+                        ).model_dump(exclude_unset=True),
+                    ),
+                ),
+            )
+            obj.spec.managementPolicies = ["Observe", "Create", "Update"]
+            resource.update(self.rsp.desired.resources[key], obj)
+            self.rsp.desired.resources[key].ready = fnv1.READY_TRUE
+
+    def observed_pool(self, pool_name: str) -> pov1alpha1.Status | None:
+        """The status of a pool's PoolObservation, or None until the agent has observed it.
+
+        The agent reports its conditions Unknown, and no nodes or devices, when
+        it can't observe a pool. That's no observation at all, rather than an
+        observation of an empty pool. So is a status that doesn't match the
+        agent's schema, which an agent other than the version Modelplane
+        installs could report. Raising would fail the whole cluster.
+        """
+        observed = self.req.observed.resources.get(f"pool-observation-{pool_name}")
+        if not observed:
+            return None
+        try:
+            obj = k8sobjv1alpha1.Object.model_validate(resource.struct_to_dict(observed.resource))
+            if not obj.status or not obj.status.atProvider or not obj.status.atProvider.manifest:
+                return None
+            po = pov1alpha1.PoolObservation.model_validate(obj.status.atProvider.manifest)
+        except pydantic.ValidationError as err:
+            response.warning(
+                self.rsp,
+                f"Ignoring the cluster agent's observation of pool {pool_name}: it does not match the agent's "
+                f"schema ({err.error_count()} problems), so the pool is counted in whole nodes.",
+            )
+            return None
+        if po.status is None:
+            return None
+        healthy = next((c for c in po.status.conditions or [] if c.type == _AGENT_CONDITION_HEALTHY), None)
+        if healthy is None or healthy.reason == _AGENT_REASON_OBSERVATION_FAILED:
+            return None
+        return po.status
+
     def resolve_gateway_cas(self) -> None:
         """Collect the client CA of every InferenceGateway in the fleet.
 
@@ -571,6 +717,68 @@ class Composer:
 
         return True
 
+    def dra_drivers(self) -> list[str]:
+        """DRA driver names claimed across the referenced classes' devices.
+
+        Collected verbatim onto ServingStack spec.draDrivers, which filters
+        the cloud's tagged components to the device stacks the cluster's
+        classes actually claim. Only claim: DRA devices count: a Synthetic
+        device is described for scheduling and never claimed, and its driver
+        is only the attribute domain its CEL selectors read, not an
+        installable stack. Sorted, so the ServingStack spec is stable across
+        reconciles.
+        """
+        drivers: set[str] = set()
+        for cls in self.classes.values():
+            for device in cls.spec.devices or []:
+                if (device.claim or _CLAIM_DRA) == _CLAIM_DRA:
+                    drivers.add(device.driver)
+        return sorted(drivers)
+
+    def check_devices_supported(self, source: Cloud) -> bool:
+        """Gate on a class claiming a driver the cloud's stack can't serve.
+
+        Checked here, before any cluster or ServingStack is composed, because
+        the cluster would provision devices nothing can drive. A typo'd or
+        not-yet-supported driver lands here too; unknown and unsupported are
+        the same failure. Existing never gates (see _SUPPORTED_DRA_DRIVERS).
+        Gating is a fatal result, so a cluster already running when a class
+        turns unsupported holds its existing resources. Every offending class
+        is named, so fixing one doesn't just surface the next.
+        """
+        if source == CLUSTER_SOURCE_EXISTING:
+            return True
+        supported = _SUPPORTED_DRA_DRIVERS[source]
+        offending = []
+        for name in sorted(self.classes):
+            claimed = {
+                d.driver for d in (self.classes[name].spec.devices or []) if (d.claim or _CLAIM_DRA) == _CLAIM_DRA
+            }
+            unsupported = claimed - supported
+            if unsupported:
+                offending.append(f"class {name} claims {', '.join(sorted(unsupported))}")
+        if not offending:
+            return True
+        msg = f"{'; '.join(offending)}; {source} clusters support {', '.join(sorted(supported))}"
+        response.set_conditions(
+            self.rsp,
+            resource.Condition(
+                typ=CONDITION_TYPE_CLUSTER_READY,
+                status="False",
+                reason=CONDITION_REASON_UNSUPPORTED_DEVICES,
+                message=msg,
+            ),
+        )
+        # A fatal result, not a bare return: everything after this gate
+        # composes the cluster, so returning an empty desired state would
+        # have Crossplane garbage-collect a running cluster - the cloud
+        # cluster XR, ServingStack and Usages - the moment a shared class
+        # starts claiming an unsupported driver. Crossplane stops before
+        # applying desired state or collecting anything on a fatal result,
+        # and still applies the condition above.
+        response.fatal(self.rsp, msg)
+        return False
+
     def compose_gke(self, gke: v1alpha1.Gke | None) -> None:
         """Compose an InferenceCluster backed by a Modelplane-provisioned
         GKE cluster. Composes the GKECluster XR, waits for it to be ready,
@@ -608,7 +816,7 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "GKE cluster ready, composing backend")
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=gke_ready)
 
     def compose_eks(self, eks: v1alpha1.Eks | None) -> None:
@@ -649,7 +857,7 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "EKS cluster ready, composing backend")
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=eks_ready)
 
     def compose_aks(self, aks: v1alpha1.Aks | None) -> None:
@@ -688,7 +896,7 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "AKS cluster ready, composing backend")
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=aks_ready)
 
     def compose_nebius(self, nebius: v1alpha1.Nebius | None) -> None:
@@ -737,7 +945,7 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "Nebius cluster ready, composing backend")
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=nebius_ready)
 
     def compose_vultr(self, vultr: v1alpha1.Vultr | None) -> None:
@@ -776,7 +984,7 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "Vultr cluster ready, composing backend")
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=vultr_ready)
 
     def compose_civo(self, civo: v1alpha1.Civo | None) -> None:
@@ -821,7 +1029,7 @@ class Composer:
             if not backend_exists:
                 response.normal(self.rsp, "Civo cluster ready, composing backend")
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=civo_ready)
 
     def compose_existing(self, existing: v1alpha1.Existing | None) -> None:
@@ -850,7 +1058,7 @@ class Composer:
             )
         self.compose_serving_stack(backend_secrets, CLUSTER_SOURCE_EXISTING)
 
-        self.write_status(self.gpu_pools())
+        self.write_status(self.schedulable_pools())
         self.derive_conditions(cluster_ready=True)
 
     def compose_serving_stack(
@@ -865,9 +1073,11 @@ class Composer:
         cloud names the cluster's source (this XR's spec.cluster.source)
         and selects the component list the serving stack installs,
         including cloud specifics like where the node image puts the
-        NVIDIA driver. gpu carries per-pool driver configuration the
-        component list can't know at build time (see
-        civo_nvlink_disabled_pools).
+        NVIDIA driver. spec.draDrivers is always set - an empty list when
+        no class claims a device - so the stack filters its tagged device
+        stacks to the drivers the classes claim. gpu carries per-pool
+        driver configuration the component list can't know at build time
+        (see civo_nvlink_disabled_pools).
         """
         # The gateway's name and the CAs it should accept client certificates
         # from. The name is Modelplane's own, derived from this cluster's name;
@@ -884,6 +1094,7 @@ class Composer:
             stack=self.xr.spec.stack,
             cloud=cloud,
             gateway=gateway,
+            draDrivers=[ssv1alpha1.DraDriver(d) for d in self.dra_drivers()],
         )
         if gpu is not None:
             spec.gpu = gpu
@@ -945,14 +1156,14 @@ class Composer:
         )
         self.rsp.desired.resources["cluster-provider-config-kubernetes"].ready = fnv1.READY_TRUE
 
-    def write_status(self, gpu_pools: list[dict[str, object]]) -> None:
+    def write_status(self, schedulable_pools: list[v1alpha1.SchedulablePool]) -> None:
         """Write the InferenceCluster status."""
         status = v1alpha1.Status(
             providerConfigRef=v1alpha1.ProviderConfigRef(
                 name=resource.child_name(_name(self.xr.metadata), "cluster-kubeconfig"),
             ),
             namespace=_NAMESPACE_SYSTEM,
-            gpuPools=gpu_pools,  # gpu_pools builds the by-alias wire form; pydantic coerces it to GpuPool
+            schedulablePools=schedulable_pools,
         )
         cache_storage_class = self.observed_cache_storage_class()
         if cache_storage_class:
@@ -986,7 +1197,12 @@ class Composer:
             # every request routed to it would be stranded.
             if ca and self.gateway_cas:
                 status.gateway.hostname = _gateway_hostname(_name(self.xr.metadata))
-        resource.update_status(self.rsp.desired.composite, status)
+        # The SDK dumps a model in Python mode, leaving a pool's
+        # lastAllocationTime a datetime a protobuf Struct can't hold.
+        resource.update_status(
+            self.rsp.desired.composite,
+            status.model_dump(mode="json", exclude_unset=True, by_alias=True, warnings=False),
+        )
 
     def derive_conditions(self, *, cluster_ready: bool) -> None:
         """Derive ClusterReady and BackendReady conditions."""
@@ -1047,22 +1263,30 @@ class Composer:
                 response.warning(self.rsp, msg)
                 return
             prov = cls.spec.provisioning.gke
-            gke_node_pools.append(
-                gkev1alpha1.NodePool(
-                    name=pool.name,
-                    role="GPU",
-                    machineType=prov.machineType,
-                    diskSizeGb=prov.diskSizeGb,
-                    nodeCount=pool.nodeCount,
-                    minNodeCount=pool.minNodeCount,
-                    maxNodeCount=pool.maxNodeCount,
-                    gpu=gkev1alpha1.Gpu(
-                        acceleratorType=prov.accelerator.type,
-                        acceleratorCount=prov.accelerator.count,
-                    ),
-                    zones=[gkev1alpha1.Zone(z) for z in pool.zones or []],
-                )
+            # A class with no accelerator describes a CPU pool: a standard
+            # node image, no GPU attachment, and the modelplane.ai/cpu
+            # label and taint composed by compose-gke-cluster.
+            node_pool = gkev1alpha1.NodePool(
+                name=pool.name,
+                role="GPU" if prov.accelerator else "CPU",
+                machineType=prov.machineType,
+                diskSizeGb=prov.diskSizeGb,
+                nodeCount=pool.nodeCount,
+                minNodeCount=pool.minNodeCount,
+                maxNodeCount=pool.maxNodeCount,
             )
+            if prov.accelerator:
+                node_pool.gpu = gkev1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                    acceleratorCount=prov.accelerator.count,
+                )
+            # Only set zones when the pool names some: GKE requires a
+            # non-empty list when zones are set, and resource.update
+            # serializes with exclude_unset, so leaving it unset keeps an
+            # empty list out of the GKECluster spec.
+            if pool.zones:
+                node_pool.zones = [gkev1alpha1.Zone(z) for z in pool.zones]
+            gke_node_pools.append(node_pool)
 
         gke_spec = gkev1alpha1.Spec(
             region=gke.region,
@@ -1110,19 +1334,26 @@ class Composer:
                 response.warning(self.rsp, msg)
                 return
             prov = cls.spec.provisioning.eks
+            # A class with no accelerator describes a CPU pool (see the GKE
+            # builder above).
             node_pool = eksv1alpha1.NodePool(
                 name=pool.name,
-                role="GPU",
+                role="GPU" if prov.accelerator else "CPU",
                 instanceType=prov.instanceType,
                 diskSizeGb=prov.diskSizeGb,
                 nodeCount=pool.nodeCount,
                 minNodeCount=pool.minNodeCount,
                 maxNodeCount=pool.maxNodeCount,
-                gpu=eksv1alpha1.Gpu(
-                    acceleratorType=prov.accelerator.type,
-                ),
-                zones=[eksv1alpha1.Zone(z) for z in pool.zones or []],
             )
+            if prov.accelerator:
+                node_pool.gpu = eksv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                )
+            # Only set zones when the pool names some, so an unzoned pool's
+            # EKSCluster spec stays free of zones: [] (resource.update
+            # serializes with exclude_unset).
+            if pool.zones:
+                node_pool.zones = [eksv1alpha1.Zone(z) for z in pool.zones]
             # Only set capacityBlock when the pool has one. resource.update
             # serializes with exclude_unset, so leaving it unset keeps it out
             # of the EKSCluster spec rather than emitting capacityBlock: null.
@@ -1182,18 +1413,21 @@ class Composer:
                 response.warning(self.rsp, msg)
                 return
             prov = cls.spec.provisioning.aks
+            # A class with no accelerator describes a CPU pool (see the GKE
+            # builder above).
             node_pool = aksv1alpha1.NodePool(
                 name=pool.name,
-                role="GPU",
+                role="GPU" if prov.accelerator else "CPU",
                 vmSize=prov.vmSize,
                 diskSizeGb=prov.diskSizeGb,
                 nodeCount=pool.nodeCount,
                 minNodeCount=pool.minNodeCount,
                 maxNodeCount=pool.maxNodeCount,
-                gpu=aksv1alpha1.Gpu(
-                    acceleratorType=prov.accelerator.type,
-                ),
             )
+            if prov.accelerator:
+                node_pool.gpu = aksv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                )
             # Only set zones when the pool names some: the AKSCluster XRD
             # requires a non-empty list, and many GPU VM sizes aren't zonal.
             if pool.zones:
@@ -1253,18 +1487,22 @@ class Composer:
                 response.warning(self.rsp, msg)
                 return
             prov = cls.spec.provisioning.nebius
+            # A class with no accelerator describes a CPU pool (see the GKE
+            # builder above). driversPreset rides the gpu block: a CPU
+            # platform preinstalls no NVIDIA stack.
             node_pool = nebiusv1alpha1.NodePool(
                 name=pool.name,
-                role="GPU",
+                role="GPU" if prov.accelerator else "CPU",
                 platform=prov.platform,
                 preset=prov.preset,
                 diskSizeGb=prov.diskSizeGb,
                 nodeCount=pool.nodeCount,
-                gpu=nebiusv1alpha1.Gpu(
+            )
+            if prov.accelerator:
+                node_pool.gpu = nebiusv1alpha1.Gpu(
                     acceleratorType=prov.accelerator.type,
                     driversPreset=prov.driversPreset,
-                ),
-            )
+                )
             # mk8s node groups are either fixed size or autoscaled, never
             # both. Only set the autoscaling bounds when the pool opts in, so
             # fixed-size pools stay fixed (resource.update serializes with
@@ -1410,15 +1648,18 @@ class Composer:
                 response.warning(self.rsp, msg)
                 return
             prov = cls.spec.provisioning.vultr
+            # A class with no accelerator describes a CPU pool (see the GKE
+            # builder above).
             node_pool = vultrv1alpha1.NodePool(
                 name=pool.name,
-                role="GPU",
+                role="GPU" if prov.accelerator else "CPU",
                 plan=prov.plan,
                 nodeCount=pool.nodeCount,
-                gpu=vultrv1alpha1.Gpu(
-                    acceleratorType=prov.accelerator.type,
-                ),
             )
+            if prov.accelerator:
+                node_pool.gpu = vultrv1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                )
             # Only set the autoscaling bounds when the pool opts in, so
             # fixed-size pools stay fixed (resource.update serializes with
             # exclude_unset, keeping unset bounds out of the VultrCluster
@@ -1528,7 +1769,7 @@ class Composer:
             if not cls or not cls.spec.provisioning or not cls.spec.provisioning.civo:
                 continue
             accelerator = cls.spec.provisioning.civo.accelerator
-            if accelerator.type == _ACCELERATOR_H100 and accelerator.count == 1:
+            if accelerator and accelerator.type == _ACCELERATOR_H100 and accelerator.count == 1:
                 pools.append(pool.name)
         return pools
 
@@ -1557,15 +1798,18 @@ class Composer:
                 response.warning(self.rsp, msg)
                 return
             prov = cls.spec.provisioning.civo
+            # A class with no accelerator describes a CPU pool (see the GKE
+            # builder above).
             node_pool = civov1alpha1.NodePool(
                 name=pool.name,
-                role="GPU",
+                role="GPU" if prov.accelerator else "CPU",
                 size=prov.size,
                 nodeCount=pool.nodeCount,
-                gpu=civov1alpha1.Gpu(
-                    acceleratorType=prov.accelerator.type,
-                ),
             )
+            if prov.accelerator:
+                node_pool.gpu = civov1alpha1.Gpu(
+                    acceleratorType=prov.accelerator.type,
+                )
             # Only set the autoscaling bounds when the pool opts in, so
             # fixed-size pools stay fixed (resource.update serializes with
             # exclude_unset, keeping unset bounds out of the CivoCluster
@@ -1820,33 +2064,50 @@ class Composer:
 
         return None
 
-    def gpu_pools(self) -> list[dict[str, object]]:
-        """Derive status.gpuPools from each node pool's class.
+    def schedulable_pools(self) -> list[v1alpha1.SchedulablePool]:
+        """Derive status.schedulablePools from each pool's class and observation.
 
         The class declares the node's devices (DRA-style); the pool declares how
-        many nodes. We copy the class's devices verbatim so
+        many nodes it can have. We copy the class's devices verbatim so
         ModelDeployment.nodeSelector can match against them, and record the node
-        count for the scheduler's available-node gate.
+        count. Once the cluster agent has observed the pool, we also record the
+        nodes it has now and how many devices are free on them, which the
+        scheduler fits replicas against. Nothing here is specific to GPUs: a CPU
+        pool's dra.cpu device lists like any other.
         """
-        gpu_pools = []
+        pools = []
         for pool in self.xr.spec.nodePools or []:
             cls = self.classes.get(pool.className)
             if not cls or not cls.spec.devices:
                 continue
-            # Copy the class's devices verbatim. model_dump drops None fields,
-            # keeping the typed attribute value objects
-            # (string/version/bool/int) one-of clean. by_alias keeps DRA's wire
-            # names (bool/int) rather than the generated bool_/int_ attributes,
-            # so the published status matches the InferenceClass schema.
-            devices = [d.model_dump(by_alias=True, exclude_none=True) for d in cls.spec.devices]
-            gpu_pools.append(
-                {
-                    "name": pool.name,
-                    "nodes": pool.maxNodeCount or pool.nodeCount,
-                    "devices": devices,
-                }
+            # Copy the class's devices verbatim, from the InferenceClass's model
+            # to the InferenceCluster's. model_dump drops None fields, keeping
+            # the typed attribute value objects (string/version/bool/int) one-of
+            # clean. by_alias keeps DRA's wire names (bool/int) rather than the
+            # generated bool_/int_ attributes.
+            schedulable = v1alpha1.SchedulablePool(
+                name=pool.name,
+                nodes=pool.maxNodeCount or pool.nodeCount,
+                devices=[
+                    v1alpha1.Device.model_validate(d.model_dump(by_alias=True, exclude_none=True))
+                    for d in cls.spec.devices
+                ],
             )
-        return gpu_pools
+            # A pool that has stopped being observable may still have an
+            # observation until Crossplane deletes it. Don't publish it.
+            observed = self.observed_pool(pool.name) if _agent_observable(cls) else None
+            if observed is not None:
+                schedulable.observedNodes = observed.nodes.total
+                schedulable.nodesByFreeDevices = [
+                    v1alpha1.NodesByFreeDevice.model_validate(b.model_dump(exclude_none=True))
+                    for b in observed.nodesByFreeDevices or []
+                ]
+                # The agent reports a time once a claim has allocated devices
+                # on the pool.
+                if observed.lastAllocationTime is not None:
+                    schedulable.lastAllocationTime = observed.lastAllocationTime
+            pools.append(schedulable)
+        return pools
 
     def observed_gke_secrets(self) -> list[gkev1alpha1.Secret] | None:
         """Read the GKECluster's status.secrets from observed state."""

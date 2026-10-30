@@ -53,7 +53,8 @@ deployment's other replicas keep serving while one moves.
 When no other cluster can take a replica, because every candidate is full or
 tainted, the deployment runs below its `spec.replicas` until capacity frees up.
 Its `ReplicasScheduled` condition reports the shortfall, so a drain that can't
-finish is visible rather than silent.
+finish is visible rather than silent. The deployment isn't `Ready` while it runs
+short, but `ReplicasServing` is True as long as one replica serves.
 
 Under `NoSchedule`, only new placement is blocked. Running replicas don't move.
 

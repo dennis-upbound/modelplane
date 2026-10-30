@@ -18,10 +18,18 @@ No generator covers Nebius, so Modelplane pins the whole cloud half by
 hand, in the same shape a generator emits. Where a component also
 appears on a generated cloud, this file states the same pin, so one
 review moves both halves when a version changes - regenerate, then
-mirror the shared pins here.
+mirror the shared pins here. The DCGM exporter's metrics CSV goes one
+step further: rather than restating it, this file imports it from the
+shared generated/aicr/dcgm.py, as civo.py does.
 """
 
+from function.stacks.clouds.generated.aicr.dcgm import DCGM_METRICS_CSV
 from function.stacks.components import Chart, Component
+
+# DRA drivers this cloud supports that arrive outside the serving
+# stack; the stacks package folds them into its derived
+# supported-drivers table.
+EXTERNAL_DRIVERS: list[str] = []
 
 COMPONENTS: list[Component] = [
     Chart(
@@ -89,19 +97,21 @@ COMPONENTS: list[Component] = [
                     ],
                 },
             },
-            # Disable components we don't need for observability.
-            "grafana": {"enabled": False},
-            "alertmanager": {"enabled": False},
             # The node-exporter chart's default toleration is keyless - it
-            # tolerates every taint, landing the pod on tainted GPU nodes by
-            # accident rather than by intent. Scope it to the GPU taint,
-            # mirroring the generated clouds (TOLERATIONS in generate.py); as
-            # a DaemonSet it still reaches every untainted node.
+            # tolerates every taint, landing the pod on tainted nodes by
+            # accident rather than by intent. Scope it to the GPU and CPU pool
+            # taints, mirroring the generated clouds (TOLERATIONS in
+            # generate.py); as a DaemonSet it still reaches every untainted
+            # node.
             "prometheus-node-exporter": {
                 "tolerations": [
                     {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                    {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
                 ],
             },
+            # Disable components we don't need for observability.
+            "grafana": {"enabled": False},
+            "alertmanager": {"enabled": False},
         },
     ),
     Chart(
@@ -111,6 +121,10 @@ COMPONENTS: list[Component] = [
         chart="node-feature-discovery",
         repository="https://kubernetes-sigs.github.io/node-feature-discovery/charts",
         version="0.19.0",
+        # NFD exists here to label GPU nodes for the DRA driver, so it
+        # carries the GPU stack's driver and stays off clusters whose
+        # classes claim no GPUs.
+        dra_drivers=["gpu.nvidia.com"],
         # The worker must run on the very nodes it is supposed to label:
         # the DRA driver's kubelet plugin schedules only onto nodes
         # carrying an NFD GPU label (feature.node.kubernetes.io/pci-10de
@@ -145,10 +159,59 @@ COMPONENTS: list[Component] = [
         namespace="nvidia-dra-driver",
         chart="dra-driver-nvidia-gpu",
         repository="oci://registry.k8s.io/dra-driver-nvidia/charts",
-        version="0.4.1",
+        version="0.5.0",
+        dra_drivers=["gpu.nvidia.com"],
         values={
             "gpuResourcesEnabledOverride": True,
             "resources": {"computeDomains": {"enabled": False}},
+        },
+    ),
+    # Exports DCGM fields for the collector's modelplane-gpu job, which
+    # keeps pods named .*dcgm.* with a port named metrics. Without this every
+    # modelplane_gpu_* series is empty. DCGM runs embedded (the chart
+    # default). The counters are the generated clouds' list, not the
+    # chart's shorter default, so Nebius exports the same DCGM fields as
+    # EKS, GKE, AKS and Civo. The node terms are the DRA kubelet plugin's PCI
+    # terms: Nebius GPU nodes carry pci-0302_10de but not pci-10de. The
+    # collector finds the pod itself, so no ServiceMonitor.
+    Chart(
+        key="dcgm-exporter",
+        release="mp-dcgm-exporter",
+        namespace="dcgm-exporter",
+        chart="dcgm-exporter",
+        repository="https://nvidia.github.io/dcgm-exporter/helm-charts",
+        version="4.8.4",
+        values={
+            "serviceMonitor": {"enabled": False},
+            "customMetrics": DCGM_METRICS_CSV,
+            # Attribute each GPU's series to the pod holding it. Nebius GPUs
+            # are allocated through DRA, which the exporter only maps back to
+            # pods with this set; the chart adds the RBAC it needs.
+            "kubernetesDRA": {"enabled": True},
+            "tolerations": [
+                {
+                    "key": "nvidia.com/gpu",
+                    "operator": "Exists",
+                    "effect": "NoSchedule",
+                },
+            ],
+            # The first three nodeSelectorTerms of dra-driver-nvidia-gpu
+            # v0.5.0's kubeletPlugin affinity. Recheck them when that chart
+            # moves.
+            "affinity": {
+                "nodeAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": {
+                        "nodeSelectorTerms": [
+                            {"matchExpressions": [{"key": key, "operator": "In", "values": ["true"]}]}
+                            for key in (
+                                "feature.node.kubernetes.io/pci-10de.present",
+                                "feature.node.kubernetes.io/pci-0302_10de.present",
+                                "feature.node.kubernetes.io/pci-0300_10de.present",
+                            )
+                        ],
+                    },
+                },
+            },
         },
     ),
 ]

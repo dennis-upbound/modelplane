@@ -52,7 +52,7 @@ native provisioning.
 | Scaleway (Kapsule) | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/scaleway/crossplane-provider-scaleway" "crossplane-provider-scaleway" "official" >}} |
 | Tencent Cloud (TKE) | {{< accel nvidia >}} | Planned | ✓ | {{< repolink "https://github.com/crossplane-contrib/provider-tencentcloud" "provider-tencentcloud" "community" >}} |
 | Voltage Park | {{< accel nvidia >}} | Planned | ✓ | none yet |
-| Vultr (VKE) | {{< accel nvidia >}} {{< accel amd >}} | ✓ | ✓ | {{< repolink "https://github.com/upbound/provider-vultr" "provider-vultr" "community" >}} |
+| Vultr (VKE) | {{< accel nvidia >}} {{< accel amd >}} | ✓ | ✓ | {{< repolink "https://github.com/upbound/provider-upjet-vultr" "provider-upjet-vultr" "community" >}} |
 {{< /table >}}
 
 {{< hint "note" >}}

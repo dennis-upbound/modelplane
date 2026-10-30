@@ -25,6 +25,9 @@ ResourceClaimTemplate. The shared Service and HTTPRoute that front a replica's
 engines are composed once by fn.py, not here.
 """
 
+from collections.abc import Mapping
+
+from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from models.ai.modelplane.modelreplica import v1alpha1
 from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
 
@@ -115,7 +118,9 @@ class NativeBackend:
         }
 
         composed = {
-            base.workload_key(engine): base.wrap_object(provider_config, deployment, cel_query=base.AVAILABLE_CEL),
+            base.workload_key(engine): base.wrap_object(
+                provider_config, deployment, cel_query=base.ALL_COPIES_READY_CEL, watch=True
+            ),
         }
         # Gated like the container's resources above, and for the same reason.
         if member.deviceRequests:
@@ -123,3 +128,7 @@ class NativeBackend:
                 replica, engine, member, provider_config
             )
         return composed
+
+    def ready_copies(self, engine: v1alpha1.Engine, observed: Mapping[str, fnv1.Resource]) -> int:
+        """How many copies of the engine are ready, from its observed workload."""
+        return base.ready_replicas(engine, observed)

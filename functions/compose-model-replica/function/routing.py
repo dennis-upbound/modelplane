@@ -119,10 +119,15 @@ _LABEL_ROLE = "llm-d.ai/role"
 # scores on. The producer pins autoTune: false and blockSizeTokens, because its
 # autoTune default leaves the block size 0 and never populates that attribute,
 # and blockSizeTokens follows the engine's KV block size (#179), at least
-# _MIN_BLOCK_SIZE_TOKENS. prefix-cache-scorer is weighted 2 to
-# queue-scorer's 1: cache locality dominates placement until queue depths
-# diverge, when the queue score breaks the tie. It's a starting default, not a
-# tuned one.
+# _MIN_BLOCK_SIZE_TOKENS. maxPrefixTokensToMatch is the producer's only match
+# cap: llm-d-router v0.9.0 defaults it to 131072 and, while it's above 0, ignores
+# maxPrefixBlocksToMatch (approximateprefix/types.go L133-L153, plugin.go
+# L178-L181). Rendering the default explicitly keeps the config the picker
+# reports equal to the one it runs. The producer hashes only that many leading
+# tokens of a prompt, so two prompts that agree that far look the same to it.
+# prefix-cache-scorer is weighted 2 to queue-scorer's 1: cache locality
+# dominates placement until queue depths diverge, when the queue score breaks
+# the tie. It's a starting default, not a tuned one.
 _UNIFIED_EPP_CONFIG_TEMPLATE = """\
 apiVersion: llm-d.ai/v1alpha1
 kind: EndpointPickerConfig
@@ -131,7 +136,7 @@ plugins:
   parameters:
     autoTune: false
     blockSizeTokens: BLOCK_SIZE_TOKENS
-    maxPrefixBlocksToMatch: 256
+    maxPrefixTokensToMatch: 131072
     lruCapacityPerServer: 31250
 - type: prefix-cache-scorer
 - type: queue-scorer

@@ -36,6 +36,9 @@ base.cache_env points HuggingFace at the mount so that name resolves to the
 staged weights.
 """
 
+from collections.abc import Mapping
+
+from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from models.ai.modelplane.modelreplica import v1alpha1
 from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
 
@@ -164,7 +167,7 @@ class LLMDBackend:
 
         composed = {
             base.workload_key(engine): base.wrap_object(
-                provider_config, leader_worker_set, cel_query=base.AVAILABLE_CEL
+                provider_config, leader_worker_set, cel_query=base.ALL_COPIES_READY_CEL, watch=True
             ),
         }
         # One ResourceClaimTemplate per claiming member. The leader and worker
@@ -176,3 +179,7 @@ class LLMDBackend:
                     replica, engine, member, provider_config
                 )
         return composed
+
+    def ready_copies(self, engine: v1alpha1.Engine, observed: Mapping[str, fnv1.Resource]) -> int:
+        """How many copies of the engine are ready, from its observed workload."""
+        return base.ready_replicas(engine, observed)

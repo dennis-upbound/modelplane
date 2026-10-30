@@ -139,14 +139,17 @@ def _relabel_pod_identity() -> list[dict[str, Any]]:
     ] + [{"source_labels": ["__meta_kubernetes_namespace"], "target_label": "namespace"}]
 
 
-def _dcgm_selector(action: str) -> dict[str, Any]:
-    """Match a GPU exporter, however it was packaged.
+def _gpu_exporter_selector(action: str) -> dict[str, Any]:
+    """Match a GPU exporter, whichever vendor's and however it was packaged.
 
-    The two spell it differently - gke-managed-dcgm-exporter and dcgm-exporter -
-    and put the name on different labels depending on who packaged it, so both
-    are read and the match is on what they share. One definition, used by the
-    job that keeps them and the job that has to leave them alone, because the
-    two drifting apart is how a series gets collected twice.
+    NVIDIA's DCGM exporters spell it differently - gke-managed-dcgm-exporter
+    and dcgm-exporter - and put the name on different labels depending on who
+    packaged it, so both labels are read and the match is on what they share.
+    The AMD GPU operator names its device-metrics-exporter pods
+    app.kubernetes.io/name: metrics-exporter, which the same pattern's second
+    alternative matches. One definition, used by the job that keeps them and
+    the job that has to leave them alone, because the two drifting apart is
+    how a series gets collected twice.
     """
     return {
         "source_labels": [
@@ -154,7 +157,7 @@ def _dcgm_selector(action: str) -> dict[str, Any]:
             "__meta_kubernetes_pod_label_app",
         ],
         "action": action,
-        "regex": ".*dcgm.*",
+        "regex": ".*dcgm.*|.*metrics-exporter.*",
     }
 
 
@@ -329,19 +332,22 @@ def _scrape_configs() -> list[dict[str, Any]]:
             "scrape_interval": _SCRAPE_INTERVAL,
             "kubernetes_sd_configs": [{"role": "pod"}],
             "relabel_configs": [
-                # A job of its own because nobody annotates DCGM for scraping
-                # and Modelplane doesn't install it: GKE runs a managed one in
-                # gke-managed-system, the NVIDIA GPU operator installs its own
-                # elsewhere, and the substrate job sees neither. Without this
-                # every modelplane_gpu_* series is empty on a cloud that
-                # provides its own - which is every cloud.
-                #
-                # Matched on the name rather than an exact label, because the
-                # two spell it differently: gke-managed-dcgm-exporter and
-                # dcgm-exporter. Both labels are read, since which one carries
-                # the name depends on who packaged it.
-                _dcgm_selector("keep"),
-                {"source_labels": ["__meta_kubernetes_pod_container_port_name"], "action": "keep", "regex": "metrics"},
+                # A job of its own because nobody annotates a GPU exporter
+                # for scraping: GKE runs a managed DCGM in
+                # gke-managed-system, the NVIDIA GPU operator installs its
+                # own elsewhere, Nebius gets the standalone dcgm-exporter
+                # chart, the AMD GPU operator Modelplane installs on
+                # Existing runs AMD's device-metrics-exporter, and the
+                # substrate job sees none of them. Without this every
+                # modelplane_gpu_* series is empty.
+                _gpu_exporter_selector("keep"),
+                # The exporters name their metrics port differently: DCGM's
+                # is metrics, the AMD operator's is exporter-port.
+                {
+                    "source_labels": ["__meta_kubernetes_pod_container_port_name"],
+                    "action": "keep",
+                    "regex": "metrics|exporter-port",
+                },
                 # The node, because a GPU series belongs to hardware rather
                 # than to a deployment. DCGM names the card itself.
                 {"source_labels": ["__meta_kubernetes_pod_node_name"], "target_label": "node"},
@@ -371,7 +377,7 @@ def _scrape_configs() -> list[dict[str, Any]]:
                     "action": "drop",
                     "regex": ".+",
                 },
-                _dcgm_selector("drop"),
+                _gpu_exporter_selector("drop"),
                 # The rest of the same convention, not just the first line of
                 # it. A pod that says scrape me generally also says where: the
                 # cert-manager webhook declares 10250 first and annotates 9402,
@@ -411,10 +417,16 @@ _PART_SUFFIX = {"Count": "_count", "Sum": "_sum"}
 # literal in that position.
 _UNIT_FACTOR = {
     "Millijoules": "0.001",
+    "Microjoules": "0.000001",
     "Milliseconds": "0.001",
     "Nanoseconds": "0.000000001",
     "Mebibytes": "1048576.0",
     "Percent": "0.01",
+}
+
+# The OTTL that converts each fromType to the counter a _total name claims.
+_TYPE_CONVERSION = {
+    "Gauge": 'convert_gauge_to_sum("cumulative", true)',
 }
 
 
@@ -424,7 +436,8 @@ def statements(mappings: list[mmv1alpha1.MetricMapping]) -> tuple[list[str], lis
     OTTL is rendered here rather than written in a MetricMapping so the kind
     stays a description of what a component emits, and the collector's own
     configuration language stays Modelplane's problem. It is also the only
-    place that knows a unit conversion has to run somewhere a rename cannot.
+    place that knows a unit or type conversion has to run somewhere a
+    rename cannot.
     """
     extract: list[str] = []
     scale: list[str] = []
@@ -444,6 +457,11 @@ def statements(mappings: list[mmv1alpha1.MetricMapping]) -> tuple[list[str], lis
                 source = f"{source}{_PART_SUFFIX[m.part]}"
             if m.fromUnit:
                 scale.append(f'scale_metric({_UNIT_FACTOR[m.fromUnit]}) where metric.name == "{source}"')
+            if m.fromType:
+                # In the conversion block with the unit scaling: both make
+                # the series agree with the name it's about to get, and
+                # both must run while it still answers to the source name.
+                scale.append(f'{_TYPE_CONVERSION[m.fromType]} where metric.name == "{source}"')
             # Labels before the rename, while the series still answers to the
             # name this mapping selected on. After it, two folded mappings share
             # one name and a statement could no longer tell them apart.

@@ -22,8 +22,10 @@ An `InferenceCluster` adds its own labels too. Whatever you put under its
 `spec.placement.metadata.labels` lands on every endpoint and replica scheduled
 there, so a service can select on a property of the cluster, like its region.
 
-Modelplane creates an endpoint only once its replica is Ready, serving and
-reachable, and withdraws it if the replica later goes unhealthy. A service only
+Modelplane creates an endpoint once its replica is serving, with at least one
+copy of each engine ready and reachable, and withdraws it if the replica stops
+serving. A replica that loses one of several copies keeps its endpoint, and the
+endpoint picker sends requests to the copies that are up. A service only
 ever routes to replicas that can actually answer, so a deployment that's still
 starting or scaling up has fewer endpoints behind it until those replicas
 come up. You don't create endpoints yourself. You point a service at them.

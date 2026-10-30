@@ -231,9 +231,12 @@ independently:
   clusters. This is the scaling axis (see [Scaling](#scaling)).
 - **`engines[].copies`** runs several identical copies of one engine within a
   replica, on the same cluster. It's a fixed number, sized once, never
-  autoscaled. Copies make a replica more resilient within its cluster: a node
-  failure drops one copy instead of taking the whole replica out of service. In
-  disaggregated serving they also set the prefill-to-decode ratio.
+  autoscaled. Copies make a replica more resilient within its cluster. A node
+  failure drops one copy instead of taking the whole replica out of service,
+  and the replica keeps [serving](#reading-a-deployments-status) while at least
+  one copy of each engine is ready. The replica reports `Ready` only when every
+  copy is ready. In disaggregated serving, copies also set the
+  prefill-to-decode ratio.
 - **`worker.nodes`** sets how many nodes one gang spans: a `Leader` plus that
   many `Worker` pods. It's how big one multi-node engine is.
 
@@ -244,6 +247,42 @@ fixed-shape serving instance, so scaling adds or removes whole instances across
 the fleet. Because the deployment exposes the Kubernetes scale subresource,
 `kubectl scale` and KEDA work without anything extra. There's no in-cluster pod
 autoscaling.
+
+## Reading a deployment's status
+
+A deployment's `Ready` means full capacity, so `kubectl wait
+--for=condition=Ready` returns once every replica is up. `ReplicasServing` says
+whether the model answers requests.
+
+| Condition | True when |
+|---|---|
+| `ReplicasScheduled` | Modelplane has placed every replica in `spec.replicas`. |
+| `ReplicasServing` | At least one replica is serving and routed. |
+| `ReplicasReady` | Every replica in `spec.replicas` is at full capacity. |
+| `Ready` | `ReplicasReady` is True and the referenced `ModelCache` exists. |
+
+A deployment with `ReplicasServing=True` and `Ready=False` is degraded. It
+serves from the replicas and copies that are up. `kubectl get` shows
+`ReplicasServing` in the `SERVING` column, and a replica's `ModelServing` in
+its own.
+
+Each `ModelReplica` reports `ModelAccepted`, `ModelServing` and `ModelReady`.
+Each implies the one before it, so the first False one says what the replica is
+waiting on:
+
+- `ModelAccepted`: the cluster accepted every engine's workload.
+- `ModelServing`: at least one copy of every engine is ready, and the endpoint
+  picker and routes in front of them are in place. The deployment routes to a
+  replica only while it's serving.
+- `ModelReady`: every copy is ready. Its message counts the ready copies, and
+  its reason is `Degraded` while the replica serves below full capacity. The
+  replica's `Ready` mirrors it.
+
+To see which replica a deployment is waiting on:
+
+```bash
+kubectl describe modelreplica -n ml-team -l modelplane.ai/deployment=<name>
+```
 
 ## Choosing a topology
 

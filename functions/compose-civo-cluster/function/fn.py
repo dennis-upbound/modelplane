@@ -96,6 +96,15 @@ _GPU_TAINT_KEY = "nvidia.com/gpu"
 _GPU_TAINT_VALUE = "true"
 _GPU_TAINT_EFFECT = "NoSchedule"
 
+# Label and taint on CPU inference pools. The label is what the serving
+# stack's dra-driver-cpu selects its nodes by; the taint keeps system
+# workloads off the pool as the GPU taint does on GPU pools, and engine
+# pods tolerate it (compose-model-replica).
+_LABEL_CPU = "modelplane.ai/cpu"
+_CPU_TAINT_KEY = "modelplane.ai/cpu"
+_CPU_TAINT_VALUE = "true"
+_CPU_TAINT_EFFECT = "NoSchedule"
+
 # Civo's default marketplace applications include the Traefik ingress
 # controller, which would compete with the serving stack's Envoy Gateway
 # for LoadBalancer traffic. A "-" prefix removes a default application at
@@ -430,6 +439,8 @@ class Composer:
         labels = {_LABEL_POOL: pool.name}
         if pool.role == "GPU" and pool.gpu:
             labels[_LABEL_GPU] = pool.gpu.acceleratorType
+        elif pool.role == "CPU":
+            labels[_LABEL_CPU] = "true"
 
         fp = nodepoolv1beta1.ForProvider(
             label=pool.name,
@@ -449,6 +460,14 @@ class Composer:
                     key=_GPU_TAINT_KEY,
                     value=_GPU_TAINT_VALUE,
                     effect=_GPU_TAINT_EFFECT,
+                ),
+            ]
+        elif pool.role == "CPU":
+            fp.taint = [
+                nodepoolv1beta1.TaintItem(
+                    key=_CPU_TAINT_KEY,
+                    value=_CPU_TAINT_VALUE,
+                    effect=_CPU_TAINT_EFFECT,
                 ),
             ]
 

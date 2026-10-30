@@ -30,9 +30,9 @@ Please include as much of the following as you can:
 
 ## Supported versions
 
-Modelplane is an early v0.1 project under active development. Security fixes are
-applied to the latest release on the default branch. There is no long-term
-support branch yet; this policy will expand as the project matures and adopts a
-formal governance structure (see [GOVERNANCE.md](GOVERNANCE.md)).
+Modelplane is an early, pre-1.0 project under active development. Security
+fixes are applied to the latest release on the default branch. There is no
+long-term support branch yet; this policy will expand as the project matures and
+adopts a formal governance structure (see [GOVERNANCE.md](GOVERNANCE.md)).
 
 [advisory]: https://github.com/modelplaneai/modelplane/security/advisories/new

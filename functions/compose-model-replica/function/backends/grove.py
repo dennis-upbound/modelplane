@@ -36,6 +36,10 @@ base.cache_env points HuggingFace at the mount so that name resolves to the
 staged weights.
 """
 
+from collections.abc import Mapping
+
+from crossplane.function import resource
+from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from models.ai.modelplane.modelreplica import v1alpha1
 from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
 
@@ -185,11 +189,6 @@ class GroveBackend:
         # terminationDelay. A copy is still all-or-nothing through its cliques'
         # own minAvailable. Fields the defaulting webhook would fill in are set
         # explicitly so provider-kubernetes doesn't fight it on every reconcile.
-        #
-        # NOTE(negz): the cost is that a replica reports available once one copy
-        # serves, since PodCliqueSet.status.availableReplicas is the only signal
-        # Grove populates - status.podGangStatuses exists on the type but
-        # nothing writes it.
         copies = int(engine.copies or 1)
         pod_clique_set = {
             "apiVersion": "grove.io/v1alpha1",
@@ -214,9 +213,24 @@ class GroveBackend:
             },
         }
 
+        # The PodCliqueSet is available once one copy is, so a second Object
+        # observes the scaling group Grove creates under it, which counts every
+        # copy. Grove names it <set>-<set replica index>-<group>.
+        scaling_group = {
+            "apiVersion": "grove.io/v1alpha1",
+            "kind": "PodCliqueScalingGroup",
+            "metadata": {"name": f"{name}-0-{base.GROVE_PCSG}", "namespace": base.remote_namespace(replica)},
+        }
         composed = {
             base.workload_key(engine): base.wrap_object(
-                provider_config, pod_clique_set, cel_query=base.GROVE_AVAILABLE_CEL
+                provider_config, pod_clique_set, cel_query=base.GROVE_AVAILABLE_CEL, watch=True
+            ),
+            base.scaling_group_key(engine): base.wrap_object(
+                provider_config,
+                scaling_group,
+                cel_query=base.GROVE_ALL_COPIES_READY_CEL,
+                watch=True,
+                observe_only=True,
             ),
         }
         # One ResourceClaimTemplate per claiming member. The leader and worker
@@ -228,3 +242,15 @@ class GroveBackend:
                     replica, engine, member, provider_config
                 )
         return composed
+
+    def ready_copies(self, engine: v1alpha1.Engine, observed: Mapping[str, fnv1.Resource]) -> int:
+        """How many copies of the engine are ready, from its scaling group.
+
+        Until the scaling group is first observed, a ready PodCliqueSet means
+        at least one copy is.
+        """
+        group = base.observed_status(observed, base.scaling_group_key(engine))
+        if group is not None:
+            return int(group.get("availableReplicas") or 0)
+        pcs = observed.get(base.workload_key(engine))
+        return 1 if resource.get_condition(pcs, "Ready").status == "True" else 0

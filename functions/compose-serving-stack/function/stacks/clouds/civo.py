@@ -154,6 +154,11 @@ def with_nvlink_disabled(components: list[Component], pools: list[str]) -> list[
     return out
 
 
+# DRA drivers this cloud supports that arrive outside the serving
+# stack; the stacks package folds them into its derived
+# supported-drivers table.
+EXTERNAL_DRIVERS: list[str] = []
+
 COMPONENTS: list[Component] = [
     Chart(
         key="cert-manager",
@@ -220,19 +225,21 @@ COMPONENTS: list[Component] = [
                     ],
                 },
             },
-            # Disable components we don't need for observability.
-            "grafana": {"enabled": False},
-            "alertmanager": {"enabled": False},
             # The node-exporter chart's default toleration is keyless - it
-            # tolerates every taint, landing the pod on tainted GPU nodes by
-            # accident rather than by intent. Scope it to the GPU taint,
-            # mirroring the generated clouds (TOLERATIONS in generate.py); as
-            # a DaemonSet it still reaches every untainted node.
+            # tolerates every taint, landing the pod on tainted nodes by
+            # accident rather than by intent. Scope it to the GPU and CPU pool
+            # taints, mirroring the generated clouds (TOLERATIONS in
+            # generate.py); as a DaemonSet it still reaches every untainted
+            # node.
             "prometheus-node-exporter": {
                 "tolerations": [
                     {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                    {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
                 ],
             },
+            # Disable components we don't need for observability.
+            "grafana": {"enabled": False},
+            "alertmanager": {"enabled": False},
         },
     ),
     Chart(
@@ -245,6 +252,10 @@ COMPONENTS: list[Component] = [
         # gpu-operator below depends on this chart, so its Ready must
         # mean healthy, not just deployed.
         wait=True,
+        # NFD exists here to label GPU nodes for the DRA driver, so it
+        # carries the GPU stack's driver and stays off clusters whose
+        # classes claim no GPUs.
+        dra_drivers=["gpu.nvidia.com"],
         # The worker must run on the very nodes it is supposed to label:
         # the DRA driver's kubelet plugin schedules only onto nodes
         # carrying an NFD GPU label (feature.node.kubernetes.io/pci-10de
@@ -278,7 +289,7 @@ COMPONENTS: list[Component] = [
         namespace="gpu-operator",
         chart="gpu-operator",
         repository="https://helm.ngc.nvidia.com/nvidia",
-        version="v26.3.3",
+        version="v26.7.1",
         wait=True,
         # No kube-prometheus-stack edge, unlike the generated clouds': the
         # DCGM exporter's ServiceMonitor, the one piece that would need
@@ -287,6 +298,7 @@ COMPONENTS: list[Component] = [
         # modelplane_energy_joules_total is empty on Civo - the
         # collector's modelplane-gpu job would find no pod to scrape.
         depends_on=["node-feature-discovery", "cert-manager"],
+        dra_drivers=["gpu.nvidia.com"],
         values={
             "ccManager": {"enabled": False},
             "cdi": {"default": True, "enabled": True},
@@ -318,9 +330,9 @@ COMPONENTS: list[Component] = [
             # scopes that to the pool when the ServingStack asks for it.
             "driver": {
                 "enabled": True,
+                "kernelModuleType": "open",
                 "maxParallelUpgrades": 5,
                 "rdma": {"enabled": False},
-                "useOpenKernelModules": True,
                 "version": "580.173.02",
             },
             "fullnameOverride": "gpu-operator",
@@ -361,8 +373,9 @@ COMPONENTS: list[Component] = [
         namespace="nvidia-dra-driver",
         chart="dra-driver-nvidia-gpu",
         repository="oci://registry.k8s.io/dra-driver-nvidia/charts",
-        version="0.4.1",
+        version="0.5.0",
         depends_on=["gpu-operator"],
+        dra_drivers=["gpu.nvidia.com"],
         values={
             "gpuResourcesEnabledOverride": True,
             "nvidiaDriverRoot": "/run/nvidia/driver",

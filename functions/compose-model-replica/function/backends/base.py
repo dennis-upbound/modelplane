@@ -21,9 +21,11 @@ serving resources. Backends return provider-kubernetes Objects; the dispatcher
 
 import hashlib
 import re
+from collections.abc import Mapping
 from typing import Protocol
 
 from crossplane.function import resource
+from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from models.ai.modelplane.modelreplica import v1alpha1
 from models.io.crossplane.m.kubernetes.object import v1alpha1 as k8sobjv1alpha1
 from models.io.k8s.apimachinery.pkg.apis.meta import v1 as metav1
@@ -54,6 +56,10 @@ class Backend(Protocol):
         serving_label: str,
         stack: str,
     ) -> dict[str, k8sobjv1alpha1.Object]: ...
+
+    def ready_copies(self, engine: v1alpha1.Engine, observed: Mapping[str, fnv1.Resource]) -> int:
+        """How many copies of the engine are ready, from its observed workload."""
+        ...
 
 
 # Backend identifiers.
@@ -252,8 +258,9 @@ LABEL_WORKLOAD = "modelplane.ai/workload"
 # Pod labels carrying the identity every metric off this pod is attributed to.
 # The collector reads them off the pod during service discovery and stamps them
 # on each series, so a MetricMapping needs no labels of its own and a series
-# merged across replicas keeps the identity all of them share. Metrics are the
-# only reason these exist; nothing selects on them.
+# merged across replicas keeps the identity all of them share. A replica's
+# ReplicaObservation also selects its pods by deployment, replica and engine (see
+# observation.compose), so renaming those breaks the scheduler's accounting.
 LABEL_DEPLOYMENT = "modelplane.ai/deployment"
 LABEL_REPLICA = "modelplane.ai/replica"
 LABEL_ENGINE = "modelplane.ai/engine"
@@ -262,7 +269,7 @@ LABEL_PHASE = "modelplane.ai/phase"
 
 
 # Set on the ModelReplica by the composite that scheduled it.
-_LABEL_REPLICA_INDEX = "modelplane.ai/replica-index"
+LABEL_REPLICA_INDEX = "modelplane.ai/replica-index"
 
 
 def telemetry_labels(
@@ -286,7 +293,7 @@ def telemetry_labels(
     # one of them is simply lost. The index rather than the pod: it is bounded
     # by the replica count, and it survives a restart and a rolling update,
     # where a pod name is minted afresh each time.
-    if index := own.get(_LABEL_REPLICA_INDEX):
+    if index := own.get(LABEL_REPLICA_INDEX):
         labels[LABEL_REPLICA] = index
     if engine.name:
         labels[LABEL_ENGINE] = engine.name
@@ -313,7 +320,7 @@ def fleet_labels(replica: v1alpha1.ModelReplica, role: str) -> dict[str, str]:
     own = (replica.metadata.labels if replica.metadata else None) or {}
     if name := own.get(LABEL_DEPLOYMENT):
         labels[LABEL_DEPLOYMENT] = name
-    if index := own.get(_LABEL_REPLICA_INDEX):
+    if index := own.get(LABEL_REPLICA_INDEX):
         labels[LABEL_REPLICA] = index
     return labels
 
@@ -422,6 +429,7 @@ GROVE_QUEUE = "modelplane"
 # don't collide in the response map.
 ROUTE_KEY = "model-route"
 _WORKLOAD_KEY = "model-serving"
+_SCALING_GROUP_KEY = "scaling-group"
 _CLAIM_KEY = "resource-claim"
 
 # HTTPRoute request timeout for model traffic. "0s" disables it (Gateway API
@@ -437,6 +445,11 @@ REQUEST_TIMEOUT = "0s"
 def workload_key(engine: v1alpha1.Engine) -> str:
     """Response key for an engine's workload (Deployment, LeaderWorkerSet, or PodCliqueSet)."""
     return f"{_WORKLOAD_KEY}-{engine.name}"
+
+
+def scaling_group_key(engine: v1alpha1.Engine) -> str:
+    """Response key for the observed Grove PodCliqueScalingGroup of an engine."""
+    return f"{_SCALING_GROUP_KEY}-{engine.name}"
 
 
 def member_role(member: v1alpha1.Member) -> str:
@@ -462,11 +475,7 @@ def claim_key(engine: v1alpha1.Engine, member: v1alpha1.Member) -> str:
 
 
 def workload_keys(replica: v1alpha1.ModelReplica) -> list[str]:
-    """Response keys of every engine's workload, in engine order.
-
-    fn.py tracks replica readiness across all of these: a replica is serving
-    only when every engine's workload is ready.
-    """
+    """Response keys of every engine's workload, in engine order."""
     return [workload_key(g) for g in replica.spec.engines]
 
 
@@ -479,9 +488,8 @@ _DRA_API_VERSION = "resource.k8s.io/v1"
 # reference individual requests within the claim.
 _POD_CLAIM_NAME = "devices"
 
-# CEL readiness query matching a Deployment's or LeaderWorkerSet's
-# all-replicas-available signal, an Available=True condition. Both publish this
-# condition when their desired replicas are up but neither publishes a Ready
+# CEL readiness query matching a Deployment's or LeaderWorkerSet's Available=True
+# condition. Both publish this condition but neither publishes a Ready
 # condition, so provider-kubernetes' DeriveFromObject policy (which only checks a
 # Ready condition) can never mark them ready. The has() guard keeps the query
 # false (not erroring) before the workload first writes status.conditions.
@@ -489,15 +497,36 @@ AVAILABLE_CEL = (
     'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")'
 )
 
+# CEL readiness query for an engine's Deployment or LeaderWorkerSet with every
+# copy ready. Available alone isn't enough: a Deployment stays Available with up
+# to its maxUnavailable (25% by default) of copies down. So the query also
+# requires a ready pod, or ready group, per copy.
+ALL_COPIES_READY_CEL = (
+    AVAILABLE_CEL + " && has(object.status.readyReplicas) && object.status.readyReplicas >= object.spec.replicas"
+)
+
 # Grove publishes no Ready or Available condition on a PodCliqueSet, so
 # readiness comes from its replica counters: a replica counts as available once
 # every clique and scaling group is at or above minAvailable. observedGeneration
 # guards against a count left over from before the last spec change.
 # status.podGangStatuses looks useful here but Grove never populates it.
+#
+# The scaling group's minAvailable is 1, so this is true once one copy of the
+# engine is up. GROVE_ALL_COPIES_READY_CEL counts every copy.
 GROVE_AVAILABLE_CEL = (
     "has(object.status) && has(object.status.observedGeneration) && "
     "object.status.observedGeneration == object.metadata.generation && "
     "object.spec.replicas > 0 && has(object.status.availableReplicas) && "
+    "object.status.availableReplicas >= object.spec.replicas"
+)
+
+# CEL readiness query for a Grove PodCliqueScalingGroup with every copy
+# available. Its availableReplicas counts the copies whose cliques are all at or
+# above their minAvailable. Unlike the PodCliqueSet's query it needs no
+# observedGeneration guard: Grove recounts the group from its cliques on every
+# reconcile, and a spec change to the set doesn't bump the group's generation.
+GROVE_ALL_COPIES_READY_CEL = (
+    "has(object.status) && has(object.status.availableReplicas) && "
     "object.status.availableReplicas >= object.spec.replicas"
 )
 
@@ -508,6 +537,7 @@ def wrap_object(
     *,
     cel_query: str | None = None,
     watch: bool = False,
+    observe_only: bool = False,
 ) -> k8sobjv1alpha1.Object:
     """Wrap a raw manifest in a provider-kubernetes Object for a remote cluster.
 
@@ -515,9 +545,10 @@ def wrap_object(
     That's right for resources with no meaningful runtime readiness (a Service,
     an HTTPRoute, or a ResourceClaimTemplate that's never reconciled). Pass
     cel_query for a workload whose readiness must reflect its observed status -
-    it selects the DeriveFromCelQuery policy with that query (see AVAILABLE_CEL).
+    it selects the DeriveFromCelQuery policy with that query (see ALL_COPIES_READY_CEL).
     Pass watch to have provider-kubernetes update the Object as soon as the
-    resource changes, rather than on its next poll or resync.
+    resource changes, rather than on its next poll or resync. Pass observe_only
+    for a resource something else creates, which the Object only reads.
     """
     readiness = (
         k8sobjv1alpha1.Readiness(policy="DeriveFromCelQuery", celQuery=cel_query)
@@ -534,7 +565,29 @@ def wrap_object(
     )
     if watch:
         spec.watch = True
+    if observe_only:
+        spec.managementPolicies = ["Observe"]
     return k8sobjv1alpha1.Object(spec=spec)
+
+
+def observed_status(observed: Mapping[str, fnv1.Resource], key: str) -> dict | None:
+    """The status of the remote resource an observed Object reads, or None
+    until provider-kubernetes has observed it."""
+    found = observed.get(key)
+    if not found:
+        return None
+    obj = k8sobjv1alpha1.Object.model_validate(resource.struct_to_dict(found.resource))
+    if not (obj.status and obj.status.atProvider and obj.status.atProvider.manifest):
+        return None
+    status = obj.status.atProvider.manifest.get("status")
+    return status if isinstance(status, dict) else {}
+
+
+def ready_replicas(engine: v1alpha1.Engine, observed: Mapping[str, fnv1.Resource]) -> int:
+    """An engine's ready copies from its Deployment's ready pods or its
+    LeaderWorkerSet's ready groups. Both leave readyReplicas out at 0."""
+    status = observed_status(observed, workload_key(engine)) or {}
+    return int(status.get("readyReplicas") or 0)
 
 
 def serving_label(replica: v1alpha1.ModelReplica) -> str:
@@ -754,12 +807,64 @@ def engine_resources(container: v1alpha1.Container, *, claim: bool) -> dict:
     return resources
 
 
-# Taint GPU node groups carry so non-GPU pods don't land on them. A pod that
-# claims a GPU must tolerate it to schedule there. With GPUs bound via DRA (not
-# the device plugin's extended resource), nothing injects this toleration for us
-# - the ExtendedResourceToleration admission controller only acts on
-# nvidia.com/gpu resource requests, which DRA pods don't make.
-_GPU_TOLERATION = {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+# The DeviceClass dra-driver-cpu registers, and the qualified name its
+# grouped devices hold their cores under. A member claiming through this
+# class sizes its claim from the engine's cpu request (see
+# resource_claim_template); the names are the driver's contract, kept in
+# sync with the dra-driver-cpu pin in compose-serving-stack's
+# stacks/common.py.
+_CPU_DEVICE_CLASS = "dra.cpu"
+_CPU_CAPACITY = "dra.cpu/cpu"
+
+
+def invalid_cpu_claim(replica: v1alpha1.ModelReplica) -> str | None:
+    """Explain why a member's dra.cpu claim can't be sized, or None if every one can.
+
+    A CPU claim takes the engine container's cpu request from one device
+    (see resource_claim_template), so the function stops on a claim it
+    can't size that way rather than compose one the driver refuses or
+    that over-claims. Without a request the claim would take the whole
+    device, which leaves the node's shared containers nowhere to run.
+    Across more than one device, each would take the full request.
+    """
+    for engine in replica.spec.engines:
+        for member in engine.members:
+            cpu = [r for r in (member.deviceRequests or []) if r.deviceClassName == _CPU_DEVICE_CLASS]
+            if not cpu:
+                continue
+            name = f"{engine.name}/{member_role(member)}"
+            if sum(int(r.count or 1) for r in cpu) > 1:
+                return (
+                    f"{name} claims more than one dra.cpu device, but a dra.cpu claim takes the engine "
+                    "container's cpu request from a single device: claim one"
+                )
+            container = engine_container(member)
+            requests = (container.resources.requests if container.resources else None) or {}
+            if "cpu" not in requests:
+                return (
+                    f"a dra.cpu claim is sized from the engine container's cpu request, and {name} sets none: "
+                    "set resources requests and limits cpu to the cores the claim should take, below the "
+                    "device's total so the node's shared containers keep a core"
+                )
+    return None
+
+
+# Taints inference node pools carry so unrelated pods don't land on them, one
+# per device stack: the cluster compositions taint NVIDIA GPU pools
+# nvidia.com/gpu and CPU pools modelplane.ai/cpu, and BYO AMD pools carry
+# amd.com/gpu. A pod that claims a device must tolerate its pool's taint to
+# schedule there, and with devices bound via DRA (not a device plugin's
+# extended resource) nothing injects the toleration for us - the
+# ExtendedResourceToleration admission controller only acts on nvidia.com/gpu
+# resource requests, which DRA pods don't make. Every engine pod tolerates the
+# whole list: tolerating a taint its pool never carries is harmless, and the
+# pool nodeSelector is what places the pod, so the accelerator needn't thread
+# through placement.
+_POOL_TOLERATIONS = [
+    {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+    {"key": "amd.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+    {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
+]
 
 # Node label identifying the pool a node belongs to. compose-eks-cluster and
 # compose-gke-cluster stamp it on every node group they provision; the scheduler
@@ -774,9 +879,9 @@ def place_pod(pod_spec: dict, replica: v1alpha1.ModelReplica, engine: v1alpha1.E
     """Constrain a member's serving pod to the placement the scheduler chose.
 
     Pins the pod to its member's scheduled node pool, wires it to claim its
-    GPUs via DRA through the member's claim, and tolerates the GPU node taint.
-    Every pod of one member shares this - a native Deployment pod, a
-    LeaderWorkerSet leader or worker pod, or a Grove leader or worker clique
+    devices via DRA through the member's claim, and tolerates every inference
+    pool taint. Every pod of one member shares this - a native Deployment pod,
+    a LeaderWorkerSet leader or worker pod, or a Grove leader or worker clique
     pod.
 
     The pool nodeSelector is what makes the scheduler's pool choice real: the
@@ -793,14 +898,14 @@ def place_pod(pod_spec: dict, replica: v1alpha1.ModelReplica, engine: v1alpha1.E
     claim. A claimless member - one with no deviceRequests, like a
     coordinator-only leader - gets no claim at all: only the pool pin places
     its pods, packed onto the gang's nodes by the cluster's scheduler. It still
-    tolerates the GPU taint, since the pool it rides along on is a GPU pool.
+    tolerates the pool taints, since the pool it rides along on carries one.
     """
     pod_spec["nodeSelector"] = {_LABEL_POOL: member.nodePoolName}
     if member.deviceRequests:
         pod_spec["resourceClaims"] = [
             {"name": _POD_CLAIM_NAME, "resourceClaimTemplateName": claim_template_name(replica, engine, member)}
         ]
-    pod_spec.setdefault("tolerations", []).append(_GPU_TOLERATION)
+    pod_spec.setdefault("tolerations", []).extend(_POOL_TOLERATIONS)
 
 
 def resource_claim_template(
@@ -824,6 +929,20 @@ def resource_claim_template(
         selectors = [{"cel": {"expression": s.cel}} for s in (r.selectors or []) if s.cel]
         if selectors:
             exactly["selectors"] = selectors
+        if r.deviceClassName == _CPU_DEVICE_CLASS:
+            # dra-driver-cpu's grouped device holds its cores as consumable
+            # capacity, and a claim with no capacity request consumes the
+            # whole device - which the driver refuses while the node's
+            # shared containers (every DaemonSet) need somewhere to run.
+            # So a CPU claim asks for an explicit share: the engine
+            # container's own cpu request, the number the driver's
+            # contract already requires there (the kubelet accounts CPUs
+            # only from requests until KEP-5517). One number, stated
+            # once, sizes the cgroup accounting and the cpuset alike;
+            # invalid_cpu_claim gates on it being present.
+            container = engine_container(member)
+            assert container.resources is not None and container.resources.requests is not None
+            exactly["capacity"] = {"requests": {_CPU_CAPACITY: str(container.resources.requests["cpu"])}}
         device_requests.append({"name": r.name, "exactly": exactly})
 
     return wrap_object(

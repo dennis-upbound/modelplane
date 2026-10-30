@@ -24,8 +24,11 @@ A device request's CEL selector is as compose-model-deployment stamps it.
 import copy
 import dataclasses
 import json
+from typing import Any
 
 import pytest
+from crossplane.function import resource
+from crossplane.function.proto.v1 import run_function_pb2 as fnv1
 from function import routing
 from function.backends import base, grove, llmd, native
 from models.ai.modelplane.modelreplica import v1alpha1
@@ -56,6 +59,16 @@ class SelectBackendCase:
     engine: v1alpha1.Engine
     stack: str
     want: str
+
+
+@dataclasses.dataclass
+class InvalidCpuClaimCase:
+    """A test case for base.invalid_cpu_claim."""
+
+    name: str
+    reason: str
+    replica: v1alpha1.ModelReplica
+    want: str | None
 
 
 @dataclasses.dataclass
@@ -128,6 +141,17 @@ class GrovePcsNameCase:
     reason: str
     replica: v1alpha1.ModelReplica
     want: str
+
+
+@dataclasses.dataclass
+class ReadyCopiesCase:
+    """A test case for a backend's ready_copies."""
+
+    name: str
+    reason: str
+    backend: base.Backend
+    observed: dict[str, fnv1.Resource]
+    want: int
 
 
 @dataclasses.dataclass
@@ -432,8 +456,12 @@ def _deployment(
             "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
             "readiness": {
                 "policy": "DeriveFromCelQuery",
-                "celQuery": 'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")',
+                "celQuery": (
+                    'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")'
+                    " && has(object.status.readyReplicas) && object.status.readyReplicas >= object.spec.replicas"
+                ),
             },
+            "watch": True,
             "forProvider": {
                 "manifest": {
                     "apiVersion": "apps/v1",
@@ -455,7 +483,9 @@ def _deployment(
                                     }
                                 ],
                                 "tolerations": [
-                                    {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+                                    {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                                    {"key": "amd.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                                    {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
                                 ],
                             },
                         },
@@ -485,8 +515,12 @@ def _leader_worker_set(
             "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
             "readiness": {
                 "policy": "DeriveFromCelQuery",
-                "celQuery": 'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")',
+                "celQuery": (
+                    'has(object.status.conditions) && object.status.conditions.exists(c, c.type == "Available" && c.status == "True")'
+                    " && has(object.status.readyReplicas) && object.status.readyReplicas >= object.spec.replicas"
+                ),
             },
+            "watch": True,
             "forProvider": {
                 "manifest": {
                     "apiVersion": "leaderworkerset.x-k8s.io/v1",
@@ -516,7 +550,9 @@ def _leader_worker_set(
                                         }
                                     ],
                                     "tolerations": [
-                                        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+                                        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                                        {"key": "amd.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                                        {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
                                     ],
                                 },
                             },
@@ -535,7 +571,9 @@ def _leader_worker_set(
                                         }
                                     ],
                                     "tolerations": [
-                                        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+                                        {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                                        {"key": "amd.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+                                        {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
                                     ],
                                 },
                             },
@@ -543,6 +581,31 @@ def _leader_worker_set(
                     },
                 }
             },
+        }
+    }
+
+
+def _scaling_group(*, pcs_name: str) -> dict:
+    """The observe-only Object reading the scaling group Grove creates under a PodCliqueSet."""
+    return {
+        "spec": {
+            "providerConfigRef": {"kind": "ClusterProviderConfig", "name": "cluster-a-pc"},
+            "readiness": {
+                "policy": "DeriveFromCelQuery",
+                "celQuery": (
+                    "has(object.status) && has(object.status.availableReplicas) && "
+                    "object.status.availableReplicas >= object.spec.replicas"
+                ),
+            },
+            "forProvider": {
+                "manifest": {
+                    "apiVersion": "grove.io/v1alpha1",
+                    "kind": "PodCliqueScalingGroup",
+                    "metadata": {"name": f"{pcs_name}-0-gang", "namespace": "mp-ml-team-51733"},
+                }
+            },
+            "watch": True,
+            "managementPolicies": ["Observe"],
         }
     }
 
@@ -556,6 +619,7 @@ def _pod_clique_set(*, name: str, cliques: list[dict]) -> dict:
                 "policy": "DeriveFromCelQuery",
                 "celQuery": "has(object.status) && has(object.status.observedGeneration) && object.status.observedGeneration == object.metadata.generation && object.spec.replicas > 0 && has(object.status.availableReplicas) && object.status.availableReplicas >= object.spec.replicas",
             },
+            "watch": True,
             "forProvider": {
                 "manifest": {
                     "apiVersion": "grove.io/v1alpha1",
@@ -658,8 +722,8 @@ def _sorted(*, objects: dict[str, dict]) -> dict[str, dict]:
 
 
 BUILD_CASES = [
-    # A Deployment reports readiness from its Available condition, and a claim
-    # template is ready once it's created. The engine and role labels are what
+    # A Deployment is ready once it's Available with every copy ready, and a
+    # claim template once it's created. The engine and role labels are what
     # the collector attributes the pod's metrics to.
     BuildCase(
         name="StandaloneEngine",
@@ -1929,14 +1993,15 @@ BUILD_CASES = [
     # a gang engine's command computes its own rank from GROVE_PCLQ_POD_INDEX.
     #
     # A PodCliqueSet publishes no Available condition, so its readiness derives
-    # from its replica counters. A worker with no template metadata carries only
+    # from its replica counters, and an observed scaling group counts every
+    # copy. A worker with no template metadata carries only
     # the managed labels, and with no cache there's no ModelExpress env or
     # security context.
     BuildCase(
         name="GroveGang",
         reason=(
-            "A Leader/Worker engine on Grove composes a PodCliqueSet with its members' commands verbatim, and a claim "
-            "template for each member."
+            "A Leader/Worker engine on Grove composes a PodCliqueSet with its members' commands verbatim, an observed "
+            "scaling group, and a claim template for each member."
         ),
         backend=grove.GroveBackend(),
         replica=_replica(
@@ -2022,6 +2087,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -2079,7 +2145,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2129,7 +2205,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2240,6 +2326,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -2302,7 +2389,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2354,7 +2451,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2453,6 +2560,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -2511,7 +2619,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2561,7 +2679,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2669,6 +2797,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -2730,7 +2859,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2780,7 +2919,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -2890,6 +3039,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -2949,7 +3099,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3001,7 +3161,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3092,6 +3262,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -3142,7 +3313,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3192,7 +3373,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3292,6 +3483,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -3349,7 +3541,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3399,7 +3601,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3490,6 +3702,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -3578,7 +3791,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3660,7 +3883,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3757,6 +3990,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -3850,7 +4084,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -3932,7 +4176,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -4035,6 +4289,7 @@ BUILD_CASES = [
         serving_label="r",
         stack="Dynamo",
         want={
+            "scaling-group-main": _scaling_group(pcs_name="r-main-bb4e3"),
             "model-serving-main": _pod_clique_set(
                 name="r-main-bb4e3",
                 cliques=[
@@ -4128,7 +4383,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -4214,7 +4479,17 @@ BUILD_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -4229,8 +4504,8 @@ BUILD_CASES = [
     # replica's Service can't route to them. They do carry the telemetry
     # identity: a worker holds GPUs, and its metrics are the deployment's. Every
     # gang container leads with the backend-neutral coordination vars aliasing
-    # LWS_LEADER_ADDRESS and LWS_WORKER_INDEX. A LeaderWorkerSet reports
-    # readiness from its Available condition.
+    # LWS_LEADER_ADDRESS and LWS_WORKER_INDEX. A LeaderWorkerSet is ready once
+    # it's Available with every group ready.
     BuildCase(
         name="LLMDGang",
         reason=(
@@ -5158,6 +5433,161 @@ def test_build(case: BuildCase) -> None:
     for engine in case.replica.spec.engines:
         got.update(case.backend.build(case.replica, engine, case.provider_config, case.serving_label, case.stack))
     assert _sorted(objects=_to_dicts(objects=got)) == _sorted(objects=case.want), case.reason
+
+
+def _cpu_member(*, cpu_request: str | None, count: int) -> v1alpha1.Member:
+    """A Standalone member claiming count dra.cpu devices, its engine requesting cpu_request CPUs (None for none)."""
+    resources = None
+    if cpu_request is not None:
+        resources = v1alpha1.Resources(requests={"cpu": cpu_request}, limits={"cpu": cpu_request})
+    return v1alpha1.Member(
+        role="Standalone",
+        nodePoolName="cpu-pool",
+        deviceRequests=[
+            v1alpha1.DeviceRequest(
+                name="cpu",
+                deviceClassName="dra.cpu",
+                count=count,
+                selectors=[v1alpha1.Selector(cel='device.capacity["dra.cpu"].cpu.compareTo(quantity("4")) >= 0')],
+            )
+        ],
+        template=v1alpha1.Template(
+            spec=v1alpha1.Spec(
+                containers=[
+                    v1alpha1.Container(
+                        name="engine",
+                        image="vllm/vllm-openai-cpu:v0.32.0-x86_64",
+                        resources=resources,
+                    )
+                ]
+            )
+        ),
+    )
+
+
+def _cpu_replica(*, cpu_request: str | None, count: int) -> v1alpha1.ModelReplica:
+    """A one-engine replica of one _cpu_member."""
+    return _replica(
+        name="r",
+        namespace="ml-team",
+        cluster_name="cluster-a",
+        labels=None,
+        model_cache_ref=None,
+        serving=None,
+        engines=[v1alpha1.Engine(name="main", copies=1, members=[_cpu_member(cpu_request=cpu_request, count=count)])],
+    )
+
+
+def _gpu_replica() -> v1alpha1.ModelReplica:
+    """A one-engine replica claiming one 80Gi GPU, as BUILD_CASES' StandaloneEngine does."""
+    return _replica(
+        name="r",
+        namespace="ml-team",
+        cluster_name="cluster-a",
+        labels=None,
+        model_cache_ref=None,
+        serving=None,
+        engines=[
+            v1alpha1.Engine(
+                name="main",
+                copies=1,
+                members=[
+                    v1alpha1.Member(
+                        role="Standalone",
+                        nodePoolName="frontier",
+                        deviceRequests=[
+                            v1alpha1.DeviceRequest(
+                                name="gpu",
+                                deviceClassName="gpu.nvidia.com",
+                                count=1,
+                                selectors=[
+                                    v1alpha1.Selector(
+                                        cel='device.capacity["gpu.nvidia.com"].memory.compareTo(quantity("80Gi")) >= 0'
+                                    )
+                                ],
+                            )
+                        ],
+                        template=v1alpha1.Template(
+                            spec=v1alpha1.Spec(
+                                containers=[
+                                    v1alpha1.Container(
+                                        name="engine",
+                                        image="vllm/vllm-openai:latest",
+                                        args=["--model=Qwen/Qwen3-0.6B"],
+                                    )
+                                ]
+                            )
+                        ),
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def test_cpu_claim_capacity() -> None:
+    """A dra.cpu claim asks for the engine's cpu request as device capacity,
+    not the whole device: dra-driver-cpu refuses a claim that would exhaust
+    the shared CPU pool, so the number the driver's contract already puts
+    on the container sizes the claim too."""
+    replica = _cpu_replica(cpu_request="5", count=1)
+    engine = replica.spec.engines[0]
+    obj = base.resource_claim_template(replica, engine, engine.members[0], "cluster-a-pc")
+    got = obj.model_dump(exclude_unset=True, by_alias=True)
+    requests = got["spec"]["forProvider"]["manifest"]["spec"]["spec"]["devices"]["requests"]
+    assert requests[0]["exactly"]["capacity"] == {"requests": {"dra.cpu/cpu": "5"}}
+
+
+def test_gpu_claim_uncapped() -> None:
+    """A GPU claim carries no capacity request: GPUs bind whole devices, and
+    a capacity request is the CPU driver's contract, not DRA's generally."""
+    replica = _gpu_replica()
+    engine = replica.spec.engines[0]
+    obj = base.resource_claim_template(replica, engine, engine.members[0], "cluster-a-pc")
+    got = obj.model_dump(exclude_unset=True, by_alias=True)
+    requests = got["spec"]["forProvider"]["manifest"]["spec"]["spec"]["devices"]["requests"]
+    assert "capacity" not in requests[0]["exactly"]
+
+
+INVALID_CPU_CLAIM_CASES = [
+    InvalidCpuClaimCase(
+        name="CpuRequestSet",
+        reason="A dra.cpu claim on one device whose engine requests cpu can be sized.",
+        replica=_cpu_replica(cpu_request="5", count=1),
+        want=None,
+    ),
+    InvalidCpuClaimCase(
+        name="CpuRequestMissing",
+        reason="A dra.cpu claim whose engine requests no cpu has nothing to size itself from.",
+        replica=_cpu_replica(cpu_request=None, count=1),
+        want=(
+            "a dra.cpu claim is sized from the engine container's cpu request, and main/standalone sets none: "
+            "set resources requests and limits cpu to the cores the claim should take, below the device's "
+            "total so the node's shared containers keep a core"
+        ),
+    ),
+    InvalidCpuClaimCase(
+        name="MoreThanOneDevice",
+        reason="A dra.cpu claim on two devices would take the engine's whole cpu request from each.",
+        replica=_cpu_replica(cpu_request="5", count=2),
+        want=(
+            "main/standalone claims more than one dra.cpu device, but a dra.cpu claim takes the engine "
+            "container's cpu request from a single device: claim one"
+        ),
+    ),
+    InvalidCpuClaimCase(
+        name="NoCpuClaim",
+        reason="A replica that claims no CPUs has no CPU claim to size.",
+        replica=_gpu_replica(),
+        want=None,
+    ),
+]
+
+
+@pytest.mark.parametrize("case", INVALID_CPU_CLAIM_CASES, ids=lambda case: case.name)
+def test_invalid_cpu_claim(case: InvalidCpuClaimCase) -> None:
+    """invalid_cpu_claim explains why a member's dra.cpu claim can't be sized."""
+    assert base.invalid_cpu_claim(case.replica) == case.want, case.reason
 
 
 SELECT_BACKEND_CASES = [
@@ -6485,6 +6915,7 @@ APPLY_CASES = [
                 volumes=[{"name": "dshm", "emptyDir": {"medium": "Memory"}}],
             ),
             "resource-claim-prefill-standalone": _claim_template(name="r-prefill-standalone-devices-f62af", count=1),
+            "scaling-group-decode": _scaling_group(pcs_name="r-decode-4b27b"),
             "model-serving-decode": _pod_clique_set(
                 name="r-decode-4b27b",
                 cliques=[
@@ -6542,7 +6973,17 @@ APPLY_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -6592,7 +7033,17 @@ APPLY_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -6778,6 +7229,7 @@ APPLY_CASES = [
                 ],
             ),
             "resource-claim-prefill-standalone": _claim_template(name="r-prefill-standalone-devices-f62af", count=1),
+            "scaling-group-decode": _scaling_group(pcs_name="r-decode-4b27b"),
             "model-serving-decode": _pod_clique_set(
                 name="r-decode-4b27b",
                 cliques=[
@@ -6838,7 +7290,17 @@ APPLY_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -6888,7 +7350,17 @@ APPLY_CASES = [
                                         "key": "nvidia.com/gpu",
                                         "operator": "Exists",
                                         "effect": "NoSchedule",
-                                    }
+                                    },
+                                    {
+                                        "key": "amd.com/gpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
+                                    {
+                                        "key": "modelplane.ai/cpu",
+                                        "operator": "Exists",
+                                        "effect": "NoSchedule",
+                                    },
                                 ],
                             },
                         },
@@ -7058,7 +7530,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 64\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -7077,7 +7549,7 @@ APPLY_CASES = [
                 app="r-epp",
                 labels={"app": "r-epp", "modelplane.ai/role": "picker"},
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007"
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="r-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "r-epp"}}],
@@ -7212,7 +7684,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 128\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -7231,7 +7703,161 @@ APPLY_CASES = [
                 app="r-epp",
                 labels={"app": "r-epp", "modelplane.ai/role": "picker"},
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "6d541823f691c0fad7e169bf03c3b7b14b766dc3e795deaae7050c11eeea6eab"
+                    "modelplane.ai/epp-config-checksum": "b27a3ca7704900471ee618c2a3a004560b66ab0db1215461ef81345ca34371f7"
+                },
+                containers=[_llm_d_epp_container(pool="r-pool")],
+                volumes=[{"name": "config", "configMap": {"name": "r-epp"}}],
+                image_pull_secrets=None,
+            ),
+            "epp-service": _epp_service(name="r-epp", app="r-epp"),
+        },
+    ),
+    ApplyCase(
+        name="UnifiedLongContext",
+        reason="An engine context length above 131072 leaves the default picker configuration's maxPrefixTokensToMatch at 131072.",
+        composed={
+            "model-serving-main": _deployment(
+                name="r-main-bb4e3",
+                claim_template_name="r-main-standalone-devices-f456f",
+                replicas=1,
+                pod_metadata={
+                    "labels": {
+                        "modelplane.ai/engine": "main",
+                        "modelplane.ai/role": "Standalone",
+                        "modelplane.ai/serving": "r",
+                        "modelplane.ai/workload": "r-main-bb4e3",
+                    }
+                },
+                containers=[
+                    {
+                        "name": "engine",
+                        "image": "vllm/vllm-openai:latest",
+                        "args": ["--model=Qwen/Qwen3-0.6B", "--max-model-len=262144"],
+                        "ports": [{"name": "http", "containerPort": 8000}],
+                        "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
+                        "readinessProbe": {
+                            "httpGet": {"path": "/health", "port": 8000},
+                            "initialDelaySeconds": 30,
+                            "periodSeconds": 10,
+                            "timeoutSeconds": 5,
+                        },
+                        "resources": {"claims": [{"name": "devices"}]},
+                    }
+                ],
+                volumes=[{"name": "dshm", "emptyDir": {"medium": "Memory"}}],
+            ),
+            "resource-claim-main-standalone": _claim_template(name="r-main-standalone-devices-f456f", count=1),
+        },
+        replica=_replica(
+            name="r",
+            namespace="ml-team",
+            cluster_name="cluster-a",
+            labels=None,
+            model_cache_ref=None,
+            serving=None,
+            engines=[
+                v1alpha1.Engine(
+                    name="main",
+                    copies=1,
+                    members=[
+                        v1alpha1.Member(
+                            role="Standalone",
+                            nodePoolName="frontier",
+                            deviceRequests=[
+                                v1alpha1.DeviceRequest(
+                                    name="gpu",
+                                    deviceClassName="gpu.nvidia.com",
+                                    count=1,
+                                    selectors=[
+                                        v1alpha1.Selector(
+                                            cel='device.capacity["gpu.nvidia.com"].memory.compareTo(quantity("80Gi")) >= 0'
+                                        )
+                                    ],
+                                )
+                            ],
+                            template=v1alpha1.Template(
+                                spec=v1alpha1.Spec(
+                                    containers=[
+                                        v1alpha1.Container(
+                                            name="engine",
+                                            image="vllm/vllm-openai:latest",
+                                            args=["--model=Qwen/Qwen3-0.6B", "--max-model-len=262144"],
+                                        )
+                                    ]
+                                )
+                            ),
+                        )
+                    ],
+                )
+            ],
+        ),
+        provider_config="cluster-a-pc",
+        want={
+            "model-serving-main": _deployment(
+                name="r-main-bb4e3",
+                claim_template_name="r-main-standalone-devices-f456f",
+                replicas=1,
+                pod_metadata={
+                    "labels": {
+                        "modelplane.ai/engine": "main",
+                        "modelplane.ai/role": "Standalone",
+                        "modelplane.ai/serving": "r",
+                        "modelplane.ai/workload": "r-main-bb4e3",
+                    }
+                },
+                containers=[
+                    {
+                        "name": "engine",
+                        "image": "vllm/vllm-openai:latest",
+                        "args": ["--model=Qwen/Qwen3-0.6B", "--max-model-len=262144"],
+                        "ports": [{"name": "http", "containerPort": 8000}],
+                        "volumeMounts": [{"name": "dshm", "mountPath": "/dev/shm"}],
+                        "readinessProbe": {
+                            "httpGet": {"path": "/health", "port": 8000},
+                            "initialDelaySeconds": 30,
+                            "periodSeconds": 10,
+                            "timeoutSeconds": 5,
+                        },
+                        "resources": {"claims": [{"name": "devices"}]},
+                    }
+                ],
+                volumes=[{"name": "dshm", "emptyDir": {"medium": "Memory"}}],
+            ),
+            "resource-claim-main-standalone": _claim_template(name="r-main-standalone-devices-f456f", count=1),
+            "inference-pool": _inference_pool(name="r-pool", serving="r", picker="r-epp"),
+            "model-route": _route(name="r", path="/ml-team/r/", pool="r-pool"),
+            "epp-serviceaccount": _epp_service_account(name="r-epp"),
+            "epp-role": _epp_role(name="r-epp"),
+            "epp-rolebinding": _epp_role_binding(name="r-epp"),
+            "epp-config": _epp_config(
+                name="r-epp",
+                config="apiVersion: llm-d.ai/v1alpha1\n"
+                "kind: EndpointPickerConfig\n"
+                "plugins:\n"
+                "- type: approx-prefix-cache-producer\n"
+                "  parameters:\n"
+                "    autoTune: false\n"
+                "    blockSizeTokens: 64\n"
+                "    maxPrefixTokensToMatch: 131072\n"
+                "    lruCapacityPerServer: 31250\n"
+                "- type: prefix-cache-scorer\n"
+                "- type: queue-scorer\n"
+                "- type: max-score-picker\n"
+                "schedulingProfiles:\n"
+                "- name: default\n"
+                "  plugins:\n"
+                "  - pluginRef: max-score-picker\n"
+                "  - pluginRef: prefix-cache-scorer\n"
+                "    weight: 2\n"
+                "  - pluginRef: queue-scorer\n"
+                "    weight: 1\n",
+            ),
+            "epp": _epp(
+                name="r-epp",
+                app="r-epp",
+                labels={"app": "r-epp", "modelplane.ai/role": "picker"},
+                annotations={
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="r-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "r-epp"}}],
@@ -7754,7 +8380,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 64\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -7778,7 +8404,7 @@ APPLY_CASES = [
                     "modelplane.ai/replica": "2",
                 },
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007"
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="r-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "r-epp"}}],
@@ -7915,7 +8541,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 64\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -7934,7 +8560,7 @@ APPLY_CASES = [
                 app="r-epp",
                 labels={"app": "r-epp", "modelplane.ai/role": "picker"},
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007"
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="r-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "r-epp"}}],
@@ -8167,7 +8793,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 64\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -8186,7 +8812,7 @@ APPLY_CASES = [
                 app="r-epp",
                 labels={"app": "r-epp", "modelplane.ai/role": "picker"},
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007"
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="r-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "r-epp"}}],
@@ -8336,7 +8962,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 64\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -8355,7 +8981,7 @@ APPLY_CASES = [
                 app="qwen2.5-7b-abcde-epp",
                 labels={"app": "qwen2.5-7b-abcde-epp", "modelplane.ai/role": "picker"},
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007"
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="qwen2.5-7b-abcde-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "qwen2.5-7b-abcde-epp"}}],
@@ -8501,7 +9127,7 @@ APPLY_CASES = [
                 "  parameters:\n"
                 "    autoTune: false\n"
                 "    blockSizeTokens: 64\n"
-                "    maxPrefixBlocksToMatch: 256\n"
+                "    maxPrefixTokensToMatch: 131072\n"
                 "    lruCapacityPerServer: 31250\n"
                 "- type: prefix-cache-scorer\n"
                 "- type: queue-scorer\n"
@@ -8520,7 +9146,7 @@ APPLY_CASES = [
                 app="epp-" + "a" * 53 + "-2dd65",
                 labels={"app": "epp-" + "a" * 53 + "-2dd65", "modelplane.ai/role": "picker"},
                 annotations={
-                    "modelplane.ai/epp-config-checksum": "bf2146be008c2e12bb555e5406e1d419b2b8159aa3b2984623e385d3cf934007"
+                    "modelplane.ai/epp-config-checksum": "c4f1cefa4a1fe67069eaa6e9dde3e5b9bc7e79d3f807ecd076dd021259b2ab39"
                 },
                 containers=[_llm_d_epp_container(pool="a" * 57 + "-abcde-pool")],
                 volumes=[{"name": "config", "configMap": {"name": "a" * 57 + "-abcde-epp"}}],
@@ -9135,3 +9761,90 @@ TELEMETRY_LABELS_CASES = [
 def test_telemetry_labels(case: TelemetryLabelsCase) -> None:
     """A serving pod carries the identity its metrics are attributed to."""
     assert base.telemetry_labels(case.replica, case.engine, case.member) == case.want, case.reason
+
+
+def _observed(*, status: dict | None, ready: bool) -> fnv1.Resource:
+    """A composed Object as observed back, reading a remote resource with status, or none observed yet."""
+    observed: dict[str, Any] = {
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": "True" if ready else "False",
+                "reason": "Available" if ready else "Unavailable",
+                "lastTransitionTime": "2025-01-01T00:00:00Z",
+            }
+        ]
+    }
+    if status is not None:
+        observed["atProvider"] = {"manifest": {"status": status}}
+    obj = {
+        "apiVersion": "kubernetes.m.crossplane.io/v1alpha1",
+        "kind": "Object",
+        "spec": {"forProvider": {"manifest": {}}},
+        "status": observed,
+    }
+    return fnv1.Resource(resource=resource.dict_to_struct(obj))
+
+
+def _main_engine() -> v1alpha1.Engine:
+    """An engine named main, whose workload and scaling group keys the observed resources use."""
+    return v1alpha1.Engine(
+        name="main",
+        copies=2,
+        members=[v1alpha1.Member(role="Standalone", nodePoolName="frontier", template=v1alpha1.Template())],
+    )
+
+
+READY_COPIES_CASES = [
+    ReadyCopiesCase(
+        name="DeploymentReadyPods",
+        reason="A Deployment counts each ready pod as a copy.",
+        backend=native.NativeBackend(),
+        observed={"model-serving-main": _observed(status={"readyReplicas": 1}, ready=False)},
+        want=1,
+    ),
+    ReadyCopiesCase(
+        name="DeploymentNoneReady",
+        reason="A Deployment leaves readyReplicas out at 0, so it counts no copies.",
+        backend=native.NativeBackend(),
+        observed={"model-serving-main": _observed(status={}, ready=False)},
+        want=0,
+    ),
+    ReadyCopiesCase(
+        name="LeaderWorkerSetGroups",
+        reason="A LeaderWorkerSet counts each ready group as a copy.",
+        backend=llmd.LLMDBackend(),
+        observed={"model-serving-main": _observed(status={"readyReplicas": 2}, ready=True)},
+        want=2,
+    ),
+    ReadyCopiesCase(
+        name="GroveScalingGroup",
+        reason="A Grove engine counts its scaling group's available copies, not its PodCliqueSet's.",
+        backend=grove.GroveBackend(),
+        observed={
+            "model-serving-main": _observed(status={"availableReplicas": 1}, ready=True),
+            "scaling-group-main": _observed(status={"availableReplicas": 1}, ready=False),
+        },
+        want=1,
+    ),
+    ReadyCopiesCase(
+        name="GroveScalingGroupUnobserved",
+        reason="Until its scaling group is observed, a ready PodCliqueSet means one copy is ready.",
+        backend=grove.GroveBackend(),
+        observed={"model-serving-main": _observed(status={"availableReplicas": 1}, ready=True)},
+        want=1,
+    ),
+    ReadyCopiesCase(
+        name="GroveNotObserved",
+        reason="A Grove engine with nothing observed has no copies ready.",
+        backend=grove.GroveBackend(),
+        observed={},
+        want=0,
+    ),
+]
+
+
+@pytest.mark.parametrize("case", READY_COPIES_CASES, ids=lambda case: case.name)
+def test_ready_copies(case: ReadyCopiesCase) -> None:
+    """A backend counts an engine's ready copies from its observed workload."""
+    assert case.backend.ready_copies(_main_engine(), case.observed) == case.want, case.reason

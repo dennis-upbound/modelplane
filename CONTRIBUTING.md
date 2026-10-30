@@ -125,7 +125,7 @@ and it runs the pytest suite in `e2e/tests/`, exiting non-zero if a test fails. 
 verify command is what the label-gated `E2E` workflow runs on CI (add the
 `test-e2e` label to a PR), so a green local `--verify` and a green CI run mean
 the same thing. `-- --cloud <cloud>` instead installs one cloud's serving
-stack onto KWOK-faked GPU pools and audits placement, still with no
+stack onto KWOK-faked device pools and audits placement, still with no
 credentials; its per-cloud CI matrix (the `E2E Clouds` workflow) runs on pull
 requests touching the serving stack or `e2e/`. See `e2e/README.md`.
 
@@ -276,6 +276,19 @@ nix run .#build
 The build deletes and recreates the whole `schemas/python/` tree, so models for
 XRDs or dependencies you've removed don't linger.
 
+A composed resource that references another composed resource inside a list
+item - a node group's network interfaces, say - must carry the referenced
+resource's id, read from the observed resource's `status.atProvider`, not a
+`matchControllerRef` selector. The managed resource CRDs declare no
+`x-kubernetes-list-type` on their lists, which makes the lists atomic under
+server-side apply, so a selector in a list item has the composition and
+crossplane-runtime's reference resolver replace each other's items on every
+apply and the object never settles
+([#517](https://github.com/modelplaneai/modelplane/issues/517)). Selectors
+outside lists are fine. The `list-selectors` flake check enforces this;
+`hack/check_list_selectors.py` describes the escape for a list that merges per
+item.
+
 ### Tests
 
 Every function has tests under `functions/<name>/tests/`, run with
@@ -421,22 +434,33 @@ checks to trip. In order:
    two must move in lockstep; the generator refuses a mismatched aicr.
 2. Re-sync the embedded gke-cos fork (`GKE_COS_OVERLAY` in generate.py):
    diff it against the new tag's `recipes/overlays/gke-cos.yaml` and
-   re-apply the one change (the `dra` profile value, the 1.35 floor, and
-   the DRA selector paths on the stock values for union totality). The
-   file is high-churn upstream. The fork is deleted the day
-   NVIDIA/aicr#2515 or #2517 lands.
+   re-apply the changes marked "Modelplane fork" (the `dra` profile
+   value, the 1.35 floor, and the DRA selector paths on the stock values
+   for union totality). The file is high-churn upstream. The profile-only
+   `--data` patch aicr 1.0.0 added (NVIDIA/aicr#2985) cannot replace the
+   fork: a patched-in value must own exactly the embedded path set, and
+   `dra` owns the DRA selector paths the upstream values don't. The fork
+   is deleted the day NVIDIA/aicr#2517 lands.
 3. Expect `ALLOW`/`DROP` to fail closed on any component the new catalog
-   adds; classify it with a reason.
-4. Expect the managed-path assertions to fail closed if a values path
+   adds; classify it with a reason. An `ALLOW` entry also names the DRA
+   drivers whose device stacks the component belongs to (empty for a
+   component every cluster needs) - deciding that is part of classifying
+   it; see design/multi-accelerator.md.
+4. Expect `check_namespace_holds` to fail closed if the catalog moved a
+   component's chart namespace: Helm can't move a release across
+   namespaces, so existing clusters would wedge on a fresh-install
+   ownership error. Pin the old namespace in `NAMESPACE_PINS`, or land
+   the move as a documented migration.
+5. Expect the managed-path assertions to fail closed if a values path
    moved or a `--set` stopped landing; re-derive the path from the new
    chart before loosening anything. `MODELPLANE_VALUES` fails closed too
    if a new recipe starts carrying one of its paths - decide whose value
    wins and move the path to the right table.
-5. Both embedded catalog documents carry an apiVersion that can move in
+6. Both embedded catalog documents carry an apiVersion that can move in
    any release.
-6. The Kubernetes floor union re-checks against `k8s_default` in
+7. The Kubernetes floor union re-checks against `k8s_default` in
    `CLOUDS`, which must track the cloud cluster XRD defaults.
-7. `nix run .#stacks`, run twice to confirm no diff, and review the
+8. `nix run .#stacks`, run twice to confirm no diff, and review the
    generated diff as the release's stack change. The `stacks-current`
    flake check regenerates in the sandbox and fails CI on a stale or
    hand-edited generated file.

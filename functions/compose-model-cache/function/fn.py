@@ -80,10 +80,13 @@ PHASE_FAILED: _Phase = "Failed"
 # name is a cross-function contract with it.
 _NS_PREFIX = "mp"
 
-# Hydration container. python:3.11-slim has pip; we install huggingface_hub
-# at runtime. A Modelplane-owned image with the tool preinstalled is a
-# follow-up (#115).
-HYDRATION_IMAGE = "python:3.11-slim"
+# Hydration container. It has pip; we install huggingface_hub at runtime. A
+# Modelplane-owned image with the tool preinstalled is a follow-up (#115).
+#
+# Pinned by digest to an image whose pip (26.2.2) distrusts the compromised
+# eMudhra intermediate CAs. Under a bare tag, a node that had already pulled an
+# older image would keep running it.
+HYDRATION_IMAGE = "python:3.13-slim@sha256:57b29a7c050c4e679e4bea572e14b3965cf4b5839de2da49d55e49ffc4024f39"
 HYDRATION_MOUNT = "/mnt/artifact"
 
 # ttlSecondsAfterFinished governs how long the completed Job (and its

@@ -78,30 +78,58 @@ graph TD
 ```
 
 A member with no `nodeSelector` doesn't claim any devices. It matches the
-engine's pool at no node cost, and the cluster's own scheduler packs its pods
-onto the gang's nodes.
+engine's pool without taking any of its capacity, and the cluster's own
+scheduler places its pods on any of the pool's nodes.
 
-## Counting capacity in nodes
+## Counting free devices
 
-Capacity is counted in **nodes**, not individual GPUs. The only number the
-scheduler reads from a member is its node cost:
+The scheduler places a replica only where each of its pods fits on a node with
+enough of the devices it claims free. A member runs this many pods, each
+claiming the devices its `nodeSelector` resolves:
 
 ```text
-nodes = pods × copies
-pods  = 1 for a Standalone or Leader, or worker.nodes for a Worker
+pods = copies × (1 for a Standalone or Leader, or worker.nodes for a Worker)
 ```
 
-A member that resolves no `claim: DRA` device, because it has no `nodeSelector`
-or matches only synthetic devices, costs zero nodes. The scheduler sums the cost
-of a replica's members and places the replica only where every engine's pool has
-enough free nodes, tracking a running ledger so it never overcommits a cluster.
+The cluster's scheduler is free to bind a gang's pods to one node, so the
+scheduler lets them share a node like any other pods.
 
-This accounting is deliberately coarse. The control-plane scheduler answers
-"could this cluster plausibly host this replica," not "exactly which GPU does
-each pod get." Device-level contention between deployments is left to DRA
-admission on the workload cluster, which is authoritative: it rejects a pod whose
-`ResourceClaim` can't be satisfied, and the next reconcile sees the updated
-state.
+A cluster agent, which the serving stack installs on every `InferenceCluster`,
+reports how many of each NVIDIA GPU pool's nodes have each number of free
+devices. The `InferenceCluster` publishes that histogram in its status:
+
+```yaml
+status:
+  schedulablePools:
+  - name: gpu-l4x4-a
+    nodes: 3          # The most nodes the pool can have.
+    observedNodes: 1  # The nodes the pool has now, ready or not.
+    nodesByFreeDevices:
+    - freeDevices:
+        gpu.nvidia.com: 1
+      nodes: 1
+    devices:
+    - name: gpu
+      claim: DRA
+      driver: gpu.nvidia.com
+      deviceClassName: gpu.nvidia.com
+      count: 4
+```
+
+A replica claiming one GPU fits this pool's node, as do two replicas claiming
+four GPUs each, on the two nodes the pool can still grow by. Pods share a node
+whenever it has the devices for them, so four one-GPU replicas fit one four-GPU
+node. A pod that claims GPUs and network devices fits only a node with enough
+of both free. The histogram leaves out cordoned and unready nodes, and nodes
+with taints Modelplane's GPU pods don't tolerate. It counts the devices
+scheduled pods hold as taken, and the scheduler doesn't charge a pool for them
+twice.
+
+The scheduler counts a pool in whole nodes when the agent hasn't reported on it
+or can't observe it. The agent doesn't observe CPU or AMD GPU pools yet, so
+they're always counted in whole nodes. Such a pool publishes no
+`observedNodes`, and every node it can have starts empty. A pod that claims any
+device takes a whole one.
 
 ## Pinning placement to a pool
 
@@ -139,19 +167,29 @@ treats a pod whose node is gone.
 
 ## Known limitations
 
-The scheduler is built to be conservative and predictable rather than optimal.
-The limits below follow from that, and each is tracked for future work:
+The scheduler is built to be conservative and predictable rather than optimal,
+and has these limits:
 
-- **A whole node is charged per pod**
-  ([#172](https://github.com/modelplaneai/modelplane/issues/172)). A pod that
-  claims one GPU of an eight-GPU node still charges the whole node in the
-  scheduler's accounting. This is safe, it can only under-count a pool's
-  capacity, never overcommit it, but it can strand GPUs on deployments of
-  sub-node engines.
 - **An engine can't span pools, even on one fabric**
   ([#149](https://github.com/modelplaneai/modelplane/issues/149)). Because the
   scheduler has no concept of fabric, it refuses to split a gang across pools at
   all. That forecloses a legitimate case, GPU workers on one pool and a no-GPU
   coordinator on another within the same fabric, until fabric-aware placement
   lands.
+- **A wrong prediction can leave a replica Pending.** The scheduler assumes each
+  pod binds to the node with the most of its claimed devices free, and the
+  cluster's scheduler may bind pods of different sizes differently. A replica
+  left without room for its pods waits in Pending until devices free up, and its
+  `ModelPodsScheduled` condition says why. The scheduler doesn't move it to
+  another cluster.
+- **A pool looks fuller than it is while its agent is down.** If the cluster agent stops
+  reporting, the `InferenceCluster` keeps publishing what it last saw. The
+  scheduler goes on charging every replica it places on the pool, and GPUs that
+  replicas free still count as taken, until the agent reports again.
+- **Modelplane doesn't request CPU or memory for engines.** Unless a deployment
+  sets requests on its engine containers, replicas that share a node compete for
+  both, and Kubernetes evicts them first under memory pressure.
+- **A rollout can need room for a new pod.** An engine that runs as a Deployment
+  of fewer than four copies starts each new pod before it stops an old one. On a
+  full pool that can't grow, the rollout stalls with the old pods still serving.
 <!-- vale write-good.Passive = YES -->

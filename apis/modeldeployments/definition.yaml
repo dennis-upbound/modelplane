@@ -17,7 +17,12 @@ spec:
     additionalPrinterColumns:
     - name: REPLICAS
       type: string
+      description: The number of replicas at full capacity.
       jsonPath: .status.replicas.ready
+    - name: SERVING
+      type: string
+      description: Whether at least one replica is serving and routed.
+      jsonPath: .status.conditions[?(@.type=='ReplicasServing')].status
     # Serve a scale subresource so `kubectl scale` and event-driven autoscalers
     # (e.g. KEDA) can drive spec.replicas, the deployment's single scaling axis.
     # statusReplicasPath points at the count of scheduled replicas, mirroring how
@@ -453,7 +458,7 @@ spec:
                                       pods: what devices each pod needs from its node.
                                       The scheduler matches it against a candidate
                                       pool's InferenceClass devices (surfaced on
-                                      InferenceCluster status.gpuPools) and places the
+                                      InferenceCluster status.schedulablePools) and places the
                                       member on a pool that satisfies it, preferring
                                       one pool for the whole engine and splitting
                                       members across pools only when no pool satisfies

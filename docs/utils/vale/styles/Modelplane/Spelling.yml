@@ -12,3 +12,4 @@ filters:
   - '#\w+'
   - \d+\.\d+[BbMmKkTt]
   - \w+'s
+  - '\w+(-\w+)+'
