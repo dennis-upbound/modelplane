@@ -335,7 +335,8 @@ def _scrape_configs() -> list[dict[str, Any]]:
                 # A job of its own because nobody annotates a GPU exporter
                 # for scraping: GKE runs a managed DCGM in
                 # gke-managed-system, the NVIDIA GPU operator installs its
-                # own elsewhere, the AMD GPU operator Modelplane installs on
+                # own elsewhere, Nebius gets the standalone dcgm-exporter
+                # chart, the AMD GPU operator Modelplane installs on
                 # Existing runs AMD's device-metrics-exporter, and the
                 # substrate job sees none of them. Without this every
                 # modelplane_gpu_* series is empty.

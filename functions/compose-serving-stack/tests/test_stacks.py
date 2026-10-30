@@ -462,6 +462,53 @@ DCGM_FI_PROF_PIPE_FP16_ACTIVE, gauge, Ratio of cycles the fp16 pipes are active 
 """
 
 
+def test_nebius_dcgm_exporter() -> None:
+    """Nebius's dcgm-exporter exports the generated clouds' DCGM fields.
+
+    Nebius installs NVIDIA's standalone dcgm-exporter chart rather than the
+    GPU Operator, so the CSV goes in the chart's customMetrics rather than
+    dcgmExporter.config.data. Left unset, the chart falls back to its own
+    shorter default list and Nebius silently exports fewer fields than every
+    other cloud. Compared against the same literal as Civo's cases, so a
+    generator-moved CSV fails here until a human confirms the change.
+    """
+    joined = stacks.join("Nebius", "Standard")
+    exporter = next(c for c in joined if isinstance(c, stacks.Chart) and c.key == "dcgm-exporter")
+    assert exporter.values is not None
+    assert exporter.values["customMetrics"] == _DCGM_METRICS_CSV
+
+
+def test_nebius_exporter_affinity() -> None:
+    """Nebius's dcgm-exporter schedules by the DRA kubelet plugin's PCI terms.
+
+    Nebius GPU nodes carry pci-0302_10de but not pci-10de, so dropping the
+    0302 term would leave the exporter on no node with every unit test still
+    passing. Spelled out as a literal so a changed term fails here rather
+    than only on a real cluster.
+    """
+    joined = stacks.join("Nebius", "Standard")
+    exporter = next(c for c in joined if isinstance(c, stacks.Chart) and c.key == "dcgm-exporter")
+    assert exporter.values is not None
+    required = exporter.values["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+    assert [term["matchExpressions"] for term in required["nodeSelectorTerms"]] == [
+        [{"key": f"feature.node.kubernetes.io/{label}.present", "operator": "In", "values": ["true"]}]
+        for label in ("pci-10de", "pci-0302_10de", "pci-0300_10de")
+    ]
+
+
+def test_nebius_exporter_dra() -> None:
+    """Nebius's dcgm-exporter attributes GPU series to DRA-allocated pods.
+
+    Nebius allocates GPUs through DRA ResourceClaims, not the device plugin.
+    Without kubernetesDRA the exporter still exports every GPU's fields, but
+    can't say which pod holds the GPU, and nothing else fails.
+    """
+    joined = stacks.join("Nebius", "Standard")
+    exporter = next(c for c in joined if isinstance(c, stacks.Chart) and c.key == "dcgm-exporter")
+    assert exporter.values is not None
+    assert exporter.values["kubernetesDRA"] == {"enabled": True}
+
+
 # Each case's input is the real joined Civo stack rather than a literal one.
 # The transform finds the gpu-operator and DRA driver charts by key, and where
 # a key matches nothing it rewrites nothing, without complaint. Only the real

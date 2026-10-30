@@ -63,10 +63,11 @@ class Cloud:
 
     What the cluster composition (or the cloud's platform) puts on a real GPU
     node, plus the NFD labels NFD's worker would set - the GPU presence labels
-    (gpu.present, pci-10de.present) and the OS release labels
-    (system-os_release.ID, system-os_release.VERSION_ID) the GPU operator's
-    ClusterPolicy controller reads from GPU nodes since v26.7 - pre-set because
-    the worker's pod on a KWOK node is fake and never labels anything.
+    (gpu.present, and pci-10de.present or Nebius's pci-0302_10de.present) and
+    the OS release labels (system-os_release.ID, system-os_release.VERSION_ID)
+    the GPU operator's ClusterPolicy controller reads from GPU nodes since
+    v26.7 - pre-set because the worker's pod on a KWOK node is fake and never
+    labels anything.
     """
 
     taint_value: str
@@ -270,7 +271,8 @@ CLOUDS: dict[str, Cloud] = {
             "modelplane.ai/pool": "gpu-fake",
             "modelplane.ai/gpu": "h100",
             "nvidia.com/gpu.present": "true",
-            "feature.node.kubernetes.io/pci-10de.present": "true",
+            # NFD labels real Nebius GPU nodes pci-0302_10de, not pci-10de.
+            "feature.node.kubernetes.io/pci-0302_10de.present": "true",
             # Nebius GPU node groups run Ubuntu 22.04.
             "feature.node.kubernetes.io/system-os_release.ID": "ubuntu",
             "feature.node.kubernetes.io/system-os_release.VERSION_ID": "22.04",
@@ -287,6 +289,7 @@ CLOUDS: dict[str, Cloud] = {
             "dra-driver-cpu/mp-dra-driver-cpu": 2,
             "node-feature-discovery/mp-node-feature-discovery-worker": 3,
             "monitoring/mp-kube-prometheus-stack-prometheus-node-exporter": 5,
+            "dcgm-exporter/mp-dcgm-exporter": 2,
         },
     ),
     # The hand-written Vultr half (stacks/clouds/vultr.py) has no NFD: Vultr
