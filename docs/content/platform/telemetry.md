@@ -11,8 +11,8 @@ description: Collect normalized metrics across the fleet and send them to any ba
 Modelplane runs an OpenTelemetry collector on every inference cluster. It
 collects from every component Modelplane installs. This includes the inference
 server engine, inference gateway and Envoy proxy, router, and the cluster's
-GPU exporter - on a provisioned cluster Modelplane or the cloud installs one,
-and on an existing cluster you provide it, as
+GPU exporter. On a provisioned cluster Modelplane or the cloud installs one. On
+an existing cluster the AMD stack brings AMD's and you provide NVIDIA's, as
 [Requirements for an existing cluster]({{< ref "/platform/inference-cluster.md#requirements-for-an-existing-cluster" >}})
 describes. It renames each component's series to a common
 `modelplane_*` vocabulary and exports them to wherever you say - any backend the
@@ -93,7 +93,7 @@ Some examples of the available metrics:
 
 Latency appears twice on purpose. The `frontend_` series are what your caller experienced,
 measured at the gateway. The engine's own series are what the engine spent. For
-example, if the frontend metric is slow and the engine isn't, you can 
+example, if the frontend metric is slow and the engine isn't, you can
 troubleshoot routing, queueing, or networking issues instead of the model.
 
 Saturation gauges are per replica, so how you combine them decides what you see. Average
@@ -223,7 +223,7 @@ Anything else the exporter takes goes under `config`, passed through as you wrot
 Modelplane doesn't define a schema for an exporter's settings so anything under
 the `config` is passed to the collector exactly as written. TLS, retries,
 queueing, compression and headers all work and any new settings in the collector
-are respected and the sink keeps working. 
+are respected and the sink keeps working.
 
 To use an authentication scheme Modelplane doesn't compose, define the extension
 yourself under `spec.extensions`. Then reference it by its key from the sink's
@@ -407,6 +407,10 @@ claims, and Modelplane converts to the base one. Skipping this is the expensive 
 a series named `_seconds` that holds milliseconds reads a thousand times fast, and nothing
 downstream can tell.
 
+Say `fromType: Gauge` when the engine reports a running total, such as accumulated
+energy, as a gauge where the name claims a counter. Modelplane converts it to a counter,
+so `to` must end in `_total`.
+
 Rename only where the measurements agree. If two engines' histograms share a name and
 their buckets disagree, a quantile over them is wrong rather than approximate.
 
@@ -459,22 +463,28 @@ spec:
 
 ## GPUs
 
-The GPU series come from a [DCGM
-exporter](https://github.com/NVIDIA/dcgm-exporter), not from the engine: a GPU
+The GPU series come from a vendor's GPU exporter, not from the engine: a GPU
 belongs to a node, and its series have a `node` label rather than a
-deployment. The collector discovers the exporter by its pod - an `app` or
-`app.kubernetes.io/name` label containing `dcgm`, with a container port named
-`metrics` - and scrapes it directly, not through Prometheus.
+deployment. On NVIDIA pools that's a [DCGM
+exporter](https://github.com/NVIDIA/dcgm-exporter); on AMD pools it's the AMD
+GPU operator's
+[device-metrics-exporter](https://github.com/ROCm/device-metrics-exporter),
+which the serving stack installs with the AMD stack. The collector discovers
+either by its pod - an `app` or `app.kubernetes.io/name` label containing
+`dcgm` or `metrics-exporter`, with a container port named `metrics` or
+`exporter-port` - and scrapes it directly, not through Prometheus.
 
 Where the exporter comes from depends on the cluster:
 
 - **A cluster Modelplane provisions** runs one already: the serving stack
   installs an exporter wherever the cloud doesn't provide its own.
-- **An existing cluster provides its own**, as [Requirements for an existing
+- **An existing cluster provides its own DCGM exporter**, as
+  [Requirements for an existing
   cluster]({{< ref "/platform/inference-cluster.md#requirements-for-an-existing-cluster" >}})
-  describes. A GPU Operator install runs one by default; a cluster without
-  one needs NVIDIA's dcgm-exporter chart, tolerating your GPU taint. The
-  chart's pod already has the label and port the collector matches on.
+  describes. The AMD stack still brings AMD's. A GPU Operator install runs a
+  DCGM exporter by default; a cluster without one needs NVIDIA's dcgm-exporter
+  chart, tolerating your GPU taint. The chart's pod already has the label and
+  port the collector matches on.
 
 Don't run two exporters: the collector scrapes every matching pod and would
 collect each GPU twice.
@@ -503,6 +513,21 @@ kubectl port-forward -n <exporter-namespace> ds/<exporter> 9400:9400 &
 curl -s localhost:9400/metrics | grep -c -E \
   'DCGM_FI_DEV_FB_(USED|FREE)|DCGM_FI_PROF_(GR_ENGINE_ACTIVE|PIPE_TENSOR_ACTIVE|DRAM_ACTIVE)|DCGM_FI_DEV_(GPU_TEMP|POWER_USAGE|TOTAL_ENERGY_CONSUMPTION)'
 ```
+
+On an AMD pool the same `modelplane_*` names come from the
+device-metrics-exporter's fields instead, in the same units. Per-card labels
+differ: AMD's exporter identifies a card by `gpu_id`, DCGM by `gpu` and `UUID`.
+
+| AMD field | Becomes | Unit |
+| --- | --- | --- |
+| `gpu_used_vram` | `modelplane_gpu_memory_used_bytes` | MiB, converted to bytes |
+| `gpu_free_vram` | `modelplane_gpu_memory_free_bytes` | MiB, converted to bytes |
+| `gpu_gfx_activity` | `modelplane_gpu_compute_active_ratio` | percent, converted to a ratio |
+| `gpu_umc_activity` | `modelplane_gpu_memory_bandwidth_ratio` | percent, converted to a ratio |
+| `gpu_prof_tensor_active_percent` | `modelplane_gpu_tensor_active_ratio` | percent, converted to a ratio |
+| `gpu_junction_temperature` | `modelplane_gpu_temperature_celsius` | Celsius |
+| `gpu_power_usage` | `modelplane_gpu_power_watts` | watts |
+| `gpu_energy_consumed` | `modelplane_energy_joules_total` | microjoules, converted to joules |
 
 If fields are missing, extend the exporter's metrics ConfigMap - on a GPU
 Operator install that's the `dcgmExporter.config` chart value. The

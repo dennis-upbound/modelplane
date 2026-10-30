@@ -24,7 +24,7 @@ class Aks(BaseModel):
     """
     kubernetesVersion: str | None = '1.34'
     """
-    AKS cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (how GPUs bind to pods) is generally available.
+    AKS cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (how GPUs bind to pods) is generally available. A CPU pool needs 1.36 or newer: its cores are claimed as consumable capacity, which Kubernetes enables by default from 1.36 (DRAConsumableCapacity).
     """
     location: constr(min_length=1, max_length=32)
     """
@@ -39,7 +39,7 @@ class Civo(BaseModel):
     """
     kubernetesVersion: constr(min_length=1, max_length=32) | None = None
     """
-    Civo Kubernetes (k3s) version. Civo requires an exact version string including the k3s build suffix; list current versions with civo kubernetes versions. Choose 1.34 or newer so Dynamic Resource Allocation (how GPUs bind to pods) is generally available. Defaults to Civo's current default version.
+    Civo Kubernetes (k3s) version. Civo requires an exact version string including the k3s build suffix; list current versions with civo kubernetes versions. Choose 1.34 or newer so Dynamic Resource Allocation (how devices bind to pods) is generally available, and 1.36 or newer for a CPU pool: its cores are claimed as consumable capacity, which Kubernetes enables by default from 1.36 (DRAConsumableCapacity). Defaults to Civo's current default version, which may be older than a CPU pool needs.
     """
     region: constr(min_length=1, max_length=32)
     """
@@ -111,6 +111,9 @@ class Gke(BaseModel):
     GCP ProviderConfig or ClusterProviderConfig used to authenticate to the GCP API. Defaults to the ClusterProviderConfig named default.
     """
     kubernetesVersion: str | None = '1.35'
+    """
+    GKE cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (how GPUs bind to pods) is generally available. A CPU pool needs 1.36 or newer: its cores are claimed as consumable capacity, which Kubernetes enables by default from 1.36 (DRAConsumableCapacity).
+    """
     region: constr(min_length=1, max_length=32)
 
 
@@ -121,7 +124,7 @@ class Nebius(BaseModel):
     """
     kubernetesVersion: str | None = '1.34'
     """
-    mk8s cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (DRA) is generally available.
+    mk8s cluster Kubernetes version. Defaults to a version where Dynamic Resource Allocation (DRA) is generally available. A CPU pool needs 1.36 or newer: its cores are claimed as consumable capacity, which Kubernetes enables by default from 1.36 (DRAConsumableCapacity).
     """
 
 
@@ -254,7 +257,7 @@ class NodePool(BaseModel):
     minNodeCount: conint(ge=0) | None = None
     name: constr(pattern=r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', max_length=40)
     """
-    Name of the pool. Its nodes carry it as the value of the modelplane.ai/pool label, and the cluster agent observes the pool through an object of this name.
+    Name of the pool. Its nodes carry it as the value of the modelplane.ai/pool label, and the cluster agent observes an NVIDIA GPU pool through an object of this name.
     """
     nodeCount: conint(ge=0) | None = 1
     zones: list[str] | None = None
@@ -292,7 +295,7 @@ class Spec(BaseModel):
     """
     nodePools: list[NodePool] | None = Field(None, max_length=8, min_length=1)
     """
-    GPU node pools available on this cluster. Each pool references an InferenceClass that describes the hardware shape and (for provisioned clusters) how to create the pool. System pools for control-plane components are provisioned automatically.
+    Inference node pools available on this cluster. Each pool references an InferenceClass that describes the hardware shape and (for provisioned clusters) how to create the pool. System pools for control-plane components are provisioned automatically.
     """
     placement: Placement | None = None
     """
@@ -339,6 +342,13 @@ class Gateway(BaseModel):
     """
 
 
+class ProviderConfigRef(BaseModel):
+    name: str | None = None
+    """
+    Name of the ProviderConfig targeting the remote cluster. Used by ModelReplica to create resources on the cluster.
+    """
+
+
 class Attributes(BaseModel):
     bool_: bool | None = Field(None, alias='bool')
     int_: int | None = Field(None, alias='int')
@@ -371,7 +381,7 @@ class NodesByFreeDevice(BaseModel):
     """
 
 
-class GpuPool(BaseModel):
+class SchedulablePool(BaseModel):
     devices: list[Device] | None = Field(None, max_length=16)
     """
     Devices copied from the pool's InferenceClass. ModelDeployment.nodeSelector matches against these.
@@ -394,14 +404,7 @@ class GpuPool(BaseModel):
     """
     observedNodes: conint(ge=0) | None = None
     """
-    The nodes this pool has now, ready or not, as the cluster agent observes them. Absent until the agent reports on the pool, and while it can't observe it.
-    """
-
-
-class ProviderConfigRef(BaseModel):
-    name: str | None = None
-    """
-    Name of the ProviderConfig targeting the remote cluster. Used by ModelReplica to create resources on the cluster.
+    The nodes this pool has now, ready or not, as the cluster agent observes them. Absent until the agent reports on the pool, and while it can't observe it. Always absent on a pool that isn't an NVIDIA GPU pool, which the agent doesn't observe.
     """
 
 
@@ -418,15 +421,15 @@ class Status(BaseModel):
     """
     This cluster's own gateway: the Envoy gateway the serving stack runs at the cluster's edge, which an InferenceGateway routes to. These fields are how an InferenceGateway reaches it.
     """
-    gpuPools: list[GpuPool] | None = Field(None, max_length=8)
-    """
-    Schedulable GPU node pools on this cluster, derived from the referenced classes, the per-pool node counts, and what the cluster agent observes of each pool. ModelDeployment scheduling matches against these.
-    """
     namespace: str | None = None
     """
     Namespace where the internal XRs (cluster, backend) were created.
     """
     providerConfigRef: ProviderConfigRef | None = None
+    schedulablePools: list[SchedulablePool] | None = Field(None, max_length=8)
+    """
+    Schedulable node pools on this cluster - GPU and CPU alike; every pool whose class declares devices - derived from the referenced classes, the per-pool node counts, and what the cluster agent observes of each pool. ModelDeployment scheduling matches against these.
+    """
 
 
 class InferenceCluster(BaseModel):

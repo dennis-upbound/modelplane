@@ -226,6 +226,15 @@ _GPU_TAINT_KEY = "nvidia.com/gpu"
 _GPU_TAINT_VALUE = "true"
 _GPU_TAINT_EFFECT = "NO_SCHEDULE"
 
+# Label and taint on CPU inference node groups. The label is what the
+# serving stack's dra-driver-cpu selects its nodes by; the taint keeps
+# system workloads off the group as the GPU taint does on GPU groups,
+# and engine pods tolerate it (compose-model-replica).
+_LABEL_CPU = "modelplane.ai/cpu"
+_CPU_TAINT_KEY = "modelplane.ai/cpu"
+_CPU_TAINT_VALUE = "true"
+_CPU_TAINT_EFFECT = "NO_SCHEDULE"
+
 # Kubernetes-API taint effect (as a toleration value, not the EC2 NO_SCHEDULE
 # form). The EFA DRA driver's DaemonSet must tolerate the GPU taint to run on
 # the GPU nodes, like the NVIDIA GPU DRA driver does.
@@ -908,6 +917,18 @@ class Composer:
                         key=_GPU_TAINT_KEY,
                         value=_GPU_TAINT_VALUE,
                         effect=_GPU_TAINT_EFFECT,
+                    ),
+                ]
+            elif pool.role == "CPU":
+                fp.labels = {
+                    _LABEL_POOL: pool.name,
+                    _LABEL_CPU: "true",
+                }
+                fp.taint = [
+                    ngv1beta1.TaintItem(
+                        key=_CPU_TAINT_KEY,
+                        value=_CPU_TAINT_VALUE,
+                        effect=_CPU_TAINT_EFFECT,
                     ),
                 ]
 

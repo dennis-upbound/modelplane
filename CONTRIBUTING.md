@@ -125,7 +125,7 @@ and it runs the pytest suite in `e2e/tests/`, exiting non-zero if a test fails. 
 verify command is what the label-gated `E2E` workflow runs on CI (add the
 `test-e2e` label to a PR), so a green local `--verify` and a green CI run mean
 the same thing. `-- --cloud <cloud>` instead installs one cloud's serving
-stack onto KWOK-faked GPU pools and audits placement, still with no
+stack onto KWOK-faked device pools and audits placement, still with no
 credentials; its per-cloud CI matrix (the `E2E Clouds` workflow) runs on pull
 requests touching the serving stack or `e2e/`. See `e2e/README.md`.
 
@@ -429,7 +429,10 @@ checks to trip. In order:
    `dra` owns the DRA selector paths the upstream values don't. The fork
    is deleted the day NVIDIA/aicr#2517 lands.
 3. Expect `ALLOW`/`DROP` to fail closed on any component the new catalog
-   adds; classify it with a reason.
+   adds; classify it with a reason. An `ALLOW` entry also names the DRA
+   drivers whose device stacks the component belongs to (empty for a
+   component every cluster needs) - deciding that is part of classifying
+   it; see design/multi-accelerator.md.
 4. Expect `check_namespace_holds` to fail closed if the catalog moved a
    component's chart namespace: Helm can't move a release across
    namespaces, so existing clusters would wedge on a fresh-install

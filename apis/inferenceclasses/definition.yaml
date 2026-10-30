@@ -22,6 +22,111 @@ spec:
           spec:
             type: object
             required: [devices]
+            x-kubernetes-validations:
+            # The pool's role follows accelerator - compose-inference-cluster
+            # gives a pool the GPU role when it's set and the CPU role when
+            # it isn't -
+            # while the scheduler and ServingStack spec.draDrivers follow
+            # spec.devices. These rules keep the two in step, one pair per
+            # cloud because CEL can't address the provider's block
+            # dynamically: a class claiming a GPU driver without accelerator
+            # would compose a CPU pool whose advertised GPUs nothing can
+            # allocate, and accelerator on a class claiming only dra.cpu would
+            # provision GPUs nothing claims.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.gke) ||
+                has(self.provisioning.gke.accelerator) ||
+                !(has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.gke.accelerator is required when a device
+                claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.gke) ||
+                !has(self.provisioning.gke.accelerator) ||
+                (has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.gke.accelerator must be omitted when no
+                device claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.eks) ||
+                has(self.provisioning.eks.accelerator) ||
+                !(has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.eks.accelerator is required when a device
+                claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.eks) ||
+                !has(self.provisioning.eks.accelerator) ||
+                (has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.eks.accelerator must be omitted when no
+                device claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.aks) ||
+                has(self.provisioning.aks.accelerator) ||
+                !(has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.aks.accelerator is required when a device
+                claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.aks) ||
+                !has(self.provisioning.aks.accelerator) ||
+                (has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.aks.accelerator must be omitted when no
+                device claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.nebius) ||
+                has(self.provisioning.nebius.accelerator) ||
+                !(has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.nebius.accelerator is required when a device
+                claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.nebius) ||
+                !has(self.provisioning.nebius.accelerator) ||
+                (has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.nebius.accelerator must be omitted when no
+                device claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.vultr) ||
+                has(self.provisioning.vultr.accelerator) ||
+                !(has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.vultr.accelerator is required when a device
+                claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.vultr) ||
+                !has(self.provisioning.vultr.accelerator) ||
+                (has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.vultr.accelerator must be omitted when no
+                device claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.civo) ||
+                has(self.provisioning.civo.accelerator) ||
+                !(has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.civo.accelerator is required when a device
+                claims a DRA driver other than dra.cpu.
+            - rule: >-
+                !has(self.provisioning) || !has(self.provisioning.civo) ||
+                !has(self.provisioning.civo.accelerator) ||
+                (has(self.devices) && self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu'))
+              message: >-
+                spec.provisioning.civo.accelerator must be omitted when no
+                device claims a DRA driver other than dra.cpu.
+            # dra-driver-cpu runs only on CPU pools, so a provisioned GPU
+            # pool never publishes dra.cpu devices for a claim to allocate.
+            - rule: >-
+                !has(self.provisioning) ||
+                !self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver == 'dra.cpu') ||
+                !self.devices.exists(d, (!has(d.claim) || d.claim == 'DRA') && d.driver != 'dra.cpu')
+              message: >-
+                A class with spec.provisioning can't claim dra.cpu alongside
+                another DRA driver: Modelplane runs dra-driver-cpu only on
+                CPU pools.
             properties:
               description:
                 type: string
@@ -52,7 +157,7 @@ spec:
                     enum: [GKE, EKS, AKS, Nebius, Vultr, Civo]
                   gke:
                     type: object
-                    required: [machineType, accelerator]
+                    required: [machineType]
                     properties:
                       machineType:
                         type: string
@@ -68,7 +173,12 @@ spec:
                           pool. Provisioning input only: the scheduler matches
                           against spec.devices, not this block, so count here is
                           the GCP machine's GPU count and need not be restated in
-                          devices.
+                          devices. Set this when and only when a device
+                          claims a DRA driver other than dra.cpu; the API
+                          rejects a mismatch.
+                          Omitted, Modelplane provisions a CPU pool: a standard
+                          node image, the modelplane.ai/cpu label and taint,
+                          and no GPU stack.
                         required: [type, count]
                         properties:
                           type:
@@ -84,15 +194,17 @@ spec:
                             maximum: 16
                   eks:
                     type: object
-                    required: [instanceType, accelerator]
+                    required: [instanceType]
                     properties:
                       instanceType:
                         type: string
                         description: >-
                           EC2 instance type (e.g. g6.xlarge,
                           p4d.24xlarge). The instance family determines
-                          the GPU model; the accelerator block below is
-                          informational.
+                          the GPU model, if any. The accelerator block
+                          below doesn't change the hardware, but whether
+                          it's set decides whether the group is provisioned
+                          as a GPU or a CPU pool.
                         minLength: 1
                       diskSizeGb:
                         type: integer
@@ -103,7 +215,12 @@ spec:
                         description: >-
                           GPU accelerator to attach when provisioning the node
                           group. Provisioning input only: the scheduler matches
-                          against spec.devices, not this block.
+                          against spec.devices, not this block. Set this when
+                          and only when a device claims a DRA driver other
+                          than dra.cpu; the API rejects a mismatch.
+                          Omitted, Modelplane provisions a CPU group: a standard
+                          node image, the modelplane.ai/cpu label and taint,
+                          and no GPU stack.
                         required: [type, count]
                         properties:
                           type:
@@ -120,15 +237,17 @@ spec:
                             maximum: 16
                   aks:
                     type: object
-                    required: [vmSize, accelerator]
+                    required: [vmSize]
                     properties:
                       vmSize:
                         type: string
                         description: >-
                           Azure VM size (e.g. Standard_NC24ads_A100_v4,
                           Standard_ND96isr_H100_v5). The VM size determines
-                          the GPU model and count; the accelerator block
-                          below is informational.
+                          the GPU model and count, if any. The accelerator
+                          block below doesn't change the hardware, but
+                          whether it's set decides whether the pool is
+                          provisioned as a GPU or a CPU pool.
                         minLength: 1
                       diskSizeGb:
                         type: integer
@@ -139,7 +258,12 @@ spec:
                         description: >-
                           GPU accelerator to attach when provisioning the node
                           pool. Provisioning input only: the scheduler matches
-                          against spec.devices, not this block.
+                          against spec.devices, not this block. Set this when
+                          and only when a device claims a DRA driver other
+                          than dra.cpu; the API rejects a mismatch.
+                          Omitted, Modelplane provisions a CPU pool: a standard
+                          node image, the modelplane.ai/cpu label and taint,
+                          and no GPU stack.
                         required: [type, count]
                         properties:
                           type:
@@ -156,15 +280,17 @@ spec:
                             maximum: 16
                   nebius:
                     type: object
-                    required: [platform, preset, accelerator]
+                    required: [platform, preset]
                     properties:
                       platform:
                         type: string
                         description: >-
                           Nebius compute platform (e.g. gpu-h100-sxm,
                           gpu-l40s-a). Together with preset this determines
-                          the GPU model and count; the accelerator block
-                          below is informational.
+                          the GPU model and count, if any. The accelerator
+                          block below doesn't change the hardware, but
+                          whether it's set decides whether the group is
+                          provisioned as a GPU or a CPU pool.
                         minLength: 1
                         maxLength: 63
                       preset:
@@ -197,7 +323,12 @@ spec:
                         description: >-
                           GPU accelerator to attach when provisioning the node
                           group. Provisioning input only: the scheduler matches
-                          against spec.devices, not this block.
+                          against spec.devices, not this block. Set this when
+                          and only when a device claims a DRA driver other
+                          than dra.cpu; the API rejects a mismatch.
+                          Omitted, Modelplane provisions a CPU group: a standard
+                          node image, the modelplane.ai/cpu label and taint,
+                          and no GPU stack.
                         required: [type, count]
                         properties:
                           type:
@@ -214,14 +345,17 @@ spec:
                             maximum: 16
                   vultr:
                     type: object
-                    required: [plan, accelerator]
+                    required: [plan]
                     properties:
                       plan:
                         type: string
                         description: >-
                           Vultr plan ID (e.g. vcg-l40s-16c-180g-48vram).
-                          The plan determines the GPU model and count; the
-                          accelerator block below is informational.
+                          The plan determines the GPU model and count, if
+                          any. The accelerator block below doesn't change
+                          the hardware, but whether it's set decides
+                          whether the pool is provisioned as a GPU or a CPU
+                          pool.
                         minLength: 1
                         maxLength: 63
                       accelerator:
@@ -229,7 +363,12 @@ spec:
                         description: >-
                           GPU accelerator to attach when provisioning the node
                           pool. Provisioning input only: the scheduler matches
-                          against spec.devices, not this block.
+                          against spec.devices, not this block. Set this when
+                          and only when a device claims a DRA driver other
+                          than dra.cpu; the API rejects a mismatch.
+                          Omitted, Modelplane provisions a CPU pool: a standard
+                          node image, the modelplane.ai/cpu label and taint,
+                          and no GPU stack.
                         required: [type, count]
                         properties:
                           type:
@@ -246,14 +385,17 @@ spec:
                             maximum: 16
                   civo:
                     type: object
-                    required: [size, accelerator]
+                    required: [size]
                     properties:
                       size:
                         type: string
                         description: >-
                           Civo Kubernetes size ID (e.g. an.g1.l40s.kube.x1).
-                          The size determines the GPU model and count; the
-                          accelerator block below is informational.
+                          The size determines the GPU model and count, if
+                          any. The accelerator block below doesn't change
+                          the hardware, but whether it's set decides
+                          whether the pool is provisioned as a GPU or a CPU
+                          pool.
                         minLength: 1
                         maxLength: 63
                       accelerator:
@@ -261,7 +403,12 @@ spec:
                         description: >-
                           GPU accelerator to attach when provisioning the node
                           pool. Provisioning input only: the scheduler matches
-                          against spec.devices, not this block.
+                          against spec.devices, not this block. Set this when
+                          and only when a device claims a DRA driver other
+                          than dra.cpu; the API rejects a mismatch.
+                          Omitted, Modelplane provisions a CPU pool: a standard
+                          node image, the modelplane.ai/cpu label and taint,
+                          and no GPU stack.
                         required: [type, count]
                         properties:
                           type:

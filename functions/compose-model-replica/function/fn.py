@@ -183,6 +183,11 @@ class Composer:
                 "PrefillDecode serving requires serving.router: EndpointPicker and serving.endpointPicker",
             )
             return
+        if invalid := base.invalid_cpu_claim(self.xr):
+            # Stop rather than compose a CPU claim that can't be sized. Fatal
+            # for the same reason as above: existing resources hold.
+            response.fatal(self.rsp, invalid)
+            return
         if routing.decode_without_sidecar(self.xr):
             response.warning(
                 self.rsp,

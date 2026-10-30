@@ -807,12 +807,64 @@ def engine_resources(container: v1alpha1.Container, *, claim: bool) -> dict:
     return resources
 
 
-# Taint GPU node groups carry so non-GPU pods don't land on them. A pod that
-# claims a GPU must tolerate it to schedule there. With GPUs bound via DRA (not
-# the device plugin's extended resource), nothing injects this toleration for us
-# - the ExtendedResourceToleration admission controller only acts on
-# nvidia.com/gpu resource requests, which DRA pods don't make.
-_GPU_TOLERATION = {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}
+# The DeviceClass dra-driver-cpu registers, and the qualified name its
+# grouped devices hold their cores under. A member claiming through this
+# class sizes its claim from the engine's cpu request (see
+# resource_claim_template); the names are the driver's contract, kept in
+# sync with the dra-driver-cpu pin in compose-serving-stack's
+# stacks/common.py.
+_CPU_DEVICE_CLASS = "dra.cpu"
+_CPU_CAPACITY = "dra.cpu/cpu"
+
+
+def invalid_cpu_claim(replica: v1alpha1.ModelReplica) -> str | None:
+    """Explain why a member's dra.cpu claim can't be sized, or None if every one can.
+
+    A CPU claim takes the engine container's cpu request from one device
+    (see resource_claim_template), so the function stops on a claim it
+    can't size that way rather than compose one the driver refuses or
+    that over-claims. Without a request the claim would take the whole
+    device, which leaves the node's shared containers nowhere to run.
+    Across more than one device, each would take the full request.
+    """
+    for engine in replica.spec.engines:
+        for member in engine.members:
+            cpu = [r for r in (member.deviceRequests or []) if r.deviceClassName == _CPU_DEVICE_CLASS]
+            if not cpu:
+                continue
+            name = f"{engine.name}/{member_role(member)}"
+            if sum(int(r.count or 1) for r in cpu) > 1:
+                return (
+                    f"{name} claims more than one dra.cpu device, but a dra.cpu claim takes the engine "
+                    "container's cpu request from a single device: claim one"
+                )
+            container = engine_container(member)
+            requests = (container.resources.requests if container.resources else None) or {}
+            if "cpu" not in requests:
+                return (
+                    f"a dra.cpu claim is sized from the engine container's cpu request, and {name} sets none: "
+                    "set resources requests and limits cpu to the cores the claim should take, below the "
+                    "device's total so the node's shared containers keep a core"
+                )
+    return None
+
+
+# Taints inference node pools carry so unrelated pods don't land on them, one
+# per device stack: the cluster compositions taint NVIDIA GPU pools
+# nvidia.com/gpu and CPU pools modelplane.ai/cpu, and BYO AMD pools carry
+# amd.com/gpu. A pod that claims a device must tolerate its pool's taint to
+# schedule there, and with devices bound via DRA (not a device plugin's
+# extended resource) nothing injects the toleration for us - the
+# ExtendedResourceToleration admission controller only acts on nvidia.com/gpu
+# resource requests, which DRA pods don't make. Every engine pod tolerates the
+# whole list: tolerating a taint its pool never carries is harmless, and the
+# pool nodeSelector is what places the pod, so the accelerator needn't thread
+# through placement.
+_POOL_TOLERATIONS = [
+    {"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+    {"key": "amd.com/gpu", "operator": "Exists", "effect": "NoSchedule"},
+    {"key": "modelplane.ai/cpu", "operator": "Exists", "effect": "NoSchedule"},
+]
 
 # Node label identifying the pool a node belongs to. compose-eks-cluster and
 # compose-gke-cluster stamp it on every node group they provision; the scheduler
@@ -827,9 +879,9 @@ def place_pod(pod_spec: dict, replica: v1alpha1.ModelReplica, engine: v1alpha1.E
     """Constrain a member's serving pod to the placement the scheduler chose.
 
     Pins the pod to its member's scheduled node pool, wires it to claim its
-    GPUs via DRA through the member's claim, and tolerates the GPU node taint.
-    Every pod of one member shares this - a native Deployment pod, a
-    LeaderWorkerSet leader or worker pod, or a Grove leader or worker clique
+    devices via DRA through the member's claim, and tolerates every inference
+    pool taint. Every pod of one member shares this - a native Deployment pod,
+    a LeaderWorkerSet leader or worker pod, or a Grove leader or worker clique
     pod.
 
     The pool nodeSelector is what makes the scheduler's pool choice real: the
@@ -846,14 +898,14 @@ def place_pod(pod_spec: dict, replica: v1alpha1.ModelReplica, engine: v1alpha1.E
     claim. A claimless member - one with no deviceRequests, like a
     coordinator-only leader - gets no claim at all: only the pool pin places
     its pods, packed onto the gang's nodes by the cluster's scheduler. It still
-    tolerates the GPU taint, since the pool it rides along on is a GPU pool.
+    tolerates the pool taints, since the pool it rides along on carries one.
     """
     pod_spec["nodeSelector"] = {_LABEL_POOL: member.nodePoolName}
     if member.deviceRequests:
         pod_spec["resourceClaims"] = [
             {"name": _POD_CLAIM_NAME, "resourceClaimTemplateName": claim_template_name(replica, engine, member)}
         ]
-    pod_spec.setdefault("tolerations", []).append(_GPU_TOLERATION)
+    pod_spec.setdefault("tolerations", []).extend(_POOL_TOLERATIONS)
 
 
 def resource_claim_template(
@@ -877,6 +929,20 @@ def resource_claim_template(
         selectors = [{"cel": {"expression": s.cel}} for s in (r.selectors or []) if s.cel]
         if selectors:
             exactly["selectors"] = selectors
+        if r.deviceClassName == _CPU_DEVICE_CLASS:
+            # dra-driver-cpu's grouped device holds its cores as consumable
+            # capacity, and a claim with no capacity request consumes the
+            # whole device - which the driver refuses while the node's
+            # shared containers (every DaemonSet) need somewhere to run.
+            # So a CPU claim asks for an explicit share: the engine
+            # container's own cpu request, the number the driver's
+            # contract already requires there (the kubelet accounts CPUs
+            # only from requests until KEP-5517). One number, stated
+            # once, sizes the cgroup accounting and the cpuset alike;
+            # invalid_cpu_claim gates on it being present.
+            container = engine_container(member)
+            assert container.resources is not None and container.resources.requests is not None
+            exactly["capacity"] = {"requests": {_CPU_CAPACITY: str(container.resources.requests["cpu"])}}
         device_requests.append({"name": r.name, "exactly": exactly})
 
     return wrap_object(
